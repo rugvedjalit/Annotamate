@@ -2117,6 +2117,9 @@ class UltimateAnnotator(ctk.CTk):
             self.load_image_data()
         else: self.title("No Images")
 
-if __name__ == "__main__":
+def main():
     app = UltimateAnnotator()
     app.mainloop()
+
+if __name__ == "__main__":
+    main()
