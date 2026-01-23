@@ -28,7 +28,7 @@
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/yourusername/Annotamate.git
+git clone https://github.com/rugvedjalit/Annotamate.git
 cd Annotamate
 pip install .
 ```
