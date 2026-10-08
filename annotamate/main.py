@@ -1,9 +1,9 @@
 import customtkinter as ctk
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageTk, ImageDraw
 import os
-import glob
 import sys
 import subprocess
 import shutil
@@ -52,6 +52,29 @@ SHORTCUT_DEFS = {
 MODIFIER_KEYSYMS = {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
                     "Meta_L", "Meta_R", "Super_L", "Super_R", "Win_L", "Win_R",
                     "Caps_Lock", "Num_Lock", "ISO_Level3_Shift"}
+
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
+ANNOTATION_EXTENSIONS = ('.txt', '.xml', '.json')
+
+# os.path.normcase for a bare file name (no separators), without its per-call overhead
+normcase_name = str.lower if os.name == "nt" else str
+
+def scan_image_files(d, name_cache=None):
+    """Sorted image paths in a directory. os.scandir is much faster than glob on large folders.
+    Optionally fills name_cache (see UltimateAnnotator.refresh_file_list) from the scan for free."""
+    files = []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                name = e.name
+                lower = name.lower()
+                if name.startswith(".") or not lower.endswith(IMAGE_EXTENSIONS) or not e.is_file(): continue
+                files.append(e.path)
+                if name_cache is not None:
+                    name_cache[e.path] = (d, name, lower, normcase_name(name.rsplit(".", 1)[0]))
+    except OSError:
+        return []
+    return sorted(files)
 
 def get_settings_path():
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
@@ -585,6 +608,106 @@ class SettingsDialog(ctk.CTkToplevel):
         self.lbl_status.configure(text="")
         self.build_rows()
 
+# --- VIRTUAL LISTBOX (Large Datasets) ---
+class VirtualListbox:
+    """A tk.Listbox that only holds the rows currently on screen.
+
+    Tk measures every row it stores, so a normal Listbox takes seconds to fill (or even to
+    change one row) with 100k+ files. Here the full list lives in Python and the Listbox is
+    refilled with just the visible slice when scrolling, so cost doesn't grow with dataset size.
+    """
+    def __init__(self, parent, scrollbar, on_select, **listbox_kwargs):
+        self.items = []
+        self.top = 0 # Index of the first visible row
+        self.selected = -1
+        self.on_select = on_select
+        self.scrollbar = scrollbar
+        self.lb = tk.Listbox(parent, exportselection=False, **listbox_kwargs)
+        scrollbar.configure(command=self.yview)
+        # Same row height formula Tk uses internally for listboxes
+        font = tkfont.Font(font=self.lb.cget("font"))
+        self.line_h = font.metrics("linespace") + 1 + 2 * int(self.lb.cget("selectborderwidth"))
+
+        self.lb.bind("<Configure>", lambda e: self.render())
+        self.lb.bind("<MouseWheel>", self.on_wheel)
+        self.lb.bind("<Button-4>", lambda e: self.scroll_rows(-3)) # Linux wheel
+        self.lb.bind("<Button-5>", lambda e: self.scroll_rows(3))
+        self.lb.bind("<<ListboxSelect>>", self.on_listbox_select)
+        self.lb.bind("<Up>", lambda e: self.step_selection(-1))
+        self.lb.bind("<Down>", lambda e: self.step_selection(1))
+        self.lb.bind("<Prior>", lambda e: self.step_selection(-self.visible_rows()))
+        self.lb.bind("<Next>", lambda e: self.step_selection(self.visible_rows()))
+
+    def pack(self, **kwargs): self.lb.pack(**kwargs)
+    def config(self, **kwargs): self.lb.config(**kwargs)
+    def size(self): return len(self.items)
+    def get(self, pos): return self.items[pos]
+
+    def visible_rows(self):
+        return max(1, self.lb.winfo_height() // self.line_h)
+
+    def set_items(self, items):
+        self.items = items
+        self.render()
+
+    def set_item(self, pos, text):
+        if 0 <= pos < len(self.items):
+            self.items[pos] = text
+            if self.top <= pos <= self.top + self.visible_rows(): self.render()
+
+    def select(self, pos, see=True):
+        self.selected = pos
+        if see and 0 <= pos < len(self.items):
+            rows = self.visible_rows()
+            if pos < self.top: self.top = pos
+            elif pos >= self.top + rows: self.top = pos - rows + 1
+        self.render()
+
+    def render(self):
+        n = len(self.items)
+        rows = self.visible_rows()
+        self.top = max(0, min(self.top, n - rows))
+        window = self.items[self.top:self.top + rows + 1] # +1 so a partial last row is filled
+        self.lb.delete(0, tk.END)
+        if window: self.lb.insert(tk.END, *window)
+        if self.top <= self.selected < self.top + len(window):
+            self.lb.selection_set(self.selected - self.top)
+        if n: self.scrollbar.set(self.top / n, min(1.0, (self.top + rows) / n))
+        else: self.scrollbar.set(0.0, 1.0)
+
+    def yview(self, *args):
+        # Called by the scrollbar: ("moveto", fraction) or ("scroll", n, "units"/"pages")
+        if not args: return
+        if args[0] == "moveto":
+            self.top = int(float(args[1]) * len(self.items))
+            self.render()
+        elif args[0] == "scroll":
+            step = int(args[1]) * (self.visible_rows() if args[2] == "pages" else 1)
+            self.scroll_rows(step)
+
+    def scroll_rows(self, n):
+        self.top += n
+        self.render()
+        return "break"
+
+    def on_wheel(self, event):
+        return self.scroll_rows(-3 * int(event.delta / 120) if event.delta else 0)
+
+    def on_listbox_select(self, event):
+        sel = self.lb.curselection()
+        if not sel: return
+        pos = self.top + sel[0]
+        if pos == self.selected: return
+        self.selected = pos
+        self.on_select(pos)
+
+    def step_selection(self, delta):
+        if not self.items: return "break"
+        pos = max(0, min(len(self.items) - 1, (self.selected if self.selected >= 0 else self.top) + delta))
+        self.select(pos)
+        self.on_select(pos)
+        return "break"
+
 # --- MAIN APP ---
 class UltimateAnnotator(ctk.CTk):
     def __init__(self):
@@ -602,7 +725,10 @@ class UltimateAnnotator(ctk.CTk):
         # --- Data ---
         self.image_list = []
         self.filtered_indices = [] # Maps listbox index -> real index in image_list
-        self.annot_cache = {} # Caches annotation existence: path -> bool
+        self.filtered_pos = {} # Reverse map: real index -> listbox index
+        self.dir_listing = {} # Cached file names per directory (normcased), used to check which images have annotations
+        self.name_cache = {} # image path -> (dir, basename, basename lower, normcased stem)
+        self.search_job = None # Debounce timer for the file search box
         
         self.current_dir = None    
         self.label_dir = None      
@@ -623,7 +749,6 @@ class UltimateAnnotator(ctk.CTk):
         self.bboxes = []
         self.undo_stack = [] # Actions: ("add", box) or ("delete", idx, box)
         self.redo_stack = []
-        self.box_images = [] # Cache for Transparent PIL images
         
         self.auto_save_var = ctk.BooleanVar(value=False)
         self.show_all_var = ctk.BooleanVar(value=True) # For visibility toggle
@@ -636,7 +761,12 @@ class UltimateAnnotator(ctk.CTk):
         self.start_x, self.start_y = 0, 0
         self.current_rect = None
         self.pil_image = None   
-        self.tk_image = None    
+        self.tk_image = None
+        self.tile_key = None # (scale, crop box) of the currently rendered viewport tile
+        self.base_tile = None # Scaled visible part of the image (PIL), before box fills
+        self.tile_origin = (0, 0) # Canvas position of base_tile
+        self.rendered_view = None # (scale, viewport) of the last render
+        self.view_update_job = None
         self.imscale = 1.0
         self.img_ox = 0 
         self.img_oy = 0
@@ -803,10 +933,7 @@ class UltimateAnnotator(ctk.CTk):
             
             self.image_list[self.current_index] = new_path
             
-            # Update cache
-            if curr_path in self.annot_cache:
-                self.annot_cache[new_path] = self.annot_cache.pop(curr_path)
-
+            self.dir_listing = {} # Files changed on disk, rescan on next refresh
             self.refresh_file_list()
             self.load_image_data()
         except Exception as e:
@@ -845,7 +972,8 @@ class UltimateAnnotator(ctk.CTk):
                 renamed_count += 1
             
             self.image_list = new_image_list
-            self.annot_cache = {} # Clear cache on batch rename
+            self.dir_listing = {} # Clear cache on batch rename
+            self.name_cache = {}
             self.refresh_file_list()
             self.current_index = 0
             self.load_image_data()
@@ -856,9 +984,9 @@ class UltimateAnnotator(ctk.CTk):
             self.load_directory_manual(self.current_dir)
 
     def load_directory_manual(self, d):
-        self.image_list = sorted(glob.glob(os.path.join(d, "*.*")))
-        self.image_list = [x for x in self.image_list if x.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-        self.annot_cache = {}
+        self.name_cache = {}
+        self.image_list = scan_image_files(d, self.name_cache)
+        self.dir_listing = {}
         self.refresh_file_list()
         self.current_index = 0
         if self.image_list: self.load_image_data()
@@ -914,7 +1042,10 @@ class UltimateAnnotator(ctk.CTk):
         
         # Canvas
         self.canvas.config(bg=PS_GRAY_DARK[t_idx])
-        
+        if self.pil_image:
+            self.tile_key = None # Transparent images are flattened onto the canvas bg
+            self.update_view()
+
         # Listbox
         self.file_listbox.config(bg=PS_GRAY_DARK[t_idx], fg=PS_TEXT_COLOR[t_idx], selectbackground=PS_ACTIVE[t_idx])
         
@@ -1086,7 +1217,7 @@ class UltimateAnnotator(ctk.CTk):
             self.frame_left, bg=PS_GRAY_DARK[t_idx], 
             highlightthickness=0, borderwidth=0, 
             cursor="tcross", 
-            xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set
+            xscrollcommand=self.on_canvas_xscroll, yscrollcommand=self.on_canvas_yscroll
         )
         self.v_scroll.config(command=self.canvas.yview); self.h_scroll.config(command=self.canvas.xview)
         self.canvas.grid(row=0, column=0, sticky="nsew")
@@ -1173,7 +1304,7 @@ class UltimateAnnotator(ctk.CTk):
         
         self.entry_search = ctk.CTkEntry(self.frame_file_content, placeholder_text="Search files...", fg_color=PS_GRAY_DARK, border_color=PS_GRAY_LIGHT, text_color=PS_TEXT_COLOR)
         self.entry_search.pack(fill="x", pady=(0, 5))
-        self.entry_search.bind("<KeyRelease>", self.refresh_file_list)
+        self.entry_search.bind("<KeyRelease>", self.on_search_key)
         self.entry_search.bind("<FocusIn>", lambda e: self.unbind_shortcuts())
         self.entry_search.bind("<FocusOut>", lambda e: self.bind_shortcuts_func())
 
@@ -1184,23 +1315,21 @@ class UltimateAnnotator(ctk.CTk):
         self.scrollbar_files = ctk.CTkScrollbar(self.listbox_frame, button_color=PS_GRAY_LIGHT, button_hover_color=PS_GRAY_LIGHTER)
         self.scrollbar_files.pack(side="right", fill="y")
         
-        # Standard TK Listbox (Needs explicit theme init)
-        self.file_listbox = tk.Listbox(
-            self.listbox_frame, 
-            bg=PS_GRAY_DARK[t_idx], 
-            fg=PS_TEXT_COLOR[t_idx], 
-            selectbackground=PS_ACTIVE[t_idx], 
+        # Virtual TK Listbox (only visible rows live in Tk; needs explicit theme init)
+        self.file_listbox = VirtualListbox(
+            self.listbox_frame,
+            self.scrollbar_files,
+            self.on_listbox_select,
+            bg=PS_GRAY_DARK[t_idx],
+            fg=PS_TEXT_COLOR[t_idx],
+            selectbackground=PS_ACTIVE[t_idx],
             selectforeground="white",
-            highlightthickness=0, 
+            highlightthickness=0,
             borderwidth=0,
             activestyle="none",
-            font=("Arial", 10),
-            yscrollcommand=self.scrollbar_files.set
+            font=("Arial", 10)
         )
         self.file_listbox.pack(side="left", fill="both", expand=True)
-        self.scrollbar_files.configure(command=self.file_listbox.yview)
-        
-        self.file_listbox.bind("<<ListboxSelect>>", self.on_listbox_select)
 
         self.refresh_class_list()
         self.reset_class_selection()
@@ -1319,14 +1448,15 @@ class UltimateAnnotator(ctk.CTk):
             del self.minimized_btns[panel]
 
     # --- Path Helpers ---
+    def get_annotation_ext(self):
+        fmt = self.format_var.get()
+        if fmt == "Pascal VOC": return ".xml"
+        elif fmt == "COCO": return ".json"
+        else: return ".txt" # YOLO default
+
     def get_annotation_path(self, img_path):
         """Returns the expected annotation path based on current format."""
-        fmt = self.format_var.get()
-        if fmt == "Pascal VOC": ext = ".xml"
-        elif fmt == "COCO": ext = ".json"
-        else: ext = ".txt" # YOLO default
-        
-        basename = os.path.splitext(os.path.basename(img_path))[0] + ext
+        basename = os.path.splitext(os.path.basename(img_path))[0] + self.get_annotation_ext()
         if self.label_dir: return os.path.join(self.label_dir, basename)
         else: return os.path.join(os.path.dirname(img_path), basename)
 
@@ -1346,9 +1476,9 @@ class UltimateAnnotator(ctk.CTk):
         self.current_dir = d
         self.label_dir = None 
         self.load_classes()
-        self.image_list = sorted(glob.glob(os.path.join(d, "*.*")))
-        self.image_list = [x for x in self.image_list if x.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-        self.annot_cache = {} # Clear cache on new load
+        self.name_cache = {}
+        self.image_list = scan_image_files(d, self.name_cache)
+        self.dir_listing = {} # Clear cache on new load
         self.refresh_file_list()
         self.current_index = 0
         self.find_latest_session_and_jump(d)
@@ -1361,7 +1491,8 @@ class UltimateAnnotator(ctk.CTk):
         if d:
             self.label_dir = d
             self.load_classes()
-            self.annot_cache = {} # Clear cache on label change
+            self.dir_listing = {} # Clear cache on label change
+            self.refresh_file_list() # Checkmarks now come from the label directory
             self.find_latest_session_and_jump(d)
             if self.image_list: self.load_image_data()
         else:
@@ -1369,19 +1500,22 @@ class UltimateAnnotator(ctk.CTk):
             if self.image_list: self.load_image_data()
 
     def find_latest_session_and_jump(self, search_dir):
-        if not search_dir or not os.path.exists(search_dir): return
-        # Simple heuristic: check for any annotation file
-        txt_files = glob.glob(os.path.join(search_dir, "*.txt"))
-        xml_files = glob.glob(os.path.join(search_dir, "*.xml"))
-        json_files = glob.glob(os.path.join(search_dir, "*.json"))
-        
-        all_files = txt_files + xml_files + json_files
-        all_files = [f for f in all_files if os.path.basename(f) != "classes.txt"]
-        
-        if not all_files: return
+        if not search_dir or not os.path.isdir(search_dir): return
+        # Simple heuristic: jump to the most recently modified annotation file.
+        # Single scandir pass (mtime comes with the directory listing on Windows).
+        latest_name, latest_mtime = None, -1
         try:
-            latest_file = max(all_files, key=os.path.getmtime)
-            latest_base = os.path.splitext(os.path.basename(latest_file))[0]
+            with os.scandir(search_dir) as it:
+                for e in it:
+                    if e.name == "classes.txt" or not e.name.lower().endswith(ANNOTATION_EXTENSIONS): continue
+                    try: mtime = e.stat().st_mtime
+                    except OSError: continue
+                    if mtime > latest_mtime: latest_name, latest_mtime = e.name, mtime
+        except OSError: return
+
+        if latest_name is None: return
+        try:
+            latest_base = os.path.splitext(latest_name)[0]
             for i, img_path in enumerate(self.image_list):
                 img_base = os.path.splitext(os.path.basename(img_path))[0]
                 if img_base == latest_base:
@@ -1621,57 +1755,75 @@ class UltimateAnnotator(ctk.CTk):
             self.redraw_boxes() # Colors might shift
 
     # --- OPTIMIZED REFRESH LIST ---
-    def refresh_file_list(self, event=None):
-        self.file_listbox.delete(0, tk.END)
-        self.filtered_indices = [] 
+    def get_dir_listing(self, d):
+        # One directory scan answers "does this annotation exist?" for every image,
+        # instead of one os.path.exists() call per image (slow on large / network folders)
+        listing = self.dir_listing.get(d)
+        if listing is None:
+            try:
+                with os.scandir(d) as it: listing = {normcase_name(e.name) for e in it}
+            except OSError: listing = set()
+            self.dir_listing[d] = listing
+        return listing
 
+    def mark_annotation(self, img_path, exists):
+        d, name = os.path.split(self.get_annotation_path(img_path))
+        listing = self.get_dir_listing(d)
+        if exists: listing.add(normcase_name(name))
+        else: listing.discard(normcase_name(name))
+
+    def on_search_key(self, event=None):
+        # Debounce: rebuild the list once typing pauses, not on every keystroke
+        if self.search_job is not None: self.after_cancel(self.search_job)
+        self.search_job = self.after(200, self.refresh_file_list)
+
+    def refresh_file_list(self, event=None):
+        self.search_job = None
         search_text = self.entry_search.get().lower().strip()
         show_unlabelled = self.show_unlabelled_var.get()
-        
+        ext = self.get_annotation_ext()
+        name_cache = self.name_cache
+        last_dir, listing = None, None
+
+        items = []
+        filtered = []
         for idx, path in enumerate(self.image_list):
-            basename = os.path.basename(path)
-            if search_text and search_text not in basename.lower():
+            # Path parsing is cached per image; it dominates the cost on large lists
+            info = name_cache.get(path)
+            if info is None:
+                img_dir, basename = os.path.split(path)
+                info = name_cache[path] = (img_dir, basename, basename.lower(), normcase_name(os.path.splitext(basename)[0]))
+            img_dir, basename, basename_lower, stem = info
+            if search_text and search_text not in basename_lower:
                 continue
 
-            # Cached check
-            if path in self.annot_cache:
-                exists = self.annot_cache[path]
-            else:
-                annot_path = self.get_annotation_path(path)
-                exists = os.path.exists(annot_path)
-                self.annot_cache[path] = exists
+            # Same as get_annotation_path() + listing lookup, inlined for speed on large lists
+            annot_dir = self.label_dir or img_dir
+            if annot_dir != last_dir:
+                last_dir, listing = annot_dir, self.get_dir_listing(annot_dir)
+            exists = (stem + ext) in listing
 
             # Unlabelled filter logic
             if show_unlabelled and exists:
                 continue
 
             prefix = "✔ " if exists else "   "
-            display_text = f"{prefix}{basename}"
-            
-            self.file_listbox.insert(tk.END, display_text)
-            self.filtered_indices.append(idx)
-            
+            items.append(f"{prefix}{basename}")
+            filtered.append(idx)
+
+        self.filtered_indices = filtered
+        self.filtered_pos = {real: pos for pos, real in enumerate(filtered)}
+        self.file_listbox.set_items(items)
+
         self.highlight_current_file()
 
     def highlight_current_file(self):
-        self.file_listbox.selection_clear(0, tk.END)
-        
-        # Find index in filtered list
-        listbox_idx = -1
-        try:
-            listbox_idx = self.filtered_indices.index(self.current_index)
-        except ValueError:
-            pass # Current image filtered out
-        
-        if listbox_idx != -1:
-            self.file_listbox.selection_set(listbox_idx)
-            self.file_listbox.see(listbox_idx)
+        # Find index in filtered list (-1 if the current image is filtered out)
+        listbox_idx = self.filtered_pos.get(self.current_index, -1)
+        self.file_listbox.select(listbox_idx, see=listbox_idx != -1)
 
-    def on_listbox_select(self, event):
-        selection = self.file_listbox.curselection()
-        if not selection: return
-        
-        listbox_idx = selection[0]
+    def on_listbox_select(self, listbox_idx):
+        if not (0 <= listbox_idx < len(self.filtered_indices)): return
         real_idx = self.filtered_indices[listbox_idx]
         
         if real_idx != self.current_index:
@@ -1696,17 +1848,31 @@ class UltimateAnnotator(ctk.CTk):
         if not self.image_list: return
         path = self.image_list[self.current_index]
         name = os.path.basename(path)
-        self.pil_image = Image.open(path)
-        
+
         count_str = f"[{self.current_index + 1}/{len(self.image_list)}]"
-        
+
         # Reset window title to static
         self.title("Annotamate Pro")
-        
+
         self.bboxes = []
         self.undo_stack = []
         self.redo_stack = []
         self.selected_box_idx = None
+
+        # A corrupt / unreadable file shouldn't break navigation through the dataset
+        try:
+            img = Image.open(path)
+            img.load() # Decode now so errors surface here (also releases the file handle)
+            self.pil_image = img
+        except Exception as e:
+            print(f"Could not open {path}: {e}")
+            self.pil_image = None
+            self.canvas.delete("all"); self.tile_key = None; self.base_tile = None
+            self.lbl_info.configure(text=f"{name}  |  Could not open image: {e} {count_str}")
+            self.has_unsaved_changes = False
+            self.highlight_current_file()
+            self.update_sidebar_objects()
+            return
 
         # Load annotations
         loaded_annot_path = self.load_annotations(path)
@@ -1732,10 +1898,15 @@ class UltimateAnnotator(ctk.CTk):
 
     def render_image(self):
         if not self.pil_image: return
+        self.layout_image()
+        self.update_view()
+
+    def layout_image(self):
+        # Sets up offsets / scroll region for the current zoom without rendering pixels.
+        # The actual image is drawn by update_view(), which only renders the visible area.
         w, h = self.pil_image.size
         new_w, new_h = int(w * self.imscale), int(h * self.imscale)
-        self.tk_image = ImageTk.PhotoImage(self.pil_image.resize((new_w, new_h), Image.Resampling.NEAREST))
-        
+
         if self.lbl_zoom:
             self.lbl_zoom.configure(text=f"{int(self.imscale * 100)}%")
 
@@ -1753,9 +1924,74 @@ class UltimateAnnotator(ctk.CTk):
         else: self.v_scroll.grid_remove()
 
         self.canvas.delete("all")
-        self.canvas.config(scrollregion=(0, 0, new_w, new_h)) 
-        self.canvas.create_image(self.img_ox, self.img_oy, anchor="nw", image=self.tk_image)
-        self.redraw_boxes()
+        self.tile_key = None
+        self.base_tile = None
+        self.canvas.config(scrollregion=(0, 0, new_w, new_h))
+
+    def get_viewport(self):
+        # Visible area in canvas coordinates: (x0, y0, x1, y1)
+        x0, y0 = self.canvas.canvasx(0), self.canvas.canvasy(0)
+        return x0, y0, x0 + self.canvas.winfo_width(), y0 + self.canvas.winfo_height()
+
+    def update_view(self):
+        if self.view_update_job is not None:
+            self.after_cancel(self.view_update_job)
+            self.view_update_job = None
+        if not self.pil_image: return
+
+        # Crop just the visible part of the source image (plus 1px so edges stay covered)
+        # and scale only that, instead of resizing the whole image at high zoom.
+        s = self.imscale
+        w, h = self.pil_image.size
+        vx0, vy0, vx1, vy1 = self.get_viewport()
+        sx0 = max(0, int((vx0 - self.img_ox) / s))
+        sy0 = max(0, int((vy0 - self.img_oy) / s))
+        sx1 = min(w, int((vx1 - self.img_ox) / s) + 2)
+        sy1 = min(h, int((vy1 - self.img_oy) / s) + 2)
+
+        self.rendered_view = (s, vx0, vy0, vx1, vy1)
+        if sx1 > sx0 and sy1 > sy0:
+            key = (s, sx0, sy0, sx1, sy1)
+            if key != self.tile_key:
+                out_w = max(1, round((sx1 - sx0) * s))
+                out_h = max(1, round((sy1 - sy0) * s))
+                tile = self.pil_image.resize((out_w, out_h), Image.Resampling.NEAREST, box=(sx0, sy0, sx1, sy1))
+                if tile.mode != "RGB": tile = self.flatten_to_rgb(tile)
+                self.base_tile = tile
+                self.tile_origin = (self.img_ox + sx0 * s, self.img_oy + sy0 * s)
+                self.tile_key = key
+        else:
+            self.base_tile = None
+        self.redraw_boxes() # Composites box fills onto the tile and puts it on the canvas
+
+    def flatten_to_rgb(self, img):
+        # Box fills can only be alpha-blended onto RGB, so transparent images are
+        # composited over the canvas background (which is what showed through before)
+        if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
+            r, g, b = (v // 257 for v in self.canvas.winfo_rgb(self.canvas.cget("bg")))
+            bg = Image.new("RGBA", img.size, (r, g, b, 255))
+            return Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
+        return img.convert("RGB")
+
+    def schedule_view_update(self):
+        # Coalesce many scroll events into one render when the app is idle
+        if self.view_update_job is None:
+            self.view_update_job = self.after_idle(self.on_view_scrolled)
+
+    def on_view_scrolled(self):
+        self.view_update_job = None
+        if not self.pil_image: return
+        # Skip if the view hasn't actually moved since the last render (e.g. right after a zoom)
+        if (self.imscale, *self.get_viewport()) != self.rendered_view:
+            self.update_view()
+
+    def on_canvas_xscroll(self, *args):
+        self.h_scroll.set(*args)
+        self.schedule_view_update()
+
+    def on_canvas_yscroll(self, *args):
+        self.v_scroll.set(*args)
+        self.schedule_view_update()
 
     def get_canvas_coords_raw(self, event):
         return self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
@@ -1813,9 +2049,9 @@ class UltimateAnnotator(ctk.CTk):
         if new_scale == self.imscale: return
         self.imscale = new_scale
         
-        # 3. Render
-        self.render_image()
-        
+        # 3. Layout only; pixels are rendered once the view is positioned (step 5)
+        self.layout_image()
+
         # 4. Scroll to keep point under mouse
         new_c_x = img_x * self.imscale + self.img_ox
         new_c_y = img_y * self.imscale + self.img_oy
@@ -1831,6 +2067,9 @@ class UltimateAnnotator(ctk.CTk):
             
         if total_h > self.canvas.winfo_height():
             self.canvas.yview_moveto(max(0, target_scroll_y / total_h))
+
+        # 5. Render the visible area
+        self.update_view()
 
     # --- SCROLL INPUT ---
     def on_vertical_scroll(self, event):
@@ -1921,6 +2160,7 @@ class UltimateAnnotator(ctk.CTk):
     def on_mouse_up(self, event):
         if self.is_processing: return
         self.drawing = False; self.drag_action = None
+        if not self.pil_image: return
         mode = self.draw_mode_var.get()
         
         if mode == "Edit":
@@ -2095,8 +2335,17 @@ class UltimateAnnotator(ctk.CTk):
 
     def redraw_boxes(self):
         self.canvas.delete("box")
-        self.box_images = [] # Clear image cache
-        
+        vx0, vy0, vx1, vy1 = self.get_viewport()
+        margin = 30 # Room for the class label drawn above each box
+
+        # Box fills are blended straight into a copy of the image tile (much faster than
+        # stacking semi-transparent images on the canvas, which Tk blends in software)
+        tile, draw = None, None
+        if self.pil_image is not None and self.base_tile is not None:
+            tile = self.base_tile.copy()
+            draw = ImageDraw.Draw(tile, "RGBA")
+        tox, toy = self.tile_origin
+
         for i, box in enumerate(self.bboxes):
             # VISIBILITY CHECK
             if not box.get('visible', True):
@@ -2106,25 +2355,24 @@ class UltimateAnnotator(ctk.CTk):
             y1 = box['y1'] * self.imscale
             x2 = box['x2'] * self.imscale
             y2 = box['y2'] * self.imscale
-            
+
             sx1, sy1 = x1 + self.img_ox, y1 + self.img_oy
             sx2, sy2 = x2 + self.img_ox, y2 + self.img_oy
+
+            # Skip boxes that are entirely off-screen (redrawn when the view scrolls)
+            if sx2 < vx0 - margin or sx1 > vx1 + margin or sy2 < vy0 - margin or sy1 > vy1 + margin:
+                continue
 
             cid = box['class_id']
             # Use Fixed Colors
             hex_c = self.get_class_color(cid)
-            
+
             # --- Smooth Transparent Mask (PIL) ---
-            w_box = int(sx2 - sx1)
-            h_box = int(sy2 - sy1)
-            if w_box > 0 and h_box > 0:
+            if draw is not None and int(sx2 - sx1) > 0 and int(sy2 - sy1) > 0:
                 # Convert hex to rgb
                 rgb = tuple(int(hex_c.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-                # Create semi-transparent image (alpha 64 approx 25%)
-                fill_img = Image.new('RGBA', (w_box, h_box), rgb + (64,))
-                tk_fill = ImageTk.PhotoImage(fill_img)
-                self.box_images.append(tk_fill) # Prevent GC
-                self.canvas.create_image(sx1, sy1, image=tk_fill, anchor='nw', tags="box")
+                # Semi-transparent fill (alpha 64 approx 25%), in tile coordinates; PIL clips to the tile
+                draw.rectangle((sx1 - tox, sy1 - toy, sx2 - tox - 1, sy2 - toy - 1), fill=rgb + (64,))
 
             width = 3 if i != self.selected_box_idx else 4
             outline_color = hex_c if i != self.selected_box_idx else "white"
@@ -2154,8 +2402,14 @@ class UltimateAnnotator(ctk.CTk):
                     bg_rect = (bbox[0]-2, bbox[1]-2, bbox[2]+2, bbox[3]+2)
                     r_id = self.canvas.create_rectangle(bg_rect, fill=hex_c, outline=hex_c, tags="box")
                     self.canvas.tag_lower(r_id, t_id) # put bg behind text
-        
-        # Note: We do NOT call update_sidebar_objects here to avoid drag-lag. 
+
+        if tile is not None:
+            self.tk_image = ImageTk.PhotoImage(tile)
+            self.canvas.delete("img")
+            self.canvas.create_image(tox, toy, anchor="nw", image=self.tk_image, tags="img")
+            self.canvas.tag_lower("img")
+
+        # Note: We do NOT call update_sidebar_objects here to avoid drag-lag.
         # Sidebar updates happen on Add/Delete/Load or specific selection events.
 
     def find_box_under_mouse(self, ix, iy):
@@ -2195,20 +2449,18 @@ class UltimateAnnotator(ctk.CTk):
                 self.save_coco(img_path, w, h, self.bboxes)
                 
             self.has_unsaved_changes = False
-            self.annot_cache[img_path] = True # Mark current as annotated
+            self.mark_annotation(img_path, True) # Mark current as annotated
             self.highlight_current_file()
 
             # We need to refresh the current listbox item text to show checkmark
-            # but that's expensive to find. 
+            # but that's expensive to find.
             # Easiest way is just calling refresh_file_list() but that might reset scroll.
             # Efficient update for current item only:
             try:
-                listbox_idx = self.filtered_indices.index(self.current_index)
+                listbox_idx = self.filtered_pos[self.current_index]
                 prefix = "✔ "
                 text = f"{prefix}{os.path.basename(img_path)}"
-                self.file_listbox.delete(listbox_idx)
-                self.file_listbox.insert(listbox_idx, text)
-                self.file_listbox.selection_set(listbox_idx)
+                self.file_listbox.set_item(listbox_idx, text)
             except: pass
 
         except Exception as e: 
@@ -2402,15 +2654,14 @@ class UltimateAnnotator(ctk.CTk):
         if not self.image_list: return
         p = self.image_list[self.current_index]
         if not messagebox.askyesno("Delete", f"Delete {os.path.basename(p)}?"): return
-        self.canvas.delete("all"); self.pil_image.close(); self.pil_image = None
+        self.canvas.delete("all"); self.base_tile = None
+        if self.pil_image: self.pil_image.close() # May be None if the image failed to open
+        self.pil_image = None
         os.remove(p)
         tp = self.get_txt_path(p)
         if os.path.exists(tp): os.remove(tp)
+        self.mark_annotation(p, False)
         self.image_list.pop(self.current_index)
-        
-        # Clear cache for deleted file
-        if p in self.annot_cache:
-             del self.annot_cache[p]
 
         self.refresh_file_list()
         if self.image_list:
