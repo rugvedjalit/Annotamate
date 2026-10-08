@@ -30,6 +30,56 @@ PS_TEXT_COLOR = ("#1a1a1a", "#f0f0f0")  # Text
 PS_BORDER_COLOR = ("#cccccc", "#1a1a1a")
 PS_ACTIVE = ("#aaaaaa", "#6b6b6b")      # Active/Accent
 
+# --- KEYBOARD SHORTCUTS ---
+# action -> (group, description, default Tk sequence)
+# Shortcuts only conflict with others in the same group (each group is bound to a different window).
+SHORTCUT_DEFS = {
+    "rect_mode":     ("Main Window",   "Draw Rectangle",           "<Key-w>"),
+    "edit_mode":     ("Main Window",   "Edit Mode / Change Class", "<Key-x>"),
+    "save":          ("Main Window",   "Save Annotation",          "<Key-s>"),
+    "prev_image":    ("Main Window",   "Previous Image",           "<Key-a>"),
+    "next_image":    ("Main Window",   "Next Image",               "<Key-d>"),
+    "zoom_fit":      ("Main Window",   "Fit Image to Screen",      "<Key-f>"),
+    "undo":          ("Main Window",   "Undo",                     "<Control-Key-z>"),
+    "redo":          ("Main Window",   "Redo",                     "<Control-Key-y>"),
+    "duplicate_box": ("Main Window",   "Duplicate Box",            "<Control-Key-d>"),
+    "delete_box":    ("Main Window",   "Delete Selected Box",      "<Key-Delete>"),
+    "class_confirm": ("Class Manager", "Confirm / Close",          "<Key-s>"),
+    "class_prev":    ("Class Manager", "Previous Class",           "<Key-q>"),
+    "class_next":    ("Class Manager", "Next Class",               "<Key-e>"),
+}
+
+MODIFIER_KEYSYMS = {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+                    "Meta_L", "Meta_R", "Super_L", "Super_R", "Win_L", "Win_R",
+                    "Caps_Lock", "Num_Lock", "ISO_Level3_Shift"}
+
+def get_settings_path():
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "Annotamate", "settings.json")
+
+def format_shortcut(seq):
+    """'<Control-Key-z>' -> 'Ctrl+Z'"""
+    if not seq: return "None"
+    parts = seq.strip("<>").split("-")
+    key = parts[-1]
+    mods = [{"Control": "Ctrl"}.get(p, p) for p in parts[:-1] if p != "Key"]
+    if len(key) == 1:
+        if key.isupper() and "Shift" not in mods: mods.append("Shift")
+        key = key.upper()
+    return "+".join(mods + [key])
+
+def event_to_sequence(event):
+    """Build a Tk bind sequence from a KeyPress event. Returns None for modifier-only presses."""
+    keysym = event.keysym
+    if keysym in MODIFIER_KEYSYMS or not keysym or keysym == "??": return None
+    mods = []
+    if event.state & 0x4: mods.append("Control")
+    alt_mask = 0x20000 if sys.platform == "win32" else 0x8
+    if event.state & alt_mask: mods.append("Alt")
+    # Shift is already reflected in the keysym of printable chars ('W' vs 'w')
+    if event.state & 0x1 and len(keysym) != 1: mods.append("Shift")
+    return "<" + "-".join(mods + ["Key", keysym]) + ">"
+
 # --- ICON GENERATOR (Using tkfontawesome) ---
 class IconFactory:
     @staticmethod
@@ -121,25 +171,37 @@ class ClassManagerDialog(ctk.CTkToplevel):
         ctk.CTkButton(btn_frame, text="Delete", width=60, fg_color=PS_GRAY_LIGHT, hover_color="#C0392B", text_color=PS_TEXT_COLOR, command=self.on_delete).pack(side="left", padx=5)
 
         # Confirm/Close Button
-        btn_text = "Confirm (S)" if selection_mode else "Close (S)"
         btn_color = PS_ACTIVE if selection_mode else PS_GRAY_LIGHT
-        
-        ctk.CTkButton(
-            btn_frame, 
-            text=btn_text, 
-            width=100, 
-            fg_color=btn_color, 
+
+        self.btn_confirm = ctk.CTkButton(
+            btn_frame,
+            width=100,
+            fg_color=btn_color,
             hover_color=PS_GRAY_LIGHTER if not selection_mode else "#888888",
             text_color=PS_TEXT_COLOR,
             command=self.on_confirm
-        ).pack(side="right", padx=5)
+        )
+        self.btn_confirm.pack(side="right", padx=5)
 
-        # Shortcuts
-        self.bind("<s>", lambda e: self.on_confirm(e))
-        self.bind("<q>", self.on_q)
-        self.bind("<e>", self.on_e)
+        # Shortcuts (configurable via Settings)
+        self._bound_sequences = []
+        self.apply_shortcuts()
 
         self.refresh_list()
+
+    def apply_shortcuts(self):
+        for seq in self._bound_sequences: self.unbind(seq)
+        self._bound_sequences = []
+        sc = self.parent.shortcuts
+        for action, handler in (("class_confirm", self.on_confirm), ("class_prev", self.on_q), ("class_next", self.on_e)):
+            seq = sc.get(action)
+            if not seq: continue
+            try:
+                self.bind(seq, handler)
+                self._bound_sequences.append(seq)
+            except tk.TclError: pass
+        label = "Confirm" if self.selection_mode else "Close"
+        self.btn_confirm.configure(text=f"{label} ({format_shortcut(sc.get('class_confirm'))})")
 
     def refresh_list(self):
         # Clear existing
@@ -341,7 +403,8 @@ class UsageGuideDialog(ctk.CTkToplevel):
         scroll_frame = ctk.CTkScrollableFrame(self, label_text="Instructions", label_text_color=PS_TEXT_COLOR, fg_color=PS_GRAY_DARK)
         scroll_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        # Instructions Text
+        # Instructions Text (uses the user's configured shortcuts)
+        k = lambda action: format_shortcut(parent.shortcuts.get(action))
         instructions = (
             "1. Setup:\n"
             "   - Click 'Open Directory' to load images.\n"
@@ -350,16 +413,18 @@ class UsageGuideDialog(ctk.CTkToplevel):
             "   - Click 'Classes' in the top bar to Manage/Select active class.\n"
             "   - The Sidebar shows objects drawn on the CURRENT image.\n\n"
             "3. Drawing:\n"
-            "   - Press 'W' to activate Rect Tool.\n"
+            f"   - Press '{k('rect_mode')}' to activate Rect Tool.\n"
             "   - Click and drag to draw a box.\n"
             "   - Mode automatically switches to Edit after drawing.\n\n"
             "4. Editing:\n"
-            "   - Edit Mode (X) allows moving/resizing.\n"
-            "   - Press 'X' again with a box selected to change its class.\n"
-            "   - Drag center to move, drag corners to resize.\n\n"
+            f"   - Edit Mode ({k('edit_mode')}) allows moving/resizing.\n"
+            f"   - Press '{k('edit_mode')}' again with a box selected to change its class.\n"
+            "   - Drag center to move, drag corners to resize.\n"
+            f"   - Press '{k('delete_box')}' (or the trash icon in the Objects panel) to remove a box.\n\n"
             "5. Saving:\n"
             "   - Select Format (YOLO/VOC/COCO) in toolbar.\n"
-            "   - Press Ctrl+S to save."
+            f"   - Press {k('save')} to save.\n\n"
+            "Shortcuts can be changed in Settings > Keyboard Shortcuts."
         )
 
         lbl_instr = ctk.CTkLabel(
@@ -376,15 +441,9 @@ class UsageGuideDialog(ctk.CTkToplevel):
         # Shortcuts Section
         ctk.CTkLabel(scroll_frame, text="Keyboard Shortcuts", font=("Arial", 14, "bold"), text_color=PS_TEXT_COLOR).pack(pady=(15, 5), anchor="w", padx=10)
 
-        shortcuts = [
-            ("A", "Previous Image"),
-            ("D", "Next Image"),
-            ("W", "Draw Rectangle"),
-            ("X", "Edit Mode / Change Class"),
-            ("Ctrl + S", "Save Annotation"),
-            ("F", "Fit Image to Screen"),
-            ("Ctrl + Z", "Undo Last Action"),
-            ("Ctrl + Y", "Redo Action"),
+        shortcuts = [(format_shortcut(parent.shortcuts.get(action)), desc)
+                     for action, (group, desc, _) in SHORTCUT_DEFS.items() if group == "Main Window"]
+        shortcuts += [
             ("Ctrl + Scroll", "Zoom In/Out"),
             ("Right Click", "Undo Box"),
             ("Scroll", "Vertical Pan"),
@@ -415,6 +474,116 @@ class UsageGuideDialog(ctk.CTkToplevel):
             y = self.master.winfo_y() + (self.master.winfo_height() // 2) - 300
             self.geometry(f"+{x}+{y}")
         except: pass
+
+# --- SETTINGS DIALOG (Keyboard Shortcuts) ---
+class SettingsDialog(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Settings")
+        self.geometry("420x600")
+        self.resizable(False, True)
+        self.parent = parent
+        self.transient(parent)
+        self.configure(fg_color=PS_GRAY_MED)
+        self.grab_set()
+
+        if hasattr(parent, 'icon_path') and parent.icon_path:
+            try: self.after(200, lambda: self.iconbitmap(parent.icon_path))
+            except: pass
+
+        self.capturing = None # Action currently waiting for a key press
+        self.key_buttons = {}
+
+        ctk.CTkLabel(self, text="Keyboard Shortcuts", font=("Arial", 16, "bold"), text_color=PS_TEXT_COLOR).pack(pady=(15, 2))
+        ctk.CTkLabel(self, text="Click a shortcut, then press the new key combination.\nPress Esc to cancel.",
+                     font=("Arial", 11), text_color="gray").pack(pady=(0, 5))
+
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color=PS_GRAY_DARK)
+        self.scroll.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.lbl_status = ctk.CTkLabel(self, text="", font=("Arial", 11), text_color="#e74c3c", wraplength=380)
+        self.lbl_status.pack(pady=(2, 0))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=10)
+        ctk.CTkButton(btn_frame, text="Reset to Defaults", width=120, fg_color=PS_GRAY_LIGHT, hover_color=PS_GRAY_LIGHTER,
+                      text_color=PS_TEXT_COLOR, command=self.on_reset).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Close", width=100, fg_color=PS_ACTIVE, hover_color=PS_GRAY_LIGHTER,
+                      text_color=PS_TEXT_COLOR, command=self.destroy).pack(side="right", padx=5)
+
+        self.bind("<KeyPress>", self.on_key)
+
+        self.build_rows()
+        self.center_window()
+        self.focus_force()
+
+    def center_window(self):
+        self.update_idletasks()
+        try:
+            x = self.master.winfo_x() + (self.master.winfo_width() // 2) - 210
+            y = self.master.winfo_y() + (self.master.winfo_height() // 2) - 300
+            self.geometry(f"+{x}+{y}")
+        except: pass
+
+    def build_rows(self):
+        for w in self.scroll.winfo_children(): w.destroy()
+        self.key_buttons = {}
+        group = None
+        for action, (grp, desc, _) in SHORTCUT_DEFS.items():
+            if grp != group:
+                group = grp
+                ctk.CTkLabel(self.scroll, text=grp.upper(), font=("Arial", 12, "bold"), text_color="#aaaaaa").pack(anchor="w", padx=5, pady=(10, 2))
+
+            row = ctk.CTkFrame(self.scroll, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=desc, anchor="w", text_color=PS_TEXT_COLOR).pack(side="left", padx=5)
+            btn = ctk.CTkButton(row, text=format_shortcut(self.parent.shortcuts.get(action)), width=120, height=24,
+                                corner_radius=2, fg_color=PS_GRAY_LIGHT, hover_color=PS_GRAY_LIGHTER, text_color=PS_TEXT_COLOR,
+                                command=lambda a=action: self.start_capture(a))
+            btn.pack(side="right", padx=5)
+            self.key_buttons[action] = btn
+
+    def start_capture(self, action):
+        self.stop_capture()
+        self.capturing = action
+        self.key_buttons[action].configure(text="Press a key...", fg_color=PS_ACTIVE)
+        self.lbl_status.configure(text="")
+        self.focus_set()
+
+    def stop_capture(self):
+        if self.capturing:
+            self.key_buttons[self.capturing].configure(
+                text=format_shortcut(self.parent.shortcuts.get(self.capturing)), fg_color=PS_GRAY_LIGHT)
+        self.capturing = None
+
+    def on_key(self, event):
+        if not self.capturing: return
+        if event.keysym == "Escape":
+            self.stop_capture()
+            return "break"
+
+        seq = event_to_sequence(event)
+        if seq is None: return "break" # Modifier only, keep waiting
+
+        action = self.capturing
+        group = SHORTCUT_DEFS[action][0]
+        for other, other_seq in self.parent.shortcuts.items():
+            if other != action and other_seq == seq and SHORTCUT_DEFS[other][0] == group:
+                self.lbl_status.configure(text=f"'{format_shortcut(seq)}' is already used by '{SHORTCUT_DEFS[other][1]}'. Try another key.")
+                return "break"
+
+        if not self.parent.set_shortcut(action, seq):
+            self.lbl_status.configure(text=f"'{format_shortcut(seq)}' can't be used as a shortcut.")
+            return "break"
+
+        self.stop_capture()
+        return "break"
+
+    def on_reset(self):
+        self.capturing = None
+        self.parent.reset_shortcuts()
+        self.lbl_status.configure(text="")
+        self.build_rows()
 
 # --- MAIN APP ---
 class UltimateAnnotator(ctk.CTk):
@@ -451,8 +620,9 @@ class UltimateAnnotator(ctk.CTk):
         self.COLORS = ["#e74c3c", "#3498db", "#f1c40f", "#9b59b6", "#2ecc71", 
                        "#1abc9c", "#34495e", "#d35400", "#7f8c8d", "#c0392b"]
         
-        self.bboxes = []       
-        self.redo_stack = []   
+        self.bboxes = []
+        self.undo_stack = [] # Actions: ("add", box) or ("delete", idx, box)
+        self.redo_stack = []
         self.box_images = [] # Cache for Transparent PIL images
         
         self.auto_save_var = ctk.BooleanVar(value=False)
@@ -476,6 +646,8 @@ class UltimateAnnotator(ctk.CTk):
         self.has_unsaved_changes = False 
         
         self.class_manager_window = None
+        self._bound_sequences = [] # Shortcut sequences currently bound on the main window
+        self.load_settings()
 
         self.branding_img = None
         self.lbl_zoom = None
@@ -522,7 +694,8 @@ class UltimateAnnotator(ctk.CTk):
         self.icon_folder = IconFactory.create_icon("folder", size=s, color=c)
         self.icon_tag = IconFactory.create_icon("tag", size=s, color=c)
         self.icon_save = IconFactory.create_icon("save", size=s, color=c)
-        self.icon_del = IconFactory.create_icon("trash", size=s, color=c_red) 
+        self.icon_del = IconFactory.create_icon("trash", size=s, color=c_red)
+        self.icon_del_small = IconFactory.create_icon("trash", size=(12, 12), color=c_red)
         self.icon_prev = IconFactory.create_icon("prev", size=s, color=c)
         self.icon_next = IconFactory.create_icon("next", size=s, color=c)
         
@@ -563,20 +736,26 @@ class UltimateAnnotator(ctk.CTk):
         file_menu.add_command(label="Open Directory...", command=self.load_directory)
         file_menu.add_command(label="Set Label Directory...", command=self.set_label_directory)
         file_menu.add_separator()
-        file_menu.add_command(label="Save Annotation (Ctrl+S)", command=self.save_annotation)
+        k = lambda action: format_shortcut(self.shortcuts.get(action))
+        file_menu.add_command(label=f"Save Annotation ({k('save')})", command=self.save_annotation)
         file_menu.add_command(label="Delete Image", command=self.delete_current_image)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
         
         edit_menu = tk.Menu(menubar, tearoff=0, bg=bg_color, fg=fg_color)
-        edit_menu.add_command(label="Rect Tool (W)", command=lambda: self.set_mode("Rect"))
-        edit_menu.add_command(label="Edit Tool (X)", command=lambda: self.set_mode("Edit"))
+        edit_menu.add_command(label=f"Rect Tool ({k('rect_mode')})", command=lambda: self.set_mode("Rect"))
+        edit_menu.add_command(label=f"Edit Tool ({k('edit_mode')})", command=lambda: self.set_mode("Edit"))
         edit_menu.add_separator()
-        edit_menu.add_command(label="Duplicate Box (Ctrl+D)", command=self.duplicate_selected_box)
-        edit_menu.add_command(label="Undo (Ctrl+Z)", command=self.undo_last)
-        edit_menu.add_command(label="Redo (Ctrl+Y)", command=self.redo_last)
+        edit_menu.add_command(label=f"Duplicate Box ({k('duplicate_box')})", command=self.duplicate_selected_box)
+        edit_menu.add_command(label=f"Delete Box ({k('delete_box')})", command=self.delete_selected_box)
+        edit_menu.add_command(label=f"Undo ({k('undo')})", command=self.undo_last)
+        edit_menu.add_command(label=f"Redo ({k('redo')})", command=self.redo_last)
         menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        settings_menu = tk.Menu(menubar, tearoff=0, bg=bg_color, fg=fg_color)
+        settings_menu.add_command(label="Keyboard Shortcuts...", command=self.open_settings)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
         
         # --- NEW RENAME MENU ---
         rename_menu = tk.Menu(menubar, tearoff=0, bg=bg_color, fg=fg_color)
@@ -878,7 +1057,8 @@ class UltimateAnnotator(ctk.CTk):
         self.frame_zoom = ctk.CTkFrame(self.footer, fg_color="transparent")
         self.frame_zoom.pack(side="right", padx=15)
         
-        ctk.CTkButton(self.frame_zoom, text="Fit (F)", width=60, height=20, corner_radius=2, fg_color=PS_GRAY_LIGHT, hover_color=PS_GRAY_LIGHTER, text_color=PS_TEXT_COLOR, font=("Arial", 10), command=self.zoom_fit).pack(side="left", padx=5)
+        self.btn_fit = ctk.CTkButton(self.frame_zoom, text=f"Fit ({format_shortcut(self.shortcuts.get('zoom_fit'))})", width=60, height=20, corner_radius=2, fg_color=PS_GRAY_LIGHT, hover_color=PS_GRAY_LIGHTER, text_color=PS_TEXT_COLOR, font=("Arial", 10), command=self.zoom_fit)
+        self.btn_fit.pack(side="left", padx=5)
         ctk.CTkButton(self.frame_zoom, text="-", width=24, height=20, corner_radius=2, fg_color=PS_GRAY_LIGHT, hover_color=PS_GRAY_LIGHTER, text_color=PS_TEXT_COLOR, font=("Arial", 12, "bold"), command=self.zoom_out).pack(side="left", padx=2)
         self.lbl_zoom = ctk.CTkLabel(self.frame_zoom, text="100%", width=40, text_color=PS_TEXT_COLOR, font=("Arial", 11))
         self.lbl_zoom.pack(side="left", padx=2)
@@ -1230,19 +1410,83 @@ class UltimateAnnotator(ctk.CTk):
         self.redraw_boxes()
 
     def _bind_shortcuts(self): self.bind_shortcuts_func()
-    def bind_shortcuts_func(self):
-        self.bind("w", lambda e: self.set_mode("Rect"))
-        self.bind("x", lambda e: self.on_press_x())
-        self.bind("s", lambda e: self.save_annotation())
-        self.bind("a", lambda e: self.prev_image())
-        self.bind("d", lambda e: self.next_image())
-        self.bind("f", lambda e: self.zoom_fit()) 
-        self.bind("<Control-z>", lambda e: self.undo_last(e))
-        self.bind("<Control-y>", lambda e: self.redo_last(e))
-        self.bind("<Control-d>", lambda e: self.duplicate_selected_box(e)) # New Binding
+    def get_shortcut_handlers(self):
+        return {
+            "rect_mode":     lambda e: self.set_mode("Rect"),
+            "edit_mode":     lambda e: self.on_press_x(),
+            "save":          lambda e: self.save_annotation(),
+            "prev_image":    lambda e: self.prev_image(),
+            "next_image":    lambda e: self.next_image(),
+            "zoom_fit":      lambda e: self.zoom_fit(),
+            "undo":          lambda e: self.undo_last(e),
+            "redo":          lambda e: self.redo_last(e),
+            "duplicate_box": lambda e: self.duplicate_selected_box(e),
+            "delete_box":    lambda e: self.delete_selected_box(e),
+        }
 
-    def unbind_shortcuts(self): 
-        self.unbind("w"); self.unbind("x"); self.unbind("s"); self.unbind("a"); self.unbind("d"); self.unbind("<Control-z>"); self.unbind("<Control-y>"); self.unbind("f"); self.unbind("<Control-d>")
+    def bind_shortcuts_func(self):
+        self.unbind_shortcuts()
+        for action, handler in self.get_shortcut_handlers().items():
+            seq = self.shortcuts.get(action)
+            if not seq: continue
+            try:
+                self.bind(seq, handler)
+                self._bound_sequences.append(seq)
+            except tk.TclError: pass
+
+    def unbind_shortcuts(self):
+        for seq in self._bound_sequences: self.unbind(seq)
+        self._bound_sequences = []
+
+    # --- SETTINGS (Configurable Shortcuts) ---
+    def is_valid_sequence(self, seq):
+        # Test on a throwaway bind tag so live window bindings are untouched
+        try:
+            self.bind_class("AnnotamateValidate", seq, lambda e: None)
+            self.unbind_class("AnnotamateValidate", seq)
+            return True
+        except tk.TclError:
+            return False
+
+    def load_settings(self):
+        self.shortcuts = {action: d[2] for action, d in SHORTCUT_DEFS.items()}
+        try:
+            with open(get_settings_path(), "r") as f:
+                data = json.load(f)
+            for action, seq in data.get("shortcuts", {}).items():
+                if action in self.shortcuts and isinstance(seq, str) and self.is_valid_sequence(seq):
+                    self.shortcuts[action] = seq
+        except (OSError, ValueError, AttributeError): pass
+
+    def save_settings(self):
+        path = get_settings_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump({"shortcuts": self.shortcuts}, f, indent=4)
+        except OSError as e:
+            print(f"Could not save settings: {e}")
+
+    def set_shortcut(self, action, seq):
+        if not self.is_valid_sequence(seq): return False
+        self.shortcuts[action] = seq
+        self.on_shortcuts_changed()
+        return True
+
+    def reset_shortcuts(self):
+        self.shortcuts = {action: d[2] for action, d in SHORTCUT_DEFS.items()}
+        self.on_shortcuts_changed()
+
+    def on_shortcuts_changed(self):
+        self.save_settings()
+        self.bind_shortcuts_func()
+        self._setup_menu() # Refresh shortcut hints in menu labels
+        self.btn_fit.configure(text=f"Fit ({format_shortcut(self.shortcuts.get('zoom_fit'))})")
+        if self.class_manager_window and self.class_manager_window.winfo_exists():
+            self.class_manager_window.apply_shortcuts()
+
+    def open_settings(self):
+        SettingsDialog(self)
 
     def on_press_x(self):
         # Switch to Edit mode
@@ -1275,7 +1519,19 @@ class UltimateAnnotator(ctk.CTk):
         box['y1'] = min(box['y1'] + offset, h - 5); box['y2'] = min(box['y2'] + offset, h)
         
         self.bboxes.append(box)
+        self.record_action(("add", box))
         self.selected_box_idx = len(self.bboxes) - 1 # Select new box
+        self.redraw_boxes(); self.update_sidebar_objects(); self.has_unsaved_changes = True
+
+    def delete_selected_box(self, event=None):
+        self.delete_box(self.selected_box_idx)
+
+    def delete_box(self, idx):
+        if self.is_processing: return
+        if idx is None or not (0 <= idx < len(self.bboxes)): return
+        box = self.bboxes.pop(idx)
+        self.record_action(("delete", idx, box))
+        self.selected_box_idx = None
         self.redraw_boxes(); self.update_sidebar_objects(); self.has_unsaved_changes = True
 
     def check_unsaved_changes(self):
@@ -1288,15 +1544,44 @@ class UltimateAnnotator(ctk.CTk):
             if choice: self.save_annotation()
         return True
 
+    def record_action(self, action):
+        self.undo_stack.append(action)
+        self.clear_redo_stack()
+
+    def _remove_box_by_identity(self, box):
+        # Dicts may compare equal (e.g. duplicates), so match the exact object
+        for i, b in enumerate(self.bboxes):
+            if b is box:
+                self.bboxes.pop(i)
+                return
+
     def undo_last(self, event=None):
-        if self.bboxes: 
-            box = self.bboxes.pop(); self.redo_stack.append(box); 
-            self.redraw_boxes(); self.update_sidebar_objects()
-            self.has_unsaved_changes = True
+        if self.undo_stack:
+            action = self.undo_stack.pop()
+            if action[0] == "add":
+                self._remove_box_by_identity(action[1])
+            else: # "delete" -> restore at original position
+                _, idx, box = action
+                self.bboxes.insert(min(idx, len(self.bboxes)), box)
+        elif self.bboxes:
+            # No recorded history (e.g. boxes loaded from file): remove last box
+            action = ("add", self.bboxes.pop())
+        else:
+            return
+        self.redo_stack.append(action)
+        self.selected_box_idx = None
+        self.redraw_boxes(); self.update_sidebar_objects()
+        self.has_unsaved_changes = True
 
     def redo_last(self, event=None):
         if self.redo_stack:
-            box = self.redo_stack.pop(); self.bboxes.append(box); 
+            action = self.redo_stack.pop()
+            if action[0] == "add":
+                self.bboxes.append(action[1])
+            else: # "delete"
+                self._remove_box_by_identity(action[2])
+            self.undo_stack.append(action)
+            self.selected_box_idx = None
             self.redraw_boxes(); self.update_sidebar_objects()
             self.has_unsaved_changes = True
 
@@ -1419,8 +1704,10 @@ class UltimateAnnotator(ctk.CTk):
         self.title("Annotamate Pro")
         
         self.bboxes = []
-        self.redo_stack = [] 
-        
+        self.undo_stack = []
+        self.redo_stack = []
+        self.selected_box_idx = None
+
         # Load annotations
         loaded_annot_path = self.load_annotations(path)
         
@@ -1694,8 +1981,9 @@ class UltimateAnnotator(ctk.CTk):
                     self.after(200, lambda: setattr(self, 'is_processing', False))
                     return 
 
-            self.clear_redo_stack() 
-            self.bboxes.append({"class_id": class_id, "x1": real_x1, "y1": real_y1, "x2": real_x2, "y2": real_y2, "visible": True})
+            box = {"class_id": class_id, "x1": real_x1, "y1": real_y1, "x2": real_x2, "y2": real_y2, "visible": True}
+            self.bboxes.append(box)
+            self.record_action(("add", box))
             self.has_unsaved_changes = True
             
             # Switch to Edit mode after drawing one box
@@ -1778,6 +2066,19 @@ class UltimateAnnotator(ctk.CTk):
                                 text_color=tc, height=20, # Reduced height
                                 command=lambda idx=i: self.select_object_from_sidebar(idx))
             btn.pack(side="left", fill="x", expand=True)
+
+            # --- DELETE BUTTON ---
+            btn_del = ctk.CTkButton(
+                row,
+                text="",
+                image=self.icon_del_small,
+                width=20,
+                height=20,
+                fg_color="transparent",
+                hover_color="#552222",
+                command=lambda idx=i: self.delete_box(idx)
+            )
+            btn_del.pack(side="right", padx=(2, 5), before=btn) # Pack before the expanding label so it keeps its space
 
             # --- SEPARATOR ---
             sep_col = "#ccc" if self.theme_mode == "Light" else "#2b2b2b"

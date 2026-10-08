@@ -56,6 +56,7 @@ python -m annotamate
 4. **Edit Boxes**:
    - Press `X` for **Edit Mode**.
    - Drag corners to resize or center to move.
+   - Press `Delete` (or click the trash icon in the Objects panel) to remove a box.
 5. **Save**: Press `Ctrl+S` to save annotations.
 
 ### Keyboard Shortcuts
@@ -68,8 +69,11 @@ python -m annotamate
 | **Ctrl + S** | Save Annotation |
 | **Ctrl + Z** | Undo |
 | **Ctrl + Y** | Redo |
+| **Delete** | Delete Selected Box |
 | **Ctrl + Scroll** | Zoom In/Out |
 | **Right Click** | Delete/Undo Box |
+
+All keyboard shortcuts (including the Class Manager's `S` / `Q` / `E`) can be changed under **Settings → Keyboard Shortcuts**. Your choices are saved to `%APPDATA%\Annotamate\settings.json` on Windows (`~/.config/Annotamate/settings.json` elsewhere).
 
 ## Development
 
