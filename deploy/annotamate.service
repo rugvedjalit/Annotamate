@@ -1,0 +1,83 @@
+# systemd unit for Annotamate.
+#
+# Install (see docs/guides/deployment.md for the full walk-through):
+#
+#   sudo useradd --system --home-dir /var/lib/annotamate --shell /usr/sbin/nologin annotamate
+#   sudo python3 -m venv /opt/annotamate/venv
+#   sudo /opt/annotamate/venv/bin/pip install annotamate-2.0.0-py3-none-any.whl
+#   sudo install -d -m 0750 -o root -g annotamate /etc/annotamate
+#   sudo install -m 0640 -o root -g annotamate deploy/annotamate.env.example /etc/annotamate/annotamate.env
+#   sudo install -m 0644 deploy/annotamate.service /etc/systemd/system/annotamate.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now annotamate
+#
+# Logs: journalctl -u annotamate -f
+
+[Unit]
+Description=Annotamate image annotation server
+Documentation=https://github.com/rugvedjalit/Annotamate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=annotamate
+Group=annotamate
+
+# Host, port, roots, data dir and the other settings live here.
+EnvironmentFile=/etc/annotamate/annotamate.env
+Environment=PYTHONUNBUFFERED=1
+
+# One process, one worker: presence and edit locks are kept in memory.
+ExecStart=/opt/annotamate/venv/bin/annotamate serve
+WorkingDirectory=/var/lib/annotamate
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Creates /var/lib/annotamate owned by the service user.
+StateDirectory=annotamate
+StateDirectoryMode=0750
+
+# Label files are created group-writable so that other members of the
+# service group (for example the users who run training jobs) can manage them.
+UMask=0002
+
+# --- Hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+
+# The whole file system is read-only for the service except the paths below.
+# List the data dir and EVERY dataset root from ANNOTAMATE_ROOTS here
+# (space-separated). The paths must exist or the service will not start.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/annotamate /data/datasets
+
+# /home, /root and /run/user are hidden from the service. If your datasets
+# live under /home, change this to `ProtectHome=read-only` and add the
+# dataset folder to ReadWritePaths.
+ProtectHome=true
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,85 @@
+# Caddy reverse proxy for Annotamate with automatic HTTPS.
+#
+# Caddy obtains and renews certificates by itself. It needs a public DNS name
+# pointing at this machine and ports 80 and 443 open.
+#
+# Both values below can be set through the environment; the part after the
+# colon is the default:
+#   ANNOTAMATE_DOMAIN    the public host name
+#   ANNOTAMATE_UPSTREAM  where `annotamate serve` listens
+#                        (use `annotamate:8765` in the docker-compose setup)
+#
+# On the Annotamate side set:
+#   ANNOTAMATE_HOST=127.0.0.1         (only the proxy should reach it)
+#   ANNOTAMATE_SECURE_COOKIES=true    (users arrive over HTTPS)
+#
+# With Caddy in a separate container (docker-compose) also set
+# FORWARDED_ALLOW_IPS=* on the Annotamate service, and do not publish its port;
+# on another machine set it to Caddy's address. Without it the sign-in rate
+# limit sees Caddy's address instead of the client's.
+#
+# `reverse_proxy` handles WebSockets (/api/ws) without extra configuration,
+# keeps the original Host header (Annotamate checks the WebSocket Origin
+# against it) and adds X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host.
+
+{$ANNOTAMATE_DOMAIN:annotate.example.com} {
+	encode zstd gzip
+
+	# Uploads: Annotamate enforces ANNOTAMATE_MAX_UPLOAD_MB per file. This is
+	# only an upper bound for one whole request, which may carry several files.
+	request_body {
+		max_size 2GB
+	}
+
+	reverse_proxy {$ANNOTAMATE_UPSTREAM:127.0.0.1:8765} {
+		# Large exports and uploads can take a while.
+		transport http {
+			response_header_timeout 10m
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Alternative: Annotamate under a sub-path of an existing site,
+# for example https://example.com/annotamate/
+#
+# Start Annotamate with the same prefix:
+#   ANNOTAMATE_BASE_URL=/annotamate/      (or: annotamate serve --base-url /annotamate/)
+#
+# The proxy must forward the path UNCHANGED. Annotamate serves its pages, its
+# API (/annotamate/api/...) and its WebSocket (/annotamate/api/ws) under the
+# prefix itself, so the prefix must not be stripped:
+#   - use `handle`, not `handle_path` (handle_path strips the prefix);
+#   - do not add `uri strip_prefix`.
+# ---------------------------------------------------------------------------
+# example.com {
+# 	encode zstd gzip
+#
+# 	# /annotamate -> /annotamate/
+# 	redir /annotamate /annotamate/ 308
+#
+# 	handle /annotamate/* {
+# 		request_body {
+# 			max_size 2GB
+# 		}
+# 		reverse_proxy 127.0.0.1:8765
+# 	}
+#
+# 	# ... the rest of your site ...
+# 	handle {
+# 		respond "Not found" 404
+# 	}
+# }
+
+# ---------------------------------------------------------------------------
+# Alternative: HTTPS inside a private network, with a certificate signed by
+# Caddy's own local authority (browsers must trust Caddy's root certificate).
+# ---------------------------------------------------------------------------
+# annotate.lan {
+# 	tls internal
+# 	reverse_proxy 127.0.0.1:8765
+# }

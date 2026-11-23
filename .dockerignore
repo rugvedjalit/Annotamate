@@ -1,0 +1,69 @@
+# Keep the build context small. Only pyproject.toml, README.md, LICENSE,
+# annotamate/ and web/ are needed by the Dockerfile.
+
+# Version control and CI
+.git
+.github
+.gitattributes
+
+# Python
+.venv
+venv
+env
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+.eggs
+build
+dist
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.hypothesis
+.coverage
+coverage.xml
+htmlcov
+tests
+
+# Frontend
+**/node_modules
+web/dist
+web/coverage
+web/playwright-report
+web/test-results
+web/blob-report
+web/playwright/.cache
+**/*.tsbuildinfo
+
+# The SPA is always rebuilt inside the image; never copy a stale local build.
+annotamate/server/static
+
+# Runtime data and secrets
+data
+datasets
+.annotamate
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.env
+.env.*
+!.env.example
+
+# Documentation and deployment files (README.md and LICENSE are needed by the build)
+docs
+deploy
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+
+# Editors and OS
+.idea
+.vscode
+.editorconfig
+*.swp
+.DS_Store
+Thumbs.db

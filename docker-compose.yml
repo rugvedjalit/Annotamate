@@ -1,0 +1,117 @@
+# Annotamate with Docker Compose.
+#
+#   mkdir -p datasets
+#   docker compose up -d
+#   open http://localhost:8765 and create the administrator account
+#
+# Full guide: docs/guides/deployment.md
+
+name: annotamate
+
+services:
+  annotamate:
+    image: ghcr.io/rugvedjalit/annotamate:latest
+    # To build from this checkout instead of pulling: docker compose up -d --build
+    build:
+      context: .
+    restart: unless-stopped
+
+    # The process runs as this user and group. Label files, classes.txt and
+    # uploaded images are written into ./datasets with this ownership, so it
+    # should match the owner of that folder on the host (check with `id -u`
+    # and `id -g`). Most shells do not export UID and GID, so when they are
+    # not 1000 put them in a `.env` file next to this one:
+    #
+    #   UID=1001
+    #   GID=1001
+    user: "${UID:-1000}:${GID:-1000}"
+
+    ports:
+      # Reachable from the network on port 8765 over plain HTTP.
+      # Behind a reverse proxy on the same host use "127.0.0.1:8765:8765",
+      # or remove `ports` entirely when using the Caddy service below.
+      - "8765:8765"
+
+    environment:
+      # Inside the container the server must listen on all interfaces.
+      ANNOTAMATE_HOST: "0.0.0.0"
+      ANNOTAMATE_PORT: "8765"
+      # Folders in which projects may be created (":"-separated).
+      ANNOTAMATE_ROOTS: /data
+      ANNOTAMATE_DATA_DIR: /var/lib/annotamate
+      # Set to "true" as soon as users reach the app over HTTPS.
+      ANNOTAMATE_SECURE_COOKIES: "false"
+      # Only when hosted under a sub-path, for example https://example.com/annotamate/
+      # (then also change the health check URL below to /annotamate/api/health).
+      # ANNOTAMATE_BASE_URL: /annotamate/
+      # ANNOTAMATE_SESSION_DAYS: "14"
+      # ANNOTAMATE_MAX_UPLOAD_MB: "50"
+      # ANNOTAMATE_LOG_LEVEL: info
+      # Behind the Caddy service below, trust its X-Forwarded-For header so that the
+      # sign-in rate limit counts real client addresses instead of the proxy's.
+      # Safe only while `ports` is removed, because then only the proxy can reach the app.
+      # FORWARDED_ALLOW_IPS: "*"
+      # PostgreSQL instead of SQLite. The image must include the driver:
+      # build it with --build-arg ANNOTAMATE_EXTRAS=postgres
+      # ANNOTAMATE_DATABASE_URL: postgresql+psycopg://annotamate:change-me@db:5432/annotamate
+
+    volumes:
+      # Application state: database (users, projects, chat, statuses) and caches.
+      - annotamate-state:/var/lib/annotamate
+      # Your datasets: images and label files. Labels are written here.
+      - ./datasets:/data
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # Annotamate keeps presence and edit locks in memory: run exactly one
+    # container. Do not scale this service.
+
+    # Hardening: read-only root file system, no capabilities, no privilege escalation.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # --------------------------------------------------------------------------
+  # Optional: HTTPS with Caddy (certificates are obtained automatically).
+  #
+  # 1. Point a DNS record for your domain at this host; open ports 80 and 443.
+  # 2. Uncomment this service and the two caddy volumes at the bottom.
+  # 3. Set ANNOTAMATE_DOMAIN below.
+  # 4. In the annotamate service: remove `ports`, set ANNOTAMATE_SECURE_COOKIES
+  #    to "true" and enable FORWARDED_ALLOW_IPS: "*".
+  # --------------------------------------------------------------------------
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #   depends_on:
+  #     annotamate:
+  #       condition: service_healthy
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #     - "443:443/udp"
+  #   environment:
+  #     ANNOTAMATE_DOMAIN: annotate.example.com
+  #     ANNOTAMATE_UPSTREAM: annotamate:8765
+  #   volumes:
+  #     - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy-data:/data
+  #     - caddy-config:/config
+
+volumes:
+  annotamate-state:
+  # caddy-data:
+  # caddy-config:
