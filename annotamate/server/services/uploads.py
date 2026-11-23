@@ -22,7 +22,7 @@ from annotamate.server.errors import ApiError, bad_request
 from annotamate.server.models import Image, Project
 from annotamate.server.services import notify, serialize
 from annotamate.server.services.access import ProjectAccess
-from annotamate.server.services.indexing import counts_for, parse_for_index, renumber, replace_class_counts
+from annotamate.server.services.indexing import counts_for, parse_for_index, replace_class_counts, set_label_state
 from annotamate.server.services.labels import load_class_table
 from annotamate.server.services.paths import RESERVED_YOLO_KEY, ProjectPaths, label_key
 
@@ -155,6 +155,7 @@ def save_uploads(ctx: AppContext, session: Session, access: ProjectAccess, files
     if written:
         with ctx.quiet_label_lock(project.id):  # the files are written: index them after a class migration
             table = load_class_table(session, project.id, project.label_format)
+            class_version = session.scalar(select(Project.class_version).where(Project.id == project.id)) or 0
             existing = dict(session.execute(select(Image.rel_path, Image.id).where(
                 Image.project_id == project.id, Image.rel_path.in_(written))).all())
             revived = list(existing.values())  # rows of files that had gone missing and are back
@@ -165,17 +166,17 @@ def save_uploads(ctx: AppContext, session: Session, access: ProjectAccess, files
                     continue
                 parsed = parse_for_index(paths, rel)
                 per_class, unknown, boxes = counts_for(table, parsed)
+                # The sort key (set from the path) places the image in the list: no other row changes.
                 image = Image(project_id=project.id, rel_path=rel, filename=posixpath.basename(rel),
                               label_key=label_key(rel),
-                              sort_index=0,
                               status="done" if parsed.has_label else "todo", has_label=parsed.has_label,
                               box_count=boxes, unknown_count=unknown, flagged=False, comment_count=0,
                               open_comment_count=0)
+                set_label_state(image, parsed.stat, class_version)
                 session.add(image)
                 session.flush()
                 replace_class_counts(session, image.id, per_class)
                 added.append(image)
-            renumber(session, project.id)
             notify.record(session, project.id, "images_uploaded", user=access.user, count=len(added),
                           data={"count": len(added)})
             emit(session, ("project", project.id), {"type": "images.bulk_updated", "project_id": project.id,

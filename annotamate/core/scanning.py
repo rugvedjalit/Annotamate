@@ -38,6 +38,48 @@ def natural_sorted(items: list[str]) -> list[str]:
     return sorted(items, key=natural_key)
 
 
+def natural_sort_key(text: str) -> bytes:
+    """``natural_key`` as bytes: comparing two results byte by byte orders them exactly like ``natural_key``.
+
+    Stored next to each image so that a database can sort and count in natural order (binary comparison of
+    a ``BLOB``/``bytea`` column is the same everywhere, unlike text collations). Layout, per path component:
+
+    * a text run: its casefolded UTF-8 bytes (bytes below ``0x04`` are escaped as ``0x03, byte + 1``), then one
+      byte saying what follows: ``0x02`` a number, ``0x01`` the next component, ``0x00`` the end of the path;
+    * a number: the count of its decimal digits (two bytes, big-endian) and the digits without leading zeros.
+
+    The original text follows as the tie-breaker (``img07`` and ``img7``, ``A.jpg`` and ``a.jpg``).
+    A shorter text run sorts first because every terminator is smaller than any text byte; a path that ends
+    sorts before one that goes on, and a component that ends before one that continues with a number, because
+    the terminators are ordered that way: the same rules as comparing the tuples of ``natural_key``.
+    """
+    out = bytearray()
+    components = text.replace("\\", "/").split("/")
+    last = len(components) - 1
+    for n, component in enumerate(components):
+        chunks = _DIGITS.split(component.casefold())
+        final = len(chunks) - 1
+        for i, chunk in enumerate(chunks):
+            if i % 2:
+                digits = str(int(chunk)).encode("ascii")
+                out += len(digits).to_bytes(2, "big")
+                out += digits
+                continue
+            raw = chunk.encode("utf-8", "surrogatepass")
+            if min(raw, default=4) >= 4:
+                out += raw
+            else:
+                for byte in raw:
+                    if byte < 4:
+                        out.append(3)
+                        out.append(byte + 1)
+                    else:
+                        out.append(byte)
+            out.append(2 if i < final else 1 if n < last else 0)
+    out += text.encode("utf-8", "surrogatepass")
+    return bytes(out)
+
+
 def _is_junction(path: str) -> bool:
     """True for a Windows junction (``os.path.isjunction`` exists from Python 3.12)."""
     isjunction = getattr(os.path, "isjunction", None)

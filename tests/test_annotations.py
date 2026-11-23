@@ -276,7 +276,7 @@ def test_revisions_are_capped(setup):
     for n in range(53):
         version = ann.put(f"{url}/annotation", json={"base_version": version,
                                                      "boxes": [box(cat, 1, 1, 2 + n % 40, 9)]}).json()["version"]
-    assert len(ann.get(f"{url}/revisions").json()) == 50
+    assert len(ann.get(f"{url}/revisions").json()) == 20  # ANNOTAMATE_REVISIONS_KEEP, see test_scale.py
 
 
 def test_saves_coalesce_in_activity(setup, app):

@@ -34,9 +34,9 @@ def put_annotation(iid: int, body: AnnotationPut, access: Access, ctx: Ctx, db: 
 
 
 @router.get("/projects/{pid}/images/{iid}/revisions", response_model=list[RevisionSummary])
-def list_revisions(iid: int, access: Access, db: DB) -> list[dict]:
+def list_revisions(iid: int, access: Access, ctx: Ctx, db: DB) -> list[dict]:
     image = get_image(db, access.project.id, iid)
-    return svc.revision_summary(db, image.id)
+    return svc.revision_summary(db, image.id, ctx.settings.revisions_keep)
 
 
 def _revision(db: DB, image_id: int, rid: int) -> Revision:

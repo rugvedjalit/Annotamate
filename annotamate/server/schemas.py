@@ -402,7 +402,8 @@ class ActivityPage(Model):
 
 
 class ImageList(Model):
-    total: int
+    #: Number of matches; ``None`` on pages where it was not counted (see ``count`` in api.md).
+    total: int | None
     offset: int
     items: list[ImageItem]
 

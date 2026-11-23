@@ -18,7 +18,7 @@ def test_migrations_match_models(tmp_path):
     with db.engine.connect() as conn:
         diff = compare_metadata(MigrationContext.configure(conn, opts={"compare_type": True}), Base.metadata)
         assert diff == []
-        assert conn.execute(text("select version_num from alembic_version")).scalar() == "0003"
+        assert conn.execute(text("select version_num from alembic_version")).scalar() == "0004"
     assert set(inspect(db.engine).get_table_names()) >= {"users", "projects", "images", "alembic_version"}
     db.dispose()
 

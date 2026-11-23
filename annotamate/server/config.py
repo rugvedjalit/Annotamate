@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     #: Threads that run the request handlers. Few threads serve many users faster than many (they share one
     #: interpreter lock); slow work (image decoding, uploads, label rewrites) runs on its own small pools.
     worker_threads: int = Field(4, ge=1, le=64)
+    #: Saved versions kept per image (older ones are removed with each save).
+    revisions_keep: int = Field(20, ge=1, le=1000)
+    #: Activity entries and read notifications older than this many days are removed once a day (0 = keep all).
+    activity_retention_days: int = Field(0, ge=0, le=36500)
 
     @field_validator("roots", mode="before")
     @classmethod

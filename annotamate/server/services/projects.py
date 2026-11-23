@@ -311,8 +311,31 @@ def update_project(ctx: AppContext, session: Session, access: ProjectAccess, bod
     notify.record(session, project.id, "project_updated", user=access.user, data={"changes": changed, "values": values})
     emit(session, ("project", project.id), {"type": "project.updated", "project_id": project.id})
     session.commit()
+    _forget_file_states(ctx, session, project.id, labels="label_dir" in changed, sizes="exif_mode" in changed)
     if reindex:
         index_project(ctx, project.id)
+
+
+def _forget_file_states(ctx: AppContext, session: Session, project_id: int, *, labels: bool, sizes: bool) -> None:
+    """Drop what the index remembers about files once a setting makes it meaningless.
+
+    ``labels``: the label folder changed, so the remembered label files are other files (the rescan that
+    follows reads every label file). ``sizes``: the EXIF mode changed, so the remembered pixel sizes are those
+    of the other mode. Done under the label lock, after the setting is committed: whoever stores such a state
+    (an index pass, a save, an export) does it under the same lock and checks the setting first.
+    """
+    if not (labels or sizes):
+        return
+    with ctx.label_locks(project_id):
+        if labels:
+            session.execute(update(Image).where(Image.project_id == project_id, Image.counted_version.is_not(None))
+                            .values(label_size=None, label_mtime_ns=None, counted_version=None)
+                            .execution_options(synchronize_session=False))
+        if sizes:
+            session.execute(update(Image).where(Image.project_id == project_id, Image.width.is_not(None))
+                            .values(width=None, height=None, file_size=None, file_mtime_ns=None)
+                            .execution_options(synchronize_session=False))
+        session.commit()
 
 
 def delete_project(ctx: AppContext, session: Session, access: ProjectAccess) -> None:

@@ -39,7 +39,8 @@ export function useImagePages(projectId: number, filters: ImageFilters, pageSize
     })),
   })
 
-  const total = results[0]?.data?.total
+  // Only the first page (offset 0) carries the count; it is always among the loaded pages.
+  const total = results[0]?.data?.total ?? undefined
   const lastPage = total !== undefined ? Math.max(0, Math.ceil(total / pageSize) - 1) : Infinity
 
   const pages = new Map<number, ImageItem[]>()

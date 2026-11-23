@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ColumnElement, DateTime, and_, bindparam, exists, func, literal, or_, select, update
+from sqlalchemy import ColumnElement, DateTime, and_, bindparam, case, exists, func, literal, or_, select, update
 from sqlalchemy.orm import Session
 
 from annotamate.server.context import AppContext
@@ -17,6 +17,7 @@ from annotamate.server.schemas import STATUSES, ImageFilterIn
 from annotamate.server.services import notify, serialize
 from annotamate.server.services.access import EDIT_ROLES, REVIEW_ROLES, ProjectAccess
 from annotamate.server.services.comments import create_comment
+from annotamate.server.services.projects import image_counts
 
 _EPOCH = datetime(1970, 1, 1)
 
@@ -64,6 +65,17 @@ class ImageFilter:
         return cls.build(q=body.q, status=body.status, assignee=body.assignee, flagged=body.flagged,
                          class_id=body.class_id, has_comments=body.has_comments, sort=body.sort, loc="filter")
 
+    @property
+    def matches_all(self) -> bool:
+        """No condition: the list has every visible image of the project (in whatever order)."""
+        return (self.q is None and not self.statuses and self.assignee is None and self.flagged is None
+                and self.class_id is None and self.has_comments is None)
+
+    @property
+    def unfiltered(self) -> bool:
+        """Every visible image of the project, in natural order: the list itself gives the positions."""
+        return self.sort == "name" and self.matches_all
+
     def conditions(self, project_id: int, user_id: int) -> list[ColumnElement[bool]]:
         conds: list[ColumnElement[bool]] = [Image.project_id == project_id, Image.missing.is_(False)]
         if self.q:
@@ -95,37 +107,60 @@ def _updated_key() -> ColumnElement:
 
 def order_by(sort: str) -> list[ColumnElement]:
     if sort == "updated":
-        return [_updated_key().desc(), Image.sort_index.asc()]
-    return [Image.sort_index.asc()]
+        return [_updated_key().desc(), Image.sort_key.asc()]
+    return [Image.sort_key.asc()]
 
 
-def list_images(session: Session, access: ProjectAccess, flt: ImageFilter, offset: int, limit: int) -> dict[str, Any]:
+def list_images(session: Session, access: ProjectAccess, flt: ImageFilter, offset: int, limit: int,
+                count: bool | None = None) -> dict[str, Any]:
+    """One page of the list. ``total`` is counted for the first page (or on request) and ``None`` otherwise:
+    counting every match again for each page of a long list is what made deep pages slow."""
     conds = flt.conditions(access.project.id, access.user.id)
-    total = session.scalar(select(func.count()).select_from(Image).where(*conds)) or 0
+    total: int | None = None
+    if count or (count is None and offset == 0):
+        total = session.scalar(select(func.count()).select_from(Image).where(*conds)) or 0
     rows = list(session.scalars(select(Image).where(*conds).order_by(*order_by(flt.sort)).offset(offset).limit(limit)))
-    return {"total": total, "offset": offset, "items": serialize.image_items(session, rows)}
+    # Without a filter the list is the project in natural order: the row at ``offset + n`` has that position.
+    positions = {image.id: offset + n for n, image in enumerate(rows)} if flt.unfiltered else None
+    return {"total": total, "offset": offset, "items": serialize.image_items(session, rows, positions)}
 
 
-def neighbors(session: Session, access: ProjectAccess, image: Image, flt: ImageFilter) -> dict[str, Any]:
-    conds = flt.conditions(access.project.id, access.user.id)
+def neighbors(ctx: AppContext, session: Session, access: ProjectAccess, image: Image,
+              flt: ImageFilter) -> dict[str, Any]:
+    """Previous and next image in the filtered list, and where ``image`` stands in it.
+
+    Without a filter the total is the project's cached image count and, in name order, the rest comes from
+    the ``(project_id, missing, sort_key)`` index: two seeks and one range count. With a filter the matches
+    are counted once (total, index and membership in a single pass) instead of three times.
+    """
+    project_id = access.project.id
+    conds = flt.conditions(project_id, access.user.id)
+    sort_key = session.scalar(select(Image.sort_key).where(Image.id == image.id))
     if flt.sort == "updated":
         key = _updated_key()
         current = image.updated_at or _EPOCH
-        before = or_(key > current, and_(key == current, Image.sort_index < image.sort_index))
-        after = or_(key < current, and_(key == current, Image.sort_index > image.sort_index))
-        prev_order = [key.asc(), Image.sort_index.desc()]
-        next_order = [key.desc(), Image.sort_index.asc()]
+        before = or_(key > current, and_(key == current, Image.sort_key < sort_key))
+        after = or_(key < current, and_(key == current, Image.sort_key > sort_key))
+        prev_order = [key.asc(), Image.sort_key.desc()]
+        next_order = [key.desc(), Image.sort_key.asc()]
     else:
-        before = Image.sort_index < image.sort_index
-        after = Image.sort_index > image.sort_index
-        prev_order = [Image.sort_index.desc()]
-        next_order = [Image.sort_index.asc()]
+        before = Image.sort_key < sort_key
+        after = Image.sort_key > sort_key
+        prev_order = [Image.sort_key.desc()]
+        next_order = [Image.sort_key.asc()]
     prev_id = session.scalar(select(Image.id).where(*conds, before).order_by(*prev_order).limit(1))
     next_id = session.scalar(select(Image.id).where(*conds, after).order_by(*next_order).limit(1))
-    total = session.scalar(select(func.count()).select_from(Image).where(*conds)) or 0
-    included = session.scalar(select(Image.id).where(*conds, Image.id == image.id)) is not None
-    index = (session.scalar(select(func.count()).select_from(Image).where(*conds, before)) or 0) if included else -1
-    return {"prev_id": prev_id, "next_id": next_id, "index": index, "total": total}
+    if flt.matches_all:  # the image is visible (``get_image``), so it is in the list
+        total = sum(image_counts(ctx, session, project_id)[0].values())
+        index = session.scalar(select(func.count()).select_from(Image).where(*conds, before)) or 0
+    else:
+        total, index, included = session.execute(select(
+            func.count(),
+            func.coalesce(func.sum(case((before, 1), else_=0)), 0),
+            func.coalesce(func.sum(case((Image.id == image.id, 1), else_=0)), 0),
+        ).select_from(Image).where(*conds)).one()
+        index = int(index) if included else -1
+    return {"prev_id": prev_id, "next_id": next_id, "index": index, "total": int(total)}
 
 
 def get_image(session: Session, project_id: int, image_id: int) -> Image:
@@ -262,7 +297,7 @@ def _target_ids(session: Session, access: ProjectAccess, image_ids: list[int] | 
         wanted = list(dict.fromkeys(image_ids))
         pairs: list[tuple[int, int]] = []
         for start in range(0, len(wanted), 500):
-            pairs.extend(session.execute(select(Image.id, Image.sort_index).where(
+            pairs.extend(session.execute(select(Image.id, Image.sort_key).where(
                 Image.project_id == project_id, Image.missing.is_(False),
                 Image.id.in_(wanted[start:start + 500]))).all())
         if len(pairs) != len(wanted):

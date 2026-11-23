@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from annotamate.server.db import emit
+from annotamate.server.db import Database, emit
 from annotamate.server.models import Activity, Notification, Project, ProjectMember, User, utcnow
 from annotamate.server.services import serialize
 
@@ -129,3 +129,35 @@ def record_save(session: Session, project_id: int, user: User, image_id: int, bo
         return
     record(session, project_id, "annotation_saved", user=user, image_id=image_id,
            data={"box_count": box_count, "saves": 1})
+
+
+# ---------------------------------------------------------------------------- retention
+
+#: Rows removed per transaction while pruning (short write locks, so saves never wait long).
+PRUNE_BATCH = 1000
+
+
+def prune_history(db: Database, days: int, should_stop: Callable[[], bool] = lambda: False) -> tuple[int, int]:
+    """Remove activity entries and *read* notifications older than ``days`` days.
+
+    Returns ``(activity entries, notifications)`` removed. Unread notifications are never removed, however
+    old. Statistics that add up activity (saves and reviews per member) then cover the kept period only.
+    """
+    if days <= 0:
+        return 0, 0
+    cutoff = utcnow() - timedelta(days=days)
+    removed = []
+    for model, conditions in ((Activity, (Activity.created_at < cutoff,)),
+                              (Notification, (Notification.created_at < cutoff, Notification.read_at.is_not(None)))):
+        count = 0
+        while not should_stop():
+            with db.session() as session:
+                ids = list(session.scalars(select(model.id).where(*conditions).order_by(model.id).limit(PRUNE_BATCH)))
+                if ids:
+                    session.execute(delete(model).where(model.id.in_(ids)))
+                    session.commit()
+            count += len(ids)
+            if len(ids) < PRUNE_BATCH:
+                break
+        removed.append(count)
+    return removed[0], removed[1]

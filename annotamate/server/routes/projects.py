@@ -30,7 +30,7 @@ from annotamate.server.services import projects as svc
 from annotamate.server.services import serialize
 from annotamate.server.services.access import load_access
 from annotamate.server.services.classes import has_pending_renames, schedule_rename
-from annotamate.server.services.export import Exporter, select_items
+from annotamate.server.services.export import Exporter, remember_sizes, select_items
 from annotamate.server.services.indexing import index_project
 from annotamate.server.services.labels import load_class_table
 from annotamate.server.services.paths import ProjectPaths
@@ -165,7 +165,9 @@ def export(access: Access, ctx: Ctx, db: DB, format: Literal["yolo", "voc", "coc
     paths.check()
     table = load_class_table(db, project.id, project.label_format)
     items = select_items(db, project, scope)
-    exporter = Exporter(paths, table, fmt, items, include_images, ctx.read_guard(project.id))
+    project_id, exif_mode = project.id, project.exif_mode
+    exporter = Exporter(paths, table, fmt, items, include_images, ctx.read_guard(project_id),
+                        remember=lambda sizes: remember_sizes(ctx, project_id, exif_mode, sizes))
     filename = f"{_slug(project.name)}-{fmt}.zip"
     return StreamingResponse(exporter.stream(), media_type="application/zip",
                              headers={"Content-Disposition": f'attachment; filename="{filename}"',

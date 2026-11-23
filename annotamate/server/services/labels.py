@@ -121,6 +121,8 @@ class LabelFile:
     mtime: float | None
     parse: ParseResult
     readonly_reason: str | None
+    #: ``(size, mtime_ns)`` of the file as it was opened (``None`` when there is no readable file).
+    stat: tuple[int, int] | None = None
 
     @property
     def exists(self) -> bool:
@@ -140,7 +142,7 @@ def label_block(session: Session, project: Project, image: Image) -> str | None:
     owner = session.execute(
         select(Image.id, Image.rel_path).where(Image.project_id == project.id, Image.label_key == key,
                                                Image.missing.is_(False))
-        .order_by(Image.sort_index, Image.id).limit(1)
+        .order_by(Image.sort_key, Image.id).limit(1)
     ).first()
     if owner is not None and owner.id != image.id:
         return (f"This image shares its label file with {owner.rel_path}, which owns it. Rename one of the images "
@@ -163,7 +165,8 @@ def read_label_file(paths: ProjectPaths, rel_path: str, width: float | None = No
         return LabelFile(path, None, None, ParseResult(), blocked)
     try:
         with open(path, "rb") as fh:
-            mtime = os.fstat(fh.fileno()).st_mtime
+            st = os.fstat(fh.fileno())
+            mtime, stat = st.st_mtime, (st.st_size, st.st_mtime_ns)
             data = read_limited(fh)
     except FileNotFoundError:
         return LabelFile(path, None, None, ParseResult(), None)
@@ -172,9 +175,9 @@ def read_label_file(paths: ProjectPaths, rel_path: str, width: float | None = No
     except OSError as exc:
         return LabelFile(path, None, None, ParseResult(), f"The label file cannot be read ({exc.strerror}).")
     if data is None:  # too large to load: unreadable for the editor, but it does exist
-        return LabelFile(path, None, mtime, ParseResult(), TOO_LARGE_REASON)
+        return LabelFile(path, None, mtime, ParseResult(), TOO_LARGE_REASON, stat)
     result = parse_label(fmt, data, width, height)
-    return LabelFile(path, data, mtime, result, result.readonly_reason)
+    return LabelFile(path, data, mtime, result, result.readonly_reason, stat)
 
 
 def sync_classes_file(paths: ProjectPaths, table: ClassTable, *, only_if_missing: bool = False) -> None:

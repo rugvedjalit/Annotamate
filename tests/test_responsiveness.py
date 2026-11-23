@@ -871,7 +871,7 @@ def test_0003_adds_and_removes_the_indexes(tmp_path):
         conn.execute(text("insert into images (project_id, rel_path, filename, label_key, missing, sort_index, "
                           "status, flagged, has_label, box_count, unknown_count, comment_count, open_comment_count) "
                           "values (1, 'a.jpg', 'a.jpg', 'a', 0, 0, 'done', 0, 1, 2, 0, 0, 0)"))
-    migrate(command.upgrade, "head")
+    migrate(command.upgrade, "0003")
     names = _index_names(db.engine, "images")
     assert new_images <= names and not old_images & names
     assert {"ix_images_project_sort", "ix_images_project_updated", "ix_images_project_label_key"} <= names
@@ -904,10 +904,10 @@ def test_filters_and_counts_use_the_new_indexes(tmp_path):
             return " | ".join(row[-1] for row in conn.execute(text("explain query plan " + sql)))
 
     by_status = plan("select id from images where project_id = 1 and missing = 0 and status = 'review' "
-                     "order by sort_index limit 100")
+                     "order by sort_key limit 100")
     assert "ix_images_project_missing_status_sort" in by_status and "TEMP B-TREE" not in by_status
     by_assignee = plan("select id from images where project_id = 1 and missing = 0 and assignee_id = 7 "
-                       "order by sort_index limit 100")
+                       "order by sort_key limit 100")
     assert "ix_images_project_missing_assignee_sort" in by_assignee and "TEMP B-TREE" not in by_assignee
     counts = plan("select missing, status, count(*) from images where project_id = 1 group by missing, status")
     assert "COVERING INDEX ix_images_project_missing_status_sort" in counts

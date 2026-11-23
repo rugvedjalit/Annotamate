@@ -20,11 +20,11 @@ from annotamate.core.images import ImageError, ImageInfo, probe
 from annotamate.server.context import AppContext
 from annotamate.server.db import emit
 from annotamate.server.errors import ApiError, conflict, forbidden, validation_error
-from annotamate.server.models import Image, Revision, User, utcnow
+from annotamate.server.models import Image, Project, Revision, User, utcnow
 from annotamate.server.schemas import BoxIn
 from annotamate.server.services import notify, serialize
 from annotamate.server.services.access import ProjectAccess
-from annotamate.server.services.indexing import replace_class_counts
+from annotamate.server.services.indexing import replace_class_counts, set_label_state
 from annotamate.server.services.labels import (
     ClassTable,
     LabelFile,
@@ -39,8 +39,6 @@ from annotamate.server.services.paths import ProjectPaths
 
 log = logging.getLogger("annotamate.annotations")
 
-REVISIONS_KEPT = 50
-
 
 def probe_image(paths: ProjectPaths, image: Image) -> tuple[ImageInfo | None, str | None]:
     """``(info, None)`` or ``(None, error message)`` for an image of the project."""
@@ -48,6 +46,15 @@ def probe_image(paths: ProjectPaths, image: Image) -> tuple[ImageInfo | None, st
         return probe(paths.image_file(image.rel_path), paths.project.exif_mode), None
     except ImageError as exc:
         return None, str(exc)
+
+
+def remember_size(image: Image, path: str, width: int, height: int) -> None:
+    """Keep the pixel size just read from the image file, with the file's state (exports reuse it)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    image.width, image.height, image.file_size, image.file_mtime_ns = width, height, st.st_size, st.st_mtime_ns
 
 
 def _latest_revision(session: Session, image_id: int) -> Revision | None:
@@ -68,8 +75,12 @@ def _box_out(table: ClassTable, box: Box, box_id: str) -> dict[str, Any]:
 
 def _box_ids(session: Session, image: Image, label: LabelFile) -> tuple[list[str], Revision | None]:
     """The ids of the boxes read from ``label`` (what a GET hands out), and the revision they come from."""
+    return _ids_from(image, label, _latest_revision(session, image.id))
+
+
+def _ids_from(image: Image, label: LabelFile, latest: Revision | None) -> tuple[list[str], Revision | None]:
+    """:func:`_box_ids` for a caller that already has the image's newest revision."""
     version = label.version
-    latest = _latest_revision(session, image.id)
     current = latest if latest is not None and latest.version == version else None
     saved_ids = [b.get("id") for b in current.boxes] if current is not None else []
     if len(saved_ids) != len(label.parse.boxes):
@@ -181,7 +192,8 @@ def save_boxes(ctx: AppContext, session: Session, access: ProjectAccess, image: 
                                folder=posixpath.basename(folder) if folder else os.path.basename(paths.image_root),
                                path=image_path)
         # Boxes that came from the file keep the fields this tool does not model (VOC pose, COCO attributes...).
-        origin_of = {box_id: n for n, box_id in enumerate(_box_ids(session, image, label)[0])}
+        latest = _latest_revision(session, image.id)
+        origin_of = {box_id: n for n, box_id in enumerate(_ids_from(image, label, latest)[0])}
         origins = [origin_of.get(meta["id"]) for _, meta in written]
         try:
             data = serialize_label(project.label_format, [b for b, _ in written], context, table.names,
@@ -195,10 +207,14 @@ def save_boxes(ctx: AppContext, session: Session, access: ProjectAccess, image: 
             raise ApiError(500, "write_failed", f"The label file could not be written ({exc.strerror or exc}).") \
                 from None
         version = label_version(data)
+        # What a GET returns from now on (coordinates as the file stores them), with the file's state.
+        stored = read_label_file(paths, image.rel_path, info.width, info.height)
         try:
             sync_classes_file(paths, table, only_if_missing=True)
         except OSError as exc:
             log.warning("Could not write classes.txt for project %s: %s", project.id, exc)
+        class_version, exif_mode = session.execute(select(Project.class_version, Project.exif_mode)
+                                                   .where(Project.id == project.id)).one()
 
         now = utcnow()
         per_class: dict[int, int] = {}
@@ -218,12 +234,20 @@ def save_boxes(ctx: AppContext, session: Session, access: ProjectAccess, image: 
         image.unknown_count = unknown
         image.last_editor_id = user.id
         image.updated_at = now
+        # The counts describe exactly the file that was written, so the next rescan does not need to read it.
+        # (Should something else have replaced it already, its state is left unknown and the rescan reads it.)
+        set_label_state(image, stored.stat if stored.version == version else None, class_version)
+        if exif_mode == project.exif_mode:  # else the mode was changed a moment ago: the size is the old mode's
+            remember_size(image, image_path, info.width, info.height)
         replace_class_counts(session, image.id, per_class)
 
-        session.add(Revision(image_id=image.id, user_id=user.id, created_at=now, version=version,
-                             box_count=len(written), boxes=[_revision_box(b, m) for b, m in written]))
-        session.flush()
-        _prune_revisions(session, image.id)
+        snapshot = [_revision_box(b, m) for b, m in written]
+        if latest is None or latest.version != version or latest.boxes != snapshot:
+            # An identical save (same file content, same box ids) adds nothing to the history.
+            session.add(Revision(image_id=image.id, user_id=user.id, created_at=now, version=version,
+                                 box_count=len(written), boxes=snapshot))
+            session.flush()
+            _prune_revisions(session, image.id, ctx.settings.revisions_keep)
         notify.record_save(session, project.id, user, image.id, len(written))
         if claimed:
             notify.record(session, project.id, "assigned", user=user, image_id=image.id,
@@ -232,9 +256,8 @@ def save_boxes(ctx: AppContext, session: Session, access: ProjectAccess, image: 
             notify.record(session, project.id, "revision_restored", user=user, image_id=image.id,
                           data={"revision_id": restored_revision, "box_count": len(written)})
         session.flush()
-        # What a GET returns from now on: coordinates as stored in the file (rounded/clamped), ids kept.
-        saved = build_doc(session, paths, image, read_label_file(paths, image.rel_path, info.width, info.height),
-                          error, table)["boxes"]
+        # The boxes as stored (rounded/clamped), ids kept.
+        saved = build_doc(session, paths, image, stored, error, table)["boxes"]
         item = serialize.image_item(session, image)
         emit(session, ("project", project.id), {"type": "image.updated", "project_id": project.id, "image": item,
                                                 "version": version, "by": serialize.brief(user)})
@@ -249,9 +272,12 @@ def _revision_box(box: Box, meta: dict[str, Any]) -> dict[str, Any]:
             "difficult": box.difficult, "truncated": box.truncated}
 
 
-def _prune_revisions(session: Session, image_id: int) -> None:
-    keep = select(Revision.id).where(Revision.image_id == image_id).order_by(Revision.id.desc()).limit(REVISIONS_KEPT)
-    session.execute(delete(Revision).where(Revision.image_id == image_id, Revision.id.not_in(keep.scalar_subquery())))
+def _prune_revisions(session: Session, image_id: int, keep: int) -> None:
+    """Remove all but the newest ``keep`` revisions of the image."""
+    oldest_kept = session.scalar(select(Revision.id).where(Revision.image_id == image_id)
+                                 .order_by(Revision.id.desc()).offset(keep - 1).limit(1))
+    if oldest_kept is not None:
+        session.execute(delete(Revision).where(Revision.image_id == image_id, Revision.id < oldest_kept))
 
 
 def revision_boxes(table: ClassTable, fmt: str, revision: Revision) -> list[dict[str, Any]]:
@@ -278,9 +304,9 @@ def revision_boxes(table: ClassTable, fmt: str, revision: Revision) -> list[dict
     return out
 
 
-def revision_summary(session: Session, image_id: int) -> list[dict[str, Any]]:
+def revision_summary(session: Session, image_id: int, limit: int) -> list[dict[str, Any]]:
     rows = list(session.scalars(select(Revision).where(Revision.image_id == image_id)
-                                .order_by(Revision.id.desc()).limit(REVISIONS_KEPT)))
+                                .order_by(Revision.id.desc()).limit(limit)))
     users = serialize.briefs(session, [r.user_id for r in rows])
     return [{"id": r.id, "user": users.get(r.user_id) if r.user_id else None, "created_at": serialize.iso(r.created_at),
              "box_count": r.box_count, "version": r.version} for r in rows]

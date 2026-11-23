@@ -45,8 +45,9 @@ Filter = Annotated[svc.ImageFilter, Depends(image_filter)]
 
 @router.get("/projects/{pid}/images", response_model=ImageList)
 def list_images(access: Access, db: DB, flt: Filter, offset: Annotated[int, Query(ge=0)] = 0,
-                limit: Annotated[int, Query(ge=1, le=500)] = 100) -> dict:
-    return svc.list_images(db, access, flt, offset, limit)
+                limit: Annotated[int, Query(ge=1, le=500)] = 100, count: bool | None = None) -> dict:
+    """``count``: whether to count all matches (``total``); by default only the first page does."""
+    return svc.list_images(db, access, flt, offset, limit, count)
 
 
 @router.post("/projects/{pid}/images/bulk", response_model=BulkResult)
@@ -79,9 +80,9 @@ def get_image(iid: int, access: Access, ctx: Ctx, db: DB) -> dict:
 
 
 @router.get("/projects/{pid}/images/{iid}/neighbors", response_model=Neighbors)
-def neighbors(iid: int, access: Access, db: DB, flt: Filter) -> dict:
+def neighbors(iid: int, access: Access, ctx: Ctx, db: DB, flt: Filter) -> dict:
     image = svc.get_image(db, access.project.id, iid)
-    return svc.neighbors(db, access, image, flt)
+    return svc.neighbors(ctx, db, access, image, flt)
 
 
 def _image_error(exc: Exception) -> Exception:

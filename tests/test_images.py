@@ -30,7 +30,9 @@ def test_pagination_and_natural_order(admin, project):
     proj, _, _ = project
     pid = proj["id"]
     page = admin.get(f"/api/projects/{pid}/images", params={"offset": 10, "limit": 5}).json()
-    assert page["total"] == 12 and page["offset"] == 10
+    assert page["total"] is None and page["offset"] == 10  # only the first page counts, unless asked to
+    counted = admin.get(f"/api/projects/{pid}/images", params={"offset": 10, "limit": 5, "count": "true"}).json()
+    assert counted["total"] == 12 and counted["items"] == page["items"]
     assert [i["filename"] for i in page["items"]] == ["frame11.png", "frame12.png"]
     first = admin.get(f"/api/projects/{pid}/images", params={"limit": 3}).json()["items"]
     assert [i["filename"] for i in first] == ["frame1.png", "frame2.png", "frame3.png"]

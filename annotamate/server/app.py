@@ -38,6 +38,7 @@ from annotamate.server.security import CSRF_HEADER, new_setup_token
 from annotamate.server.services.classes import resume_renames
 from annotamate.server.services.indexing import index_project
 from annotamate.server.services.labels import load_class_table, sync_classes_file
+from annotamate.server.services.notify import prune_history
 from annotamate.server.services.paths import ProjectPaths
 from annotamate.server.services.users import user_count
 
@@ -378,6 +379,27 @@ def _resume_indexing(ctx: AppContext) -> None:
         index_project(ctx, project_id, discover_classes=project_id not in with_classes)
 
 
+#: Seconds between two runs of the history retention job.
+RETENTION_INTERVAL = 24 * 60 * 60
+
+
+def prune_history_job(ctx: AppContext) -> None:
+    """Background job: apply ``activity_retention_days`` (old activity and read notifications are removed)."""
+    days = ctx.settings.activity_retention_days
+    activity, notifications = prune_history(ctx.db, days, ctx.jobs.stopping.is_set)
+    if activity or notifications:
+        log.info("Retention: removed %d activity entries and %d read notifications older than %d days",
+                 activity, notifications, days)
+        ctx.aggregates.clear()  # statistics add up activity
+
+
+async def _retention_loop(ctx: AppContext) -> None:
+    """Queue the retention job at start-up and then once a day (the work itself runs on a job thread)."""
+    while True:
+        ctx.jobs.submit(("retention", 0), lambda: prune_history_job(ctx), coalesce=True)
+        await asyncio.sleep(RETENTION_INTERVAL)
+
+
 def _recover_label_rewrites(settings: Settings, db: Database) -> None:
     """Finish or undo label rewrites interrupted by a crash, deciding class changes by the database.
 
@@ -440,9 +462,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ctx.hub.start(loop)
         await run_in_threadpool(_resume_indexing, ctx)
         await run_in_threadpool(resume_renames, ctx)
+        retention = asyncio.create_task(_retention_loop(ctx)) if settings.activity_retention_days > 0 else None
         try:
             yield
         finally:
+            if retention is not None:
+                retention.cancel()
             await ctx.hub.stop()
             await run_in_threadpool(ctx.jobs.shutdown)
             await run_in_threadpool(ctx.close_pools)

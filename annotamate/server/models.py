@@ -7,12 +7,14 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Text,
@@ -22,6 +24,8 @@ from sqlalchemy import (
     false as sa_false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from annotamate.core.scanning import natural_sort_key
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -90,6 +94,12 @@ class Project(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     #: Set when an index pass completed; ``None`` makes the server index the project again at start-up.
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    #: Bumped by every change to the class list that can alter how labels map onto classes (add, rename,
+    #: delete, merge, a finished rename). Images remember the version their counts were computed with.
+    class_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    #: ``class_version`` after the last change that can alter the meaning of labels that were already known
+    #: (delete, merge, the end of a rename). Counts made before it are never reused by a rescan.
+    class_floor: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class ProjectMember(Base):
@@ -115,14 +125,25 @@ class ProjectClass(Base):
     color: Mapped[str] = mapped_column(String(7))
 
 
+def _sort_key_default(context: Any) -> bytes:
+    """Fallback for single inserts; bulk inserts pass ``sort_key`` themselves (a per-row default makes
+    SQLAlchemy send the rows one by one)."""
+    return natural_sort_key(context.get_current_parameters()["rel_path"])
+
+
+#: Columns that only index passes, saves and exports need (see ``Image.sort_key``).
+_INDEX_ONLY: dict[str, Any] = {"deferred": True, "deferred_group": "index"}
+
+
 class Image(Base):
     __tablename__ = "images"
     __table_args__ = (
         UniqueConstraint("project_id", "rel_path"),
-        Index("ix_images_project_sort", "project_id", "sort_index"),
+        # List order: visible images first, each group in natural order (also counts positions).
+        Index("ix_images_project_sort", "project_id", "missing", "sort_key"),
         # Visible images of a project by status / by assignee, in list order (filters and per-project counts).
-        Index("ix_images_project_missing_status_sort", "project_id", "missing", "status", "sort_index"),
-        Index("ix_images_project_missing_assignee_sort", "project_id", "missing", "assignee_id", "sort_index"),
+        Index("ix_images_project_missing_status_sort", "project_id", "missing", "status", "sort_key"),
+        Index("ix_images_project_missing_assignee_sort", "project_id", "missing", "assignee_id", "sort_key"),
         Index("ix_images_project_updated", "project_id", "updated_at"),
         Index("ix_images_project_label_key", "project_id", "label_key"),
     )
@@ -135,7 +156,10 @@ class Image(Base):
     label_key: Mapped[str] = mapped_column(Text, default="", server_default="")
     #: The file disappeared from disk; kept (soft-deleted) so comments, revisions and status survive.
     missing: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
-    sort_index: Mapped[int] = mapped_column(Integer)
+    #: ``natural_sort_key(rel_path)``: ordering by it (as bytes) is the natural order of the paths.
+    #: Like the file states below it is bookkeeping of the index: queries use these columns, but they are not
+    #: loaded with every ``Image`` object (``deferred``; ``undefer_group("index")`` loads them).
+    sort_key: Mapped[bytes] = mapped_column(LargeBinary, default=_sort_key_default, **_INDEX_ONLY)
     status: Mapped[str] = mapped_column(String(16), default="todo")
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     flagged: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -149,6 +173,18 @@ class Image(Base):
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     comment_count: Mapped[int] = mapped_column(Integer, default=0)
     open_comment_count: Mapped[int] = mapped_column(Integer, default=0)
+    #: Size and modification time of the label file the counts above were computed from, and the project's
+    #: ``class_version`` at that moment. A rescan does not read the file again while all three still hold.
+    #: ``None``: no label file, or its state could not be pinned down (it is read at the next rescan).
+    label_size: Mapped[int | None] = mapped_column(BigInteger, **_INDEX_ONLY)
+    label_mtime_ns: Mapped[int | None] = mapped_column(BigInteger, **_INDEX_ONLY)
+    counted_version: Mapped[int | None] = mapped_column(Integer, **_INDEX_ONLY)
+    #: Pixel size as the editor sees it (after the project's EXIF mode), remembered from the last time the
+    #: image was opened for a save or an export, with the size and modification time of the image file then.
+    width: Mapped[int | None] = mapped_column(Integer, **_INDEX_ONLY)
+    height: Mapped[int | None] = mapped_column(Integer, **_INDEX_ONLY)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, **_INDEX_ONLY)
+    file_mtime_ns: Mapped[int | None] = mapped_column(BigInteger, **_INDEX_ONLY)
 
 
 class PendingRename(Base):

@@ -6,8 +6,8 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import LargeBinary, bindparam, func, literal, select
+from sqlalchemy.orm import Session, aliased
 
 from annotamate.server.models import (
     Activity,
@@ -95,15 +95,66 @@ def class_ids_for(session: Session, image_ids: list[int]) -> dict[int, list[int]
     return out
 
 
-def image_items(session: Session, images: list[Image]) -> list[Json]:
+def _position_statements() -> tuple[Any, Any]:
+    """The two statements of :func:`image_positions`, built once (building them costs more than running them)."""
+    other = aliased(Image)
+    in_scope = (other.project_id == bindparam("project_id"), other.missing == bindparam("missing"))
+    # One image: the index entries before it.
+    asked_key = select(Image.sort_key).where(Image.id == bindparam("image_id")).scalar_subquery()
+    one = select(func.count()).select_from(other).where(*in_scope, other.sort_key < asked_key)
+    # Several: put them in list order and count the entries after the previous one, up to and including each.
+    asked = (select(Image.id, Image.sort_key,
+                    func.lag(Image.sort_key).over(order_by=Image.sort_key).label("previous"))
+             .where(Image.id.in_(bindparam("image_ids", expanding=True))).subquery())
+    gap = (select(func.count()).select_from(other)
+           .where(*in_scope, other.sort_key > func.coalesce(asked.c.previous, literal(b"", LargeBinary)),
+                  other.sort_key <= asked.c.sort_key).scalar_subquery())
+    return one, select(asked.c.id, gap).order_by(asked.c.sort_key)
+
+
+_POSITION_OF_ONE, _POSITIONS_OF_MANY = _position_statements()
+
+
+def image_positions(session: Session, images: list[Image]) -> dict[int, int]:
+    """0-based position of each image in the natural order of its project (missing images come last).
+
+    Positions are counted on the ``(project_id, missing, sort_key)`` index, never stored, so adding or
+    removing images does not touch any other row. A single image costs one range count. Several images are
+    put in list order and the index entries between each one and the one before it are counted: one statement,
+    one pass over the part of the index from the start of the list to the last image asked for.
+    """
+    out: dict[int, int] = {}
+    groups: dict[tuple[int, bool], list[int]] = {}
+    for image in images:
+        groups.setdefault((image.project_id, image.missing), []).append(image.id)
+    for (project_id, missing), ids in groups.items():
+        scope = {"project_id": project_id, "missing": missing}
+        first = 0
+        if missing:  # after every visible image
+            first = session.scalar(select(func.count()).select_from(Image).where(
+                Image.project_id == project_id, Image.missing.is_(False))) or 0
+        if len(ids) == 1:
+            out[ids[0]] = first + (session.scalar(_POSITION_OF_ONE, {**scope, "image_id": ids[0]}) or 0)
+            continue
+        position = first - 1
+        for image_id, entries in session.execute(_POSITIONS_OF_MANY, {**scope, "image_ids": ids}):
+            position += entries
+            out[image_id] = position
+    return out
+
+
+def image_items(session: Session, images: list[Image], positions: dict[int, int] | None = None) -> list[Json]:
+    """``positions``: the images' positions when the caller already knows them (see :func:`image_positions`)."""
     users = briefs(session, [i.assignee_id for i in images] + [i.last_editor_id for i in images])
     classes = class_ids_for(session, [i.id for i in images])
+    if positions is None:
+        positions = image_positions(session, list(images))
     return [
         {
             "id": img.id,
             "filename": img.filename,
             "rel_path": img.rel_path,
-            "position": img.sort_index,
+            "position": positions.get(img.id, 0),
             "status": img.status,
             "box_count": img.box_count,
             "class_ids": classes.get(img.id, []),

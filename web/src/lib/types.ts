@@ -391,7 +391,8 @@ export interface UploadResult {
 export type ClassDeleteStrategy = 'forbid' | 'delete_boxes' | 'merge'
 
 export interface ImagePage {
-  total: number
+  /** Number of matches. Counted for the first page (offset 0) or with `count=true`; null otherwise. */
+  total: number | null
   offset: number
   items: ImageItem[]
 }

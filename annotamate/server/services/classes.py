@@ -30,9 +30,11 @@ from annotamate.server.services.access import ProjectAccess
 from annotamate.server.services.indexing import (
     LabelLister,
     ParsedLabel,
+    bump_class_version,
     counts_for,
     replace_class_counts,
     schedule_unknown_recount,
+    set_label_state,
 )
 from annotamate.server.services.labels import ClassTable, load_class_table, pending_aliases, sync_classes_file
 from annotamate.server.services.paths import RESERVED_YOLO_KEY, ProjectPaths, fold_case, label_key
@@ -112,6 +114,7 @@ def add_class(ctx: AppContext, session: Session, access: ProjectAccess, name: st
         cls = ProjectClass(project_id=project.id, position=len(existing), name=name,
                            color=(color or next_color([c.color for c in existing])).lower())
         session.add(cls)
+        bump_class_version(project)  # labels that were unknown may be this class
         session.flush()
         _after_change(ctx, session, project)
         notify.record(session, project.id, "class_added", user=access.user,
@@ -154,6 +157,7 @@ def update_class(ctx: AppContext, session: Session, access: ProjectAccess, cls: 
                       data={"class_id": cls.id, "name": cls.name, **changes})
         if "name" in changes:
             ctx.bump_class_epoch(project.id)
+            bump_class_version(project)  # labels that were unknown may carry the new name
         session.commit()
     if "name" in changes:
         if uses_class_index(project.label_format):
@@ -215,7 +219,7 @@ def _label_files(session: Session, paths: ProjectPaths) -> list[tuple[int, str]]
     """
     lister = LabelLister(paths)
     rows = session.execute(select(Image.id, Image.rel_path).where(Image.project_id == paths.project.id)
-                           .order_by(Image.missing, Image.sort_index, Image.id))
+                           .order_by(Image.missing, Image.sort_key, Image.id))
     out = []
     seen: set[str] = set()
     reserved = uses_class_index(paths.project.label_format)
@@ -298,9 +302,13 @@ def rename_in_files(ctx: AppContext, project_id: int) -> None:
         _retry_rename_later(ctx, project_id)
     else:
         ctx.rename_retries.pop(project_id, None)
-        with ctx.db.session() as session:
+        with ctx.quiet_label_lock(project_id), ctx.db.session() as session:
             session.execute(delete(PendingRename).where(PendingRename.project_id == project_id,
                                                         PendingRename.id <= last_id))
+            project = session.get(Project, project_id)
+            if project is not None:
+                # The old names stop being aliases: counts made while they were must not be reused by a rescan.
+                bump_class_version(project, known_labels_change=True)
             session.commit()
     ctx.send_project(project_id, {"type": "images.bulk_updated", "project_id": project_id, "count": len(images)})
 
@@ -314,6 +322,7 @@ def _counts(table: ClassTable, fmt: str, data: bytes) -> tuple[dict[int, int], i
 def _recount(session: Session, table: ClassTable, fmt: str, image: Image, data: bytes) -> None:
     per_class, unknown, boxes = _counts(table, fmt, data)
     image.has_label, image.box_count, image.unknown_count = True, boxes, unknown
+    set_label_state(image, None, 0)  # the file was just rewritten: the next rescan reads it once
     replace_class_counts(session, image.id, per_class)
 
 
@@ -583,8 +592,10 @@ class ClassDeleteJob:
                 c.position = position
             session.flush()
             ids = list(touched)
+            # Label states are cleared: these files were rewritten, the next rescan reads them once.
             recount = (update(Image).where(Image.id == bindparam("_id"))
-                       .values(has_label=True, box_count=bindparam("_boxes"), unknown_count=bindparam("_unknown")))
+                       .values(has_label=True, box_count=bindparam("_boxes"), unknown_count=bindparam("_unknown"),
+                               label_size=None, label_mtime_ns=None, counted_version=None))
             for start in range(0, len(ids), BATCH):
                 chunk = ids[start:start + BATCH]
                 session.execute(delete(ImageClassCount).where(ImageClassCount.image_id.in_(chunk)))
@@ -594,6 +605,8 @@ class ClassDeleteJob:
                     session.execute(insert(ImageClassCount), counts)
                 session.connection().execute(recount, [{"_id": i, "_boxes": touched[i][2], "_unknown": touched[i][1]}
                                                        for i in chunk])
+            # Positions (YOLO indexes) moved and a name is gone: no count made before this may be reused.
+            bump_class_version(project, known_labels_change=True)
             _after_change(ctx, session, project)
             notify.record(session, project_id, "class_deleted", user=session.get(User, self.user_id),
                           data={**removed, "rewritten_files": rewritten})

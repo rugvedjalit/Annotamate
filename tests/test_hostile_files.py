@@ -332,10 +332,10 @@ def test_export_item_error_does_not_truncate_archive(admin, create_project, root
                   json={"base_version": None, "boxes": [box(project["classes"][0]["id"], 1, 1, 20, 20)]})
     real = export_service.Exporter._add_label
 
-    def flaky(self, zf, coco, ids, item):
+    def flaky(self, zf, coco, item):
         if item.rel_path == "a.jpg":
             raise RuntimeError("boom")
-        return real(self, zf, coco, ids, item)
+        return real(self, zf, coco, item)
 
     monkeypatch.setattr(export_service.Exporter, "_add_label", flaky)
     response = admin.get(f"/api/projects/{pid}/export", params={"format": "yolo"})

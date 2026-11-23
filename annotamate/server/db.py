@@ -10,7 +10,8 @@ from typing import Any
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Engine, create_engine, event
+from alembic.migration import MigrationContext
+from sqlalchemy import Connection, Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 log = logging.getLogger("annotamate.db")
@@ -60,12 +61,50 @@ def alembic_config(engine: Engine) -> Config:
     return cfg
 
 
-def run_migrations(engine: Engine) -> None:
-    """Upgrade the database to the latest revision (idempotent)."""
+@contextmanager
+def migration_connection(engine: Engine) -> Iterator[Connection]:
+    """A connection, inside a transaction, on which migrations can run.
+
+    SQLite: a migration that changes or drops a column rebuilds the table (copy, drop, rename), and dropping
+    a table deletes its rows first, which would cascade to every table that references it (dropping ``images``
+    would empty ``revisions``, ``comments``, ...). Foreign keys are therefore switched off for the migration, as
+    SQLite's documentation prescribes, and on again afterwards. The switch only works outside a transaction, so
+    it is checked: a migration never runs with cascades armed.
+    """
+    sqlite = engine.dialect.name == "sqlite"
+    with engine.connect() as connection:
+        if sqlite:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            if connection.exec_driver_sql("PRAGMA foreign_keys").scalar():
+                raise RuntimeError("Foreign keys could not be switched off for the migration; nothing was changed.")
+            connection.commit()
+        try:
+            with connection.begin():
+                yield connection
+        finally:
+            if sqlite:
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                restored = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+                connection.commit()
+                if not restored:  # never hand a connection without foreign keys back to the pool
+                    connection.invalidate()
+
+
+def run_migrations(engine: Engine, revision: str = "head") -> None:
+    """Upgrade the database to the latest revision (idempotent), or move it to ``revision`` (up or down)."""
     cfg = alembic_config(engine)
-    with engine.begin() as connection:
+    with migration_connection(engine) as connection:
         cfg.attributes["connection"] = connection
-        command.upgrade(cfg, "head")
+        current = MigrationContext.configure(connection).get_current_revision()
+        if revision != "head" and current is not None and _revision_number(current) > _revision_number(revision):
+            command.downgrade(cfg, revision)
+        else:
+            command.upgrade(cfg, revision)
+
+
+def _revision_number(revision: str) -> int:
+    """Revisions are numbered ``0001``, ``0002``, ...; ``base`` is before the first."""
+    return int(revision) if revision.isdigit() else 0
 
 
 class Database:
@@ -78,8 +117,8 @@ class Database:
         event.listen(self.session_factory, "after_commit", self._after_commit)
         event.listen(self.session_factory, "after_soft_rollback", self._after_rollback)
 
-    def migrate(self) -> None:
-        run_migrations(self.engine)
+    def migrate(self, revision: str = "head") -> None:
+        run_migrations(self.engine, revision)
 
     def _after_commit(self, session: Session) -> None:
         items: list[OutboxItem] = session.info.pop("outbox", [])
