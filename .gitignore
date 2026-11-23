@@ -39,6 +39,7 @@ node_modules/
 
 # ---------- Runtime data ----------
 /data/
+/datasets/
 /.annotamate/
 *.db
 *.db-wal

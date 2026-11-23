@@ -46,7 +46,7 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Lint (ruff)
-        run: ruff check annotamate tests
+        run: ruff check annotamate tests scripts
 
       - name: Test (pytest)
         run: pytest -q
