@@ -9,6 +9,44 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+Findings of a full security audit (authentication, authorization, file handling, client and realtime):
+
+- Sign-in limits can no longer be bypassed by rotating addresses: IPv6 addresses count per /64, every user
+  name is limited across all addresses (100 failures in 10 minutes), and attempts are counted before the
+  password is checked, so parallel guesses cannot slip past. Loopback and private addresses get a generous
+  address-wide limit instead of none, and junk user names share one bucket.
+- At most 16 sign-in or password requests are processed at once; more get `503 busy` instead of tying up
+  the server's worker threads.
+- First-run setup without the token also requires a `localhost` Host header and a matching Origin, so a
+  DNS-rebinding page cannot create the administrator through a browser on the server.
+- Sessions end 90 days after sign-in at the latest (`ANNOTAMATE_SESSION_MAX_DAYS`). Administrators change
+  their own password on the account page only (it asks for the current one), and the last active
+  administrator cannot be removed, even by concurrent requests.
+- API responses are sent with `Cache-Control: no-store`; new `Cross-Origin-Opener-Policy`,
+  `Cross-Origin-Resource-Policy` and `Permissions-Policy` headers; `Strict-Transport-Security` with
+  `ANNOTAMATE_SECURE_COOKIES`; the OpenAPI description needs a signed-in user. Untrusted
+  `X-Forwarded-For` headers are reported once in the log.
+- WebSocket: frames are rate limited per socket (floods are dropped, then closed), typing notices are
+  throttled, chatter never disconnects a slow reader, at most 10 sockets per user and 3 edit locks per
+  user, oversized ids and deeply nested JSON are rejected cleanly, the Origin check no longer trusts
+  `X-Forwarded-Host` and requires https with secure cookies, and a lock is taken back when its holder
+  loses the right to edit the image.
+- Members removed from a project no longer receive its review results, and their old notifications lose
+  the project's current name and links. Restricted annotators cannot resolve comments on images assigned
+  to others. Deactivated managers no longer count as the project's remaining manager.
+- Archived projects are read-only (no annotation, review, class, assignment, bulk or upload changes).
+- Hostile dataset files can no longer break a project: malformed YOLO/VOC/COCO files (huge numbers, deep
+  nesting, wrong shapes) become read-only instead of stopping indexing or causing errors; label files over
+  8 MB or with more than 20,000 boxes are read-only; VOC DTDs and entities are refused in every encoding;
+  class renames skip malformed files.
+- Only JPEG, PNG, BMP, WebP and TIFF image content is decoded, whatever the extension (no EPS/Ghostscript,
+  ICO, TGA, JPEG 2000...). Thumbnail sizes are rounded to 128, 256 or 512.
+- Exports stream images in chunks and skip a failing item instead of truncating the archive, and skip
+  entries with unsafe names. Scans skip Windows junctions and folders that resolve outside the root.
+  Uploaded file names drop invisible characters and avoid all Windows device names.
+- Bidirectional and zero-width characters are removed from display and project names and refused in
+  class names; chat shows `@username` next to names; message links stop at such characters.
+
 - First-run setup needs a one-time setup token (printed in the server log and the `annotamate serve`
   console) unless the request comes from the machine itself without proxy headers. Concurrent setups can no longer create
   two administrators. `docker-compose.yml` now publishes the port on `127.0.0.1` by default.

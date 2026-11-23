@@ -146,7 +146,7 @@ Class palette (20 colours, used when a class is created without a colour):
    resize, nudge, class change, delete, duplicate, paste, visibility/lock, property edits. History is kept for the
    last 20 visited images (in memory). Ctrl+Z with empty history does nothing.
 4. **Locks.** On open: if `permissions.can_edit` → `lock.acquire`. Until granted the editor is read-only. Denied →
-   read-only + banner. `lock.revoked` → read-only + toast; unsaved changes are kept locally and the user can copy them;
+   read-only + banner. `lock.revoked` → read-only + toast (with `by: null` the toast shows the server's `reason`, e.g. the image was reassigned); unsaved changes are kept locally and the user can copy them;
    the lock is no longer re-requested on reconnect (it is requested again when the new holder leaves). Revoked by the
    same user (another tab) → "You are editing this image in another tab" with *Edit here*. Release on image
    change/unmount. A `presence.snapshot` resets the known locks (the server follows it with `lock.state` frames).

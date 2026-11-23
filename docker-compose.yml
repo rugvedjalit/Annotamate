@@ -50,6 +50,7 @@ services:
       # (then also change the health check URL below to /annotamate/api/health).
       # ANNOTAMATE_BASE_URL: /annotamate/
       # ANNOTAMATE_SESSION_DAYS: "14"
+      # ANNOTAMATE_SESSION_MAX_DAYS: "90"
       # ANNOTAMATE_MAX_UPLOAD_MB: "50"
       # ANNOTAMATE_MAX_UPLOAD_REQUEST_MB: "1024"
       # ANNOTAMATE_MAX_BODY_MB: "2"

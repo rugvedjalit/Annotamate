@@ -62,12 +62,16 @@ Accounts are managed by administrators under **Administration → Users** in the
 - The actions menu of each row offers **Edit details** (name, e-mail address and administrator
   switch), **Reset password**, **Send a message**, **Make administrator** or **Remove
   administrator**, and **Deactivate** or **Reactivate**. User names cannot be changed.
-- **Reset password** signs the user out on every device.
+- **Reset password** signs the user out on every device. For your own account the menu offers
+  **Change your password** instead, which asks for your current password, so someone who got hold of
+  your open session cannot lock you out.
 - **Deactivate** an account when someone leaves. Deactivated users cannot sign in and their sessions
   end immediately. Their past work, messages and comments stay. Reactivate the account to give
   access back; the old password works again. Turn on **Show deactivated** to see these accounts.
-  You cannot deactivate yourself or remove your own administrator rights, so the server cannot be
-  left without an administrator by accident.
+  You cannot deactivate yourself or remove your own administrator rights, and the last active
+  administrator cannot be removed, so the server is never left without one.
+- Sessions end 14 days after their last use and, at the latest, 90 days after sign-in
+  (`ANNOTAMATE_SESSION_DAYS`, `ANNOTAMATE_SESSION_MAX_DAYS`).
 - **Remove administrator** keeps the person's project roles but ends their access to user
   management and project creation.
 
@@ -504,10 +508,12 @@ Exports of large datasets with images take a while and produce large files.
 ## 12. Archiving and deleting projects
 
 **Archive project** (managers, under **Settings → Danger zone**) takes a finished project off the
-projects page for everyone. It only hides the project: files, labels, history and conversations stay
-as they are, and nothing on disk is changed. Members and administrators find it again with **Show
-archived** on the projects page, and **Restore project** (in the same Danger zone tab) brings it
-back.
+projects page for everyone and makes it **read-only**: nobody can save annotations, review, change
+classes or assignments, run bulk actions or upload while it is archived. Chat, comments, export,
+settings and members keep working. Files, labels, history and conversations stay as they are, and
+nothing on disk is changed. Members and administrators find it again with **Show archived** on the
+projects page, and **Restore project** (in the same Danger zone tab) brings it back and makes it
+editable again.
 
 **Delete project** (administrators only, under **Settings → Danger zone**; you confirm by typing the
 project name) removes it from Annotamate: its membership, statuses, assignments, chat, comments,

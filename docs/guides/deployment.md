@@ -297,10 +297,13 @@ What the proxy must do:
 
 ### Client addresses and the sign-in limit
 
-Annotamate limits failed sign-ins to 10 per address and user name in 10 minutes and, so that one
-address cannot try many user names, to 30 per public address in total (`ANNOTAMATE_LOGIN_IP_LIMIT`;
-`0` turns it off). Loopback and private addresses only get the first limit, because many users can share
-one of them. Behind a proxy
+Annotamate limits failed sign-ins in 10 minutes to 10 per address and user name; to 30 per address
+in total, so that one address cannot try many user names (`ANNOTAMATE_LOGIN_IP_LIMIT`, `0` turns it off;
+IPv6 addresses count per /64 network); and to 100 per user name from all addresses together, so that
+rotating addresses does not help either. Loopback and private addresses get ten times the per-address
+allowance, because many users can share one of them. When more than 16 sign-ins or password changes
+are being processed at once, further ones are answered with "busy, try again" instead of queueing,
+which keeps a sign-in flood from slowing down everything else. Behind a proxy
 the address of the TCP connection is the proxy's, so the limit only sees real client addresses if
 the server trusts the `X-Forwarded-For` header sent by the proxy. The server runs uvicorn with proxy
 headers enabled and trusts them only from the addresses in the `FORWARDED_ALLOW_IPS` environment
@@ -314,7 +317,9 @@ variable (a comma-separated list; default `127.0.0.1`).
 
 Without it every visitor appears to come from the proxy, and failed sign-ins of one person count
 against everyone who uses the same user name. Never use `*` when clients can reach the application
-directly, because they could then forge the header. The proxy must also replace, not extend, a header
+directly, because they could then forge the header. If a proxy sends `X-Forwarded-For` that is not
+trusted, the server logs a warning once ("... carry an X-Forwarded-For header that is not trusted ...")
+so you notice the missing setting. The proxy must also replace, not extend, a header
 sent by the client: the nginx example sets `X-Forwarded-For $remote_addr`, and Caddy ignores incoming
 values by default.
 
@@ -464,7 +469,8 @@ Flags override environment variables.
 | Database URL | | `ANNOTAMATE_DATABASE_URL` | `sqlite:///<data-dir>/annotamate.db` |
 | Base URL | `--base-url` | `ANNOTAMATE_BASE_URL` | `/` |
 | Secure cookies | `--secure-cookies` | `ANNOTAMATE_SECURE_COOKIES` | `false` |
-| Session lifetime (days) | | `ANNOTAMATE_SESSION_DAYS` | `14` |
+| Session lifetime without activity (days) | | `ANNOTAMATE_SESSION_DAYS` | `14` |
+| Absolute session lifetime after sign-in (days) | | `ANNOTAMATE_SESSION_MAX_DAYS` | `90` |
 | Maximum upload size (MB per file) | | `ANNOTAMATE_MAX_UPLOAD_MB` | `50` |
 | Maximum whole upload request (MB) | | `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` | `1024` |
 | Maximum request body, other routes (MB) | | `ANNOTAMATE_MAX_BODY_MB` | `2` |

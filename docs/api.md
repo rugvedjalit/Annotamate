@@ -8,7 +8,11 @@ Field names are `snake_case` on the wire. Shapes are written as TypeScript.
 * Base path: `{base_url}api` (e.g. `/api`). JSON in, JSON out, UTF-8.
 * Timestamps: ISO 8601 UTC strings ending in `Z`, e.g. `"2026-11-23T10:15:00Z"`.
 * IDs are integers unless stated otherwise. Box ids are strings (UUID v4).
-* Auth: session cookie `annotamate_session` (set by login/setup).
+* Auth: session cookie `annotamate_session` (set by login/setup). Sessions slide forward while used
+  (`ANNOTAMATE_SESSION_DAYS`, 14) but end `ANNOTAMATE_SESSION_MAX_DAYS` (90) after sign-in regardless.
+* Caching: API responses carry `Cache-Control: no-store` unless the route sets its own (image files and
+  thumbnails).
+* `GET {base_url}api/openapi.json` (the generated API description) needs a signed-in user.
 * CSRF: every `POST/PUT/PATCH/DELETE` must send header `X-Annotamate-Client: web`. Missing → `403 {code:"csrf"}`.
 * Errors always have this body (status code carries the class of error):
 
@@ -24,7 +28,7 @@ interface ApiError {
 | --- | --- | --- | --- |
 | 400 | `bad_request` | Semantically invalid input (e.g. wrong current password, workflow transition not allowed, `subdir` upload into a non-recursive project) | |
 | 401 | `unauthenticated`, `invalid_credentials` | No / expired session; wrong username or password on login | |
-| 403 | `forbidden`, `csrf` | Role does not allow it (also: `force: true` on a save by someone who is neither reviewer+ nor the lock holder); missing CSRF header | |
+| 403 | `forbidden`, `csrf` | Role does not allow it (also: `force: true` on a save by someone who is neither reviewer+ nor the lock holder; any annotation, review, class, assignment, bulk or upload change in an **archived** project, which is read-only until a manager restores it); missing CSRF header | |
 | 404 | `not_found` | Unknown id or not a member of the project (also unknown `/api/...` paths) | |
 | 409 | `conflict` | Annotation `base_version` ≠ current version | `current: AnnotationDoc` |
 | 409 | `in_use` | Deleting a class (`strategy=forbid`) that labels still use | `images: number` (images using it) |
@@ -32,10 +36,11 @@ interface ApiError {
 | 413 | `too_large` | Request body over its limit: 2 MB for ordinary routes (`ANNOTAMATE_MAX_BODY_MB`), 64 KB for `PUT /api/me/settings`, `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for the upload route, `ANNOTAMATE_MAX_UPLOAD_MB` (50) per uploaded file. Checked against `Content-Length` and again while the body streams in | |
 | 422 | `validation_error` | Body/query validation failed | `errors: {loc: string[], msg: string}[]` |
 | 423 | `locked` | Another user holds the image's edit lock | `holder: UserBrief` |
-| 429 | `rate_limited` | Too many failed sign-ins: 10 per address and user name, and 30 per public address in total (`ANNOTAMATE_LOGIN_IP_LIMIT`), in 10 minutes | `retry_after: number` (seconds, also in `Retry-After`) |
+| 429 | `rate_limited` | Too many failed sign-ins in 10 minutes: 10 per address and user name; 30 per public address in total (`ANNOTAMATE_LOGIN_IP_LIMIT`; IPv6 counted per /64; 10 times as many for loopback and private addresses); 100 per user name from all addresses together. Attempts are counted before the password is checked; a correct password takes its attempt back | `retry_after: number` (seconds, also in `Retry-After`) |
 | 500 | `write_failed` | The label file could not be written (disk full, permissions); nothing was changed | |
 | 500 | `migration_incomplete` | A class delete/merge failed half-way and restoring the original label files failed too | `files: string[]` (paths whose content may be wrong; their `.bak` backups are kept next to them) |
 | 500 | `internal_error` | Unexpected server error | |
+| 503 | `busy` | More than 16 password-hashing requests (sign-in, setup, password changes, account creation) at once; retry after `Retry-After` seconds | |
 
 Pagination:
 
@@ -224,9 +229,9 @@ interface Notification {
   id: number
   type: NotificationType
   actor: UserBrief | null
-  project: { id: number; name: string } | null
-  image: { id: number; filename: string } | null
-  text: string                // server-rendered one-line summary
+  project: { id: number; name: string } | null  // null once the recipient is no longer a member (no live name or link)
+  image: { id: number; filename: string } | null  // null as above, and for deleted or missing images
+  text: string                // server-rendered one-line summary (frozen when the notification was created)
   created_at: string
   read_at: string | null
 }
@@ -303,8 +308,8 @@ Username rules: 3–32 chars, `[a-z0-9_.-]`, stored lowercase, unique. Password 
 | --- | --- | --- | --- |
 | `GET /api/users` | user | `?include_inactive=true` (admin only) | Admins: `(User & {online: boolean})[]`. Everyone else: `(UserBrief & {online: boolean})[]` only (no email, admin flag, activity or timestamps). Sorted by display_name |
 | `POST /api/users` | admin | `{username, display_name, password, email?, is_admin?}` | `User` (`409 exists`) |
-| `PATCH /api/users/{id}` | admin | `{display_name?, email?, is_admin?, is_active?}` | `User`. Cannot deactivate or demote yourself → `400` |
-| `POST /api/users/{id}/password` | admin | `{new_password}` | `204`, revokes that user's sessions |
+| `PATCH /api/users/{id}` | admin | `{display_name?, email?, is_admin?, is_active?}` | `User`. Cannot deactivate or demote yourself, or remove the last active administrator → `400`. Changes to admin rights and account status are serialised, so concurrent requests cannot leave the server without an administrator |
+| `POST /api/users/{id}/password` | admin | `{new_password}` | `204`, revokes that user's sessions. Not for your own account (`400`): use `POST /api/me/password`, which asks for the current password |
 
 ### Folder browser (project creation)
 
@@ -361,7 +366,7 @@ Common filter query (images list, neighbours, bulk `filter`):
 | `GET /api/projects/{pid}/images/{iid}` | member | | `ImageDetail`. `404` for a missing image. `error` is set when the image cannot be read, including when it exceeds the pixel budget (`ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`, default 150) |
 | `GET /api/projects/{pid}/images/{iid}/neighbors` | member | filters | `{prev_id: number \| null, next_id: number \| null, index: number /* 0-based within filter, -1 if excluded */, total: number}` |
 | `GET /api/projects/{pid}/images/{iid}/file` | member | `?v=` ignored | image bytes, browser-safe (JPEG/PNG/WebP/GIF/BMP as-is unless re-encoding needed); `Cache-Control: private, max-age=31536000, immutable` when `v` present |
-| `GET /api/projects/{pid}/images/{iid}/thumb` | member | `?size=256` (64–512) | WebP thumbnail (cached on disk) |
+| `GET /api/projects/{pid}/images/{iid}/thumb` | member | `?size=256` (64–512, rounded up to 128, 256 or 512) | WebP thumbnail (cached on disk) |
 | `PATCH /api/projects/{pid}/images/{iid}` | see rules | `{flagged?: boolean, assignee_id?: number \| null}` | `ImageItem`. Flag: `can_edit`. Assign others: manager. Annotators may set `assignee_id` to themselves when unassigned, or to null when it is themselves. Assigning notifies the assignee. |
 | `POST /api/projects/{pid}/images/{iid}/status` | see §6 of architecture | `{action: 'submit'\|'approve'\|'reject'\|'reopen', comment?: string}` | `ImageItem`; `reject` requires `comment` (also stored as an image comment); notifications for review results / review requests |
 | `POST /api/projects/{pid}/images/bulk` | manager | `{image_ids?: number[], filter?: {...filters}, action: 'assign'\|'unassign'\|'flag'\|'unflag'\|'set_status'\|'distribute', assignee_id?: number, status?: ImageStatus, user_ids?: number[], limit?: number}` | `{updated: number}`. `distribute` splits the matched images (in natural order, up to `limit`) evenly between `user_ids`. One notification per assignee summarising the count. |
@@ -425,7 +430,13 @@ Frames are JSON objects with a `type`. Unknown types are ignored.
 
 Connection lifecycle and close codes:
 
-* `Origin` mismatch: the handshake is refused (close `1008`).
+* `Origin` mismatch: the handshake is refused (close `1008`). `Origin` must name exactly the `Host` the request
+  was sent to (`X-Forwarded-Host` is not consulted), and with `ANNOTAMATE_SECURE_COOKIES` it must be `https`.
+* More than 10 sockets for one user (or 5000 in total): `{type:'error', code:'rate_limited'}`, then close `4429`;
+  clients retry with backoff.
+* Frames are rate limited per socket (20 per second sustained, bursts of 40). Excess frames are dropped with
+  one `{type:'error', code:'rate_limited'}`; a client that keeps flooding (over 200 dropped frames) is closed
+  with `1008`. Ids in frames must be positive 64-bit integers; anything else is ignored.
 * No valid session: the socket is accepted, receives `{type:'error', code:'unauthenticated'}` and is closed with
   `4401`. The same close code is used when the user is deactivated, their password is reset or they sign out
   elsewhere. Clients re-check `GET /api/auth/state` on `4401`, `4403` and `1008` and show the sign-in page if the
@@ -462,7 +473,9 @@ Connection lifecycle and close codes:
 
 { type: 'lock.granted', image_id: number }
 { type: 'lock.denied', image_id: number, holder: UserBrief }
-{ type: 'lock.revoked', image_id: number, by: UserBrief }          // someone (or the same user in another tab) took over
+{ type: 'lock.revoked', image_id: number, by: UserBrief | null, reason?: string }
+    // someone (or the same user in another tab) took over; `by: null` + `reason` when the holder lost the right
+    // to edit the image (role change, reassignment under restrict_to_assigned; checked on every ping)
 { type: 'lock.expired', image_id: number }                         // to the holder only: the server's sweep expired the lock
                                                                    // (no ping for 60 s); re-acquire it or drop to read-only
 { type: 'lock.state', project_id: number, image_id: number, holder: UserBrief | null }  // broadcast to the room
@@ -494,7 +507,11 @@ Ordering and semantics:
   currently held in the project. A snapshot therefore starts a fresh view: clients drop the locks they knew
   (they may have been released while the client was disconnected) and rebuild them from those frames.
 * **One edit lock per connection.** Acquiring a lock releases any other lock the same connection holds
-  (the room gets `lock.state` with `holder: null` for the released image).
+  (the room gets `lock.state` with `holder: null` for the released image). Over all of a user's connections at
+  most **3** locks are held: acquiring a fourth lets go of the user's oldest (its tab gets `lock.revoked`).
+* `typing` is passed on at most once every 2 seconds per socket and target, and typing/presence updates are
+  skipped for a recipient whose outgoing queue is more than half full (they never cause a `1013`).
+* `subscribe` to the project the socket is already in is a no-op.
 * Locks belong to a connection. A second tab of the **same user** that asks for a lock it already holds elsewhere
   takes it over without `force`; the old tab gets `lock.revoked` with `by` = that same user (and should stop
   re-requesting it until the new holder lets go). A manager/admin `force` take-over works the same way for

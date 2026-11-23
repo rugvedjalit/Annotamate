@@ -174,6 +174,19 @@ reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-mi
   so nothing is lost. GET never modifies the class list.
 * **Read-only files.** YOLO lines with more than 5 values (segmentation/OBB) or unparsable files make the image
   read-only (`readonly_reason`), so saving can never destroy data the tool does not understand.
+* **Hostile label files.** Parsers never raise: any malformed input (huge integers, deep nesting, wrong JSON
+  shapes, invalid XML) becomes a read-only result, and indexing isolates each file so one bad file cannot stop a
+  project from loading. Label files over 8 MB are not read (read-only, no boxes); files with more than 20,000
+  boxes show the first 20,000 read-only. VOC files may not contain a DOCTYPE or entity declarations in any
+  encoding and may nest at most 64 levels. Label text echoed into `readonly_reason` is cut to 100 characters.
+* **Image formats.** Only JPEG, PNG, BMP, WebP and TIFF content is decoded (Pillow's `formats=` allow-list), whatever
+  the file extension says; other formats (EPS, ICO, TGA, JPEG 2000...) are unreadable images and skipped uploads.
+* **Scanning** skips symbolic links, Windows junctions and folders whose real path leaves the root.
+* **Exports** stream image files in 1 MB chunks; an item that fails is skipped with a warning (the archive stays
+  valid), and entries whose names contain backslashes, colons, control characters or `.`/`..` segments are
+  skipped.
+* **Uploaded file names** drop invisible formatting characters and avoid every Windows device name (`CON`, `COM¹`,
+  `CONIN$`, `con .png`...).
 * **Atomic writes.** Write to a temp file in the same folder, `fsync`, `os.replace`.
 * **Multi-file rewrites** (class delete/merge, `core.fsutil.atomic_write_many`) are all-or-nothing: pre-flight
   writability check of every target (including the Windows read-only attribute), all new contents written and
@@ -230,15 +243,34 @@ reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-mi
 ## 10. Security
 
 * Session cookie `annotamate_session`: random 32-byte token, only its SHA-256 is stored; HttpOnly, SameSite=Lax,
-  Secure when `secure_cookies`; sliding expiry.
+  Secure when `secure_cookies`; sliding expiry (`session_days`, 14) capped by an absolute lifetime
+  (`session_max_days`, 90 days after sign-in). Sessions are revoked on sign-out, password change (other sessions),
+  admin password reset and deactivation, and open WebSockets of revoked sessions are closed with `4401`.
 * CSRF: every non-GET/HEAD/OPTIONS request under `/api` must carry header `X-Annotamate-Client: web`
   (or any non-empty value). No CORS is configured, so browsers cannot send it cross-site.
-* WebSocket: cookie auth + `Origin` must match the request host.
-* Login rate limit: 10 failed attempts per (IP, username) and, for public addresses only, 30 per IP in total
-  (`ANNOTAMATE_LOGIN_IP_LIMIT`, 0 = off) per 10 minutes → `429`. Loopback and private addresses are exempt from
-  the address-wide limit because a proxy without trusted forwarding headers, Docker's gateway or an office network
-  can make every user share one address. At most
-  four password hashes/verifications (argon2id) run at the same time.
+* WebSocket: cookie auth; `Origin` must equal the `Host` header (`X-Forwarded-Host` is ignored, it could come from
+  the client) and be `https` when `secure_cookies` is on. Per socket: 20 frames/s with bursts of 40 (excess dropped,
+  persistent flooding closed with `1008`), `typing` relayed at most every 2 s per target, typing/presence skipped
+  for recipients with a backed-up queue, ids bounded to positive 64-bit integers, malformed or deeply nested JSON
+  answered with `bad_request`. At most 10 sockets per user and 5000 in total (`4429`).
+* Login rate limit (sliding 10 minutes, `429`): 10 failed attempts per (address, username); 30 per address across
+  usernames (`ANNOTAMATE_LOGIN_IP_LIMIT`, 0 = off), with IPv6 counted per /64 and loopback/private addresses allowed
+  10 times as many (a proxy without trusted forwarding headers, Docker's gateway or an office network can make every
+  user share one address); 100 per username across all addresses, so rotating addresses gains nothing. An attempt is
+  recorded atomically **before** the password is verified (parallel guesses cannot exceed the limit) and taken back
+  when the password is right. Usernames that no account can have share one bucket. When the limiter's table is full,
+  expired entries go first and address-wide entries are never evicted early.
+* Password hashing: argon2id (library defaults), at most four hashes/verifications at a time; at most 16 requests to
+  the hashing routes (sign-in, setup, password changes, account creation) are admitted at once, more get
+  `503 busy` immediately instead of tying up worker threads.
+* First-run setup without the token only for requests made on the server itself: loopback peer, no proxy/tunnel
+  headers, a `Host` of `localhost`/`127.0.0.1`/`[::1]` (a DNS-rebinding page sends its own name) and a matching
+  `Origin`.
+* Accounts: an administrator cannot reset their own password through the admin route (the account page asks for the
+  current one); admin-right and account-status changes are serialised and the last active administrator cannot be
+  demoted or deactivated.
+* A one-time warning is logged when requests carry an `X-Forwarded-For` that uvicorn did not apply (the proxy is not
+  in `FORWARDED_ALLOW_IPS`).
 * Request size limits (ASGI middleware, `413 too_large`, checked against `Content-Length` and the streamed byte
   count): 2 MB for ordinary routes (`ANNOTAMATE_MAX_BODY_MB`), 64 KB for `PUT /api/me/settings`,
   `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for the upload route, plus `ANNOTAMATE_MAX_UPLOAD_MB` per file.
@@ -247,14 +279,26 @@ reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-mi
   decodes run at once and concurrent requests for the same thumbnail/re-encoded image decode it only once.
 * `base_url` is validated at start-up (`^/[A-Za-z0-9._~\-/]*$`, no `.`/`..` segments, normalised to a trailing
   slash) and HTML-escaped where it is injected into the page.
-* Edit locks: one per WebSocket connection; the session is re-validated on every `ping` (close `4401` when expired).
+* Edit locks: one per WebSocket connection and at most three per user; on every `ping` the session is re-validated
+  (close `4401` when expired) and the right to edit each locked image is re-checked (`lock.revoked` with `by: null`
+  when it was lost, e.g. after reassignment under `restrict_to_assigned`).
+* Archived projects are read-only: no annotation saves, reviews, class or assignment changes, bulk actions or
+  uploads (`403`); chat, comments, settings, members, export and restoring still work.
+* Notifications of a project the recipient has left keep their text but lose the project and image link; review
+  results go only to annotators who still have access.
 * Filesystem: project folders and every served/written file are resolved with `realpath` and must stay inside
   the roots / project folders. The client never sends paths except in the admin-only folder browser and project
   creation, both validated against the roots.
 * Uploads: manager-only, image extensions only, size-limited, filenames sanitised, never overwrite (suffix `-1`, `-2`…).
 * Security headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`,
-  `X-Frame-Options: DENY`, a strict `Content-Security-Policy` for the SPA (self only: `connect-src 'self'`, which
-  covers the same-origin WebSocket; `img-src 'self' blob: data:`).
+  `X-Frame-Options: DENY`, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`,
+  a restrictive `Permissions-Policy`, `Strict-Transport-Security` (one year) when `secure_cookies` is on, and a
+  strict `Content-Security-Policy` for the SPA (self only: `connect-src 'self'`, which covers the same-origin
+  WebSocket; `img-src 'self' blob: data:`). API responses default to `Cache-Control: no-store`.
+* `GET /api/openapi.json` needs a signed-in user.
+* Names: invisible formatting characters (bidirectional overrides and isolates, zero-width spaces, BOM, soft hyphen)
+  and control characters are removed from display names and project names and refused in class names; chat shows
+  `@username` next to display names; message links stop at such characters.
 * `GET /api/users` returns the full `User` to administrators only; everyone else gets `UserBrief & {online}`.
 
 ## 11. Frontend summary
