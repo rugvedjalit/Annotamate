@@ -316,7 +316,7 @@ An image opens read-only, with an explanation, when:
 
 ### Revision history
 
-Every save is recorded. The **History** tab lists the last 50 versions of the image with author,
+Every save that changes something is recorded. The **History** tab lists the last 20 versions of the image with author,
 time and number of boxes, marked *Current* or *Latest*. Use **Preview** to look at a version on the
 canvas (**Exit preview** or `Escape` leaves it) and **Restore** to make it the current version;
 restoring needs edit access and no unsaved changes. Restoring is itself a save, so it can be

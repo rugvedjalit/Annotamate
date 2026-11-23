@@ -462,7 +462,9 @@ A rescan:
 
 - adds new images (**Done** if they have a label file, otherwise **To do**);
 - never changes the status or assignment of an image that is already in the project, even when a
-  label file has appeared for it; box counts and per-class counts are refreshed from the label files;
+  label file has appeared for it; box counts and per-class counts are refreshed from the label files.
+  Only label files that changed since the last scan are read (their size or modification time is
+  different), so rescanning a large project in which little changed takes seconds;
 - marks images that are no longer in the folder as **missing**. They disappear from the images list,
   counts, statistics, exports and bulk actions, but their status, comments and revision history are
   kept: if the file comes back (a remounted share, a restored backup) a rescan makes the image
@@ -550,6 +552,7 @@ labels up again, but not the deleted history.
   administrators can **take over** a lock, for example when someone left an image open and went
   home. The previous holder is notified and drops to read-only. A lock also expires by itself about
   a minute after its holder's browser stops responding.
-- **Revisions**: the last 50 saves of every image are kept with author and time and can be restored
-  from the History tab in the annotator.
+- **Revisions**: the last 20 saves of every image are kept with author and time and can be restored
+  from the History tab in the annotator (the server setting `ANNOTAMATE_REVISIONS_KEEP` changes the
+  number; saving without a change does not add a version).
 - **Project chat and comments**: managers can delete any chat message or comment in their project.

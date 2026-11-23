@@ -142,7 +142,8 @@ interface ImageItem {
   id: number
   filename: string            // basename
   rel_path: string            // path relative to image_dir, "/" separators
-  position: number            // 0-based position in natural sort order of the whole project
+  position: number            // 0-based position in natural sort order of the whole project (missing images
+                              // are not counted); computed for every response, so uploads never renumber rows
   status: ImageStatus
   box_count: number
   class_ids: number[]         // ProjectClass ids present (deduplicated)
@@ -337,11 +338,11 @@ Username rules: 3–32 chars, `[a-z0-9_.-]`, stored lowercase, unique. Password 
 | `GET /api/projects/{pid}` | member | | `Project` |
 | `PATCH /api/projects/{pid}` | manager | `{name?, description?, label_dir?, settings?: Partial<ProjectSettings>, archived?}` | `Project` |
 | `DELETE /api/projects/{pid}` | admin | | `204` (DB rows only; files on disk untouched) |
-| `POST /api/projects/{pid}/rescan` | manager | | `202 {started: true}`; progress over WS (`project.indexing`). Adds new images (a new image with a label file starts as `done`); never changes the status of existing images; images whose file is gone get `missing` (hidden from lists, neighbours, counts, stats, exports, bulk actions and filters; comments, revisions and status are kept) and are restored when the file returns |
+| `POST /api/projects/{pid}/rescan` | manager | | `202 {started: true}`; progress over WS (`project.indexing`). Only label files whose size or modification time changed are read again (see architecture.md, "Index and rescans"). Adds new images (a new image with a label file starts as `done`); never changes the status of existing images; images whose file is gone get `missing` (hidden from lists, neighbours, counts, stats, exports, bulk actions and filters; comments, revisions and status are kept) and are restored when the file returns |
 | `POST /api/projects/{pid}/prune-missing` | manager | | `{removed: number}`: permanently deletes the missing images (with their comments and revisions) |
 | `GET /api/projects/{pid}/stats` | member | `?tz_offset=` (viewer's UTC offset in minutes, east positive, −840…840; default 0): `daily` covers the last 30 days of the viewer's calendar. Computed once per change of the project however many clients ask (see "Counts and statistics" below) | `{status_counts: StatusCounts, images_total, boxes_total, class_counts: {class_id: number, boxes: number, images: number}[], per_user: {user: UserBrief, saves: number, boxes: number, submitted: number, approved: number, rejected: number, reviewed: number}[], daily: {date: "YYYY-MM-DD", saves: number, done: number}[] /* last 30 days */}` |
 | `POST /api/projects/{pid}/upload` | manager | multipart `files[]` (the field name `files` is accepted too; ≤ 1000 files per request), optional `subdir` (relative folder; only for projects with `settings.recursive`, else `400`) | `{added: ImageItem[], skipped: {filename, reason}[]}` |
-| `GET /api/projects/{pid}/export` | manager | `?format=yolo\|voc\|coco&scope=all\|done&include_images=false` | `application/zip` download. YOLO: `labels/*.txt`, `classes.txt`, `data.yaml`. VOC: `Annotations/*.xml`. COCO: single `annotations.json` (dataset-level, ids 1-based). With images: `images/...` |
+| `GET /api/projects/{pid}/export` | manager | `?format=yolo\|voc\|coco&scope=all\|done&include_images=false` | `application/zip` download. YOLO: `labels/*.txt`, `classes.txt`, `data.yaml`. VOC: `Annotations/*.xml`. COCO: single `annotations.json` (dataset-level; `images`, `annotations`, `categories` in this order, one record per line, ids 1-based in export order; categories are the classes in index order followed by label names that are not classes). With images: `images/...`. Every format is streamed with flat memory |
 
 **Counts and statistics.** `status_counts`, `image_count`, `missing_count`, `my_assigned_todo`, the members'
 `assigned_count`/`done_count` and `GET .../stats` come from a short-lived cache per project: a change in the
@@ -402,9 +403,9 @@ Common filter query (images list, neighbours, bulk `filter`):
 
 | Method & path | Auth | Body / query | Response |
 | --- | --- | --- | --- |
-| `GET /api/projects/{pid}/images` | member | filters + `offset` (0) + `limit` (100, max 500) | `{total: number, offset: number, items: ImageItem[]}` |
+| `GET /api/projects/{pid}/images` | member | filters + `offset` (0) + `limit` (100, max 500) + `count` (`true`/`false`; default: `true` for `offset=0`, else `false`) | `{total: number \| null, offset: number, items: ImageItem[]}`. `total` (all matches) is counted only when `count` says so: by default on the first page, so scrolling through a long list does not count it again for every page. It is `null` otherwise; take it from the first page, or ask with `count=true` |
 | `GET /api/projects/{pid}/images/{iid}` | member | | `ImageDetail`. `404` for a missing image. `error` is set when the image cannot be read, including when it exceeds the pixel budget (`ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`, default 150) |
-| `GET /api/projects/{pid}/images/{iid}/neighbors` | member | filters | `{prev_id: number \| null, next_id: number \| null, index: number /* 0-based within filter, -1 if excluded */, total: number}` |
+| `GET /api/projects/{pid}/images/{iid}/neighbors` | member | filters | `{prev_id: number \| null, next_id: number \| null, index: number /* 0-based within filter, -1 if excluded */, total: number}`. Without filters `total` is the project's cached image count (see "Counts and statistics") |
 | `GET /api/projects/{pid}/images/{iid}/file` | member | `?v=` ignored | image bytes, browser-safe (JPEG/PNG/WebP/GIF/BMP as-is unless re-encoding needed); `Cache-Control: private, max-age=31536000, immutable` when `v` present |
 | `GET /api/projects/{pid}/images/{iid}/thumb` | member | `?size=256` (64–512, rounded up to 128, 256 or 512) | WebP thumbnail (cached on disk) |
 | `PATCH /api/projects/{pid}/images/{iid}` | see rules | `{flagged?: boolean, assignee_id?: number \| null}` | `ImageItem`. Flag: `can_edit`. Assign others: manager. Annotators may set `assignee_id` to themselves when unassigned, or to null when it is themselves. Assigning notifies the assignee. |
@@ -417,7 +418,7 @@ Common filter query (images list, neighbours, bulk `filter`):
 | --- | --- | --- | --- |
 | `GET /api/projects/{pid}/images/{iid}/annotation` | member | | `AnnotationDoc` |
 | `PUT /api/projects/{pid}/images/{iid}/annotation` | `can_edit` (+ assignment rule) | `{base_version: string \| null, boxes: Box[], force?: boolean}` | `{version: string, updated_at, box_count, image: ImageItem, boxes: Box[]}` where `boxes` are the boxes as stored (clamped, rounded to the file format, tiny ones dropped, ids kept): exactly what a following `GET` returns. `409 conflict` + `current: AnnotationDoc` if `base_version` ≠ current version and not `force` (`force` allowed for reviewer+ or the lock holder). `409 readonly` (broken/polygon label file, unreadable image, an image that shares its label file with an earlier image of the folder, or the YOLO name `classes`). `423 locked` + `holder`. VOC and COCO saves patch the existing file: boxes that came from it keep fields this tool does not model (VOC `pose`, `occluded`, custom elements, `source`; COCO `attributes`, `iscrowd`, `score`, ids, `info`, `licenses`); new boxes are written in the standard shape. Box coordinates are clamped/normalised server-side; boxes smaller than 1px are dropped; unknown `class_id` → `422`. An empty `boxes` list writes an empty label file (a "background" image). |
-| `GET /api/projects/{pid}/images/{iid}/revisions` | member | | `{id, user: UserBrief \| null, created_at, box_count, version}[]` newest first (max 50) |
+| `GET /api/projects/{pid}/images/{iid}/revisions` | member | | `{id, user: UserBrief \| null, created_at, box_count, version}[]` newest first. The newest `ANNOTAMATE_REVISIONS_KEEP` (default 20) saves of an image are kept; a save whose boxes are identical to the newest revision (same file content, same box ids) does not add one |
 | `GET /api/projects/{pid}/images/{iid}/revisions/{rid}` | member | | `{id, user, created_at, boxes: Box[]}` |
 | `POST /api/projects/{pid}/images/{iid}/revisions/{rid}/restore` | `can_edit` | `{base_version}` | same as PUT |
 
@@ -461,7 +462,7 @@ Common filter query (images list, neighbours, bulk `filter`):
 
 | Method & path | Auth | Query | Response |
 | --- | --- | --- | --- |
-| `GET /api/projects/{pid}/activity` | member | `?before_id=&limit=50&user_id=&image_id=` | `{items: Activity[] /* newest first */, has_more}` |
+| `GET /api/projects/{pid}/activity` | member | `?before_id=&limit=50&user_id=&image_id=` | `{items: Activity[] /* newest first */, has_more}`. With `ANNOTAMATE_ACTIVITY_RETENTION_DAYS` set, entries older than that are removed once a day (and with them their share of the per-member numbers in `stats`) |
 
 ## WebSocket `/api/ws`
 

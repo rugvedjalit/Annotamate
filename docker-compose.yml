@@ -57,6 +57,9 @@ services:
       # ANNOTAMATE_MAX_IMAGE_MEGAPIXELS: "150"
       # Threads that answer requests; more than a few makes a busy server slower.
       # ANNOTAMATE_WORKER_THREADS: "4"
+      # ANNOTAMATE_REVISIONS_KEEP: "20"
+      # Days to keep activity and read notifications (0 = for ever).
+      # ANNOTAMATE_ACTIVITY_RETENTION_DAYS: "0"
       # ANNOTAMATE_LOGIN_IP_LIMIT: "30"
       # ANNOTAMATE_LOG_LEVEL: info
       # Behind the Caddy service below, trust its X-Forwarded-For header so that the

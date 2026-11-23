@@ -59,13 +59,15 @@ docs/                             architecture, API, guides
   * full image decodes (thumbnails, re-encoded images) run on an image pool of three threads; the request thread
     only does the database lookup and the cache check;
   * uploads (checking and writing up to a thousand files) run on an upload pool of two threads;
-  * indexing, class renames and class delete/merge are background jobs (two job threads), reported over the
-    WebSocket;
-  * exports are streamed, one file per step.
+  * indexing, class renames, class delete/merge and the daily history retention are background jobs (two job
+    threads), reported over the WebSocket;
+  * exports are streamed, one file per step (the dataset-level COCO document included, see section 7).
 * **Database.** SQLite by default (`<data-dir>/annotamate.db`, WAL mode, foreign keys on, 64 MB page cache,
   memory-mapped reads, temporary tables in memory; the connection pool holds one connection per worker thread
   plus four). `PRAGMA optimize` refreshes the query planner's statistics after every indexing job and at
-  shutdown. `ANNOTAMATE_DATABASE_URL` may point at PostgreSQL. Alembic migrations run automatically at start-up.
+  shutdown. `ANNOTAMATE_DATABASE_URL` may point at PostgreSQL. Alembic migrations run automatically at start-up;
+  on SQLite they run with foreign keys switched off (`db.migration_connection`), because rebuilding a table to
+  change a column would otherwise cascade-delete the rows that reference it.
 * **Counts are cached briefly.** Per-project status counts, assignment counts and statistics are asked for by
   every open page after every change. They come from an in-memory cache (`AppContext.aggregates`): a change in
   the project marks them stale (hooked into the realtime events, so a client reads its own writes), simultaneous
@@ -96,6 +98,8 @@ docs/                             architecture, API, guides
 | Max request body, other routes (MB) | | `ANNOTAMATE_MAX_BODY_MB` | `2` |
 | Max image size (megapixels) | | `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` | `150` |
 | Worker threads (request handlers) | | `ANNOTAMATE_WORKER_THREADS` | `4` (1–64) |
+| Revisions kept per image | | `ANNOTAMATE_REVISIONS_KEEP` | `20` (1–1000) |
+| Activity and read notifications kept (days) | | `ANNOTAMATE_ACTIVITY_RETENTION_DAYS` | `0` = for ever |
 | Open browser | `--open/--no-open` | | `--open` only for bare `annotamate` |
 | Log level | `--log-level` | `ANNOTAMATE_LOG_LEVEL` | `info` |
 
@@ -165,6 +169,42 @@ are excluded from lists, neighbours, counts, statistics, exports, bulk actions, 
 (`missing_count` reports them), keep their comments, revisions and status, and are restored when the file
 reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-missing`).
 
+**Index and rescans.** The `images` table is an index of the folder; indexing (`services/indexing.py`) keeps it
+in line with the files:
+
+* **Order and positions.** Each row stores `sort_key = natural_sort_key(rel_path)` (`core/scanning.py`): a byte
+  string whose binary order is the natural order (`img2` before `img10`, folders compared component by component,
+  the path itself as tie-breaker), the same in SQLite and PostgreSQL. Lists are ordered by it through the
+  `(project_id, missing, sort_key)` index and the status/assignee indexes, which end in it. `ImageItem.position`
+  is not stored: it is the number of visible images with a smaller key, counted on that index (for a whole page
+  in one statement; an unfiltered page needs no count at all). Adding images therefore never rewrites other rows.
+* **Chunks.** An index pass lists the folder, then works through it 1,000 images at a time: read the label files
+  of the chunk without holding any lock, take the project's label lock, store the chunk in one short transaction,
+  release the lock. Memory stays flat (parsed labels live for one chunk) and a save waits for one chunk at most.
+  This is safe because a row saved after the chunk started is left alone (the save stored fresh counts), and the
+  chunk is read again when the class epoch or the project's class versions changed in between (compared under
+  the lock). Images whose file is gone are marked `missing` after the last chunk.
+* **Only changed label files are read.** With its counts a row keeps the size and modification time of the label
+  file they were computed from (`label_size`, `label_mtime_ns`) and the project's class-list version at that
+  moment (`counted_version`). The directory listing that finds the label files also gives their current size and
+  time, so a rescan reads a file only when the counts cannot be reused. They are reused when the file is the
+  same (same label key, size and time) and the class list still maps its labels the same way: either
+  `counted_version` equals `projects.class_version`, or the file had no unknown label and
+  `counted_version >= projects.class_floor`. `class_version` goes up with every class added, renamed, deleted or
+  merged and when a rename has finished; `class_floor` follows it only for the changes that can alter a label
+  that was already known (delete, merge, the end of a rename, which drops the old name as an alias). Adding a
+  class appends it and a rename keeps the class, so a known label keeps its class through those.
+* **Timestamps that cannot be trusted.** A file modified less than two seconds before it was read could change
+  again without a new size or time (file systems tick in steps of up to two seconds), so its state is not
+  stored and the next rescan reads it again. A save through the app stores the state of the file it wrote.
+  Changing the label folder clears every stored state. Not detected: a file rewritten outside the app with the
+  same size *and* the same modification time (a tool that restores timestamps).
+* **Classes found in files.** A new VOC/COCO project without classes gets them from its label files as the chunks
+  are read, in the order the names first appear (the same list as reading everything first).
+* **Image sizes.** `width`, `height`, `file_size`, `file_mtime_ns` remember the pixel size read by a save or an
+  export together with the state of the image file; a COCO export uses them instead of opening the image while the
+  file still has that size and time. Changing `exif_mode` clears them.
+
 ## 7. Annotations on disk
 
 * Label path: `<label_dir or image's own folder>/<image stem>.<txt|xml|json>`; `classes.txt` lives in the label dir
@@ -177,7 +217,10 @@ reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-mi
   naming the owner (`409 readonly` on save/restore). Uploads of a colliding file are skipped. In YOLO projects the
   stem `classes` is reserved for `classes.txt`: such an image is read-only and its upload is skipped.
 * Formats: YOLO (`class cx cy w h`, normalised, 6 decimals), Pascal VOC (XML, integer pixel coords, real depth),
-  COCO (one JSON per image, compatible with the desktop app; categories 1-based). Dataset-level export is separate.
+  COCO (one JSON per image, compatible with the desktop app; categories 1-based). Dataset-level export is separate:
+  its `annotations.json` is written into the archive piece by piece. Image and annotation records are collected in
+  two spools while the label files are read (4 MB in memory each, then a temporary file), because `categories`
+  is only complete at the end and the archive can hold one open entry at a time.
 * **Class identity.** In the API boxes reference `ProjectClass.id` (stable). The class *index* (its position) is the
   YOLO id and the order of `classes.txt`. VOC/COCO use class *names*. Renaming a class in a VOC/COCO project, or
   deleting/merging any class, rewrites affected label files. A VOC/COCO rename is a background job whose work is
@@ -241,7 +284,13 @@ reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-mi
   file name, never a server path.
 * **Versions.** `version` = first 16 hex chars of SHA-256 of the label file bytes (`null` when no file).
   Saves send `base_version`; a mismatch returns `409 conflict` with the current content.
-* **Revisions.** Every save stores a revision row (boxes JSON, user, time); the last 50 per image are kept and can be restored.
+* **Revisions.** A save stores a revision row (boxes JSON, user, time) unless its boxes are identical to the
+  newest revision (same file content, same box ids). The newest `ANNOTAMATE_REVISIONS_KEEP` (default 20) per
+  image are kept and can be restored.
+* **History retention.** With `ANNOTAMATE_ACTIVITY_RETENTION_DAYS` > 0 a background job (at start-up, then once a
+  day) deletes activity entries and *read* notifications older than that, a thousand rows per transaction.
+  Unread notifications are never deleted. The per-member numbers of the statistics add up activity, so they then
+  cover the kept period.
 * **EXIF orientation.** Project setting `exif_mode`: `apply` (default; matches OpenCV/Ultralytics) or `ignore`.
   Reported width/height follow the mode. When an image carries an orientation tag ≠ 1 the server re-encodes it
   (transposed for `apply`, tag stripped for `ignore`) so browsers can never rotate it differently.

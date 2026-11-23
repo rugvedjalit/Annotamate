@@ -476,6 +476,8 @@ Flags override environment variables.
 | Maximum request body, other routes (MB) | | `ANNOTAMATE_MAX_BODY_MB` | `2` |
 | Largest image accepted (megapixels) | | `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` | `150` |
 | Worker threads for requests (1–64) | | `ANNOTAMATE_WORKER_THREADS` | `4` |
+| Saved versions kept per image (1–1000) | | `ANNOTAMATE_REVISIONS_KEEP` | `20` |
+| Days activity and read notifications are kept (0 = for ever) | | `ANNOTAMATE_ACTIVITY_RETENTION_DAYS` | `0` |
 | Failed sign-ins per public address in 10 minutes (0 = no limit) | | `ANNOTAMATE_LOGIN_IP_LIMIT` | `30` |
 | Open the browser | `--open` / `--no-open` | | off for `serve`, on for bare `annotamate` |
 | Log level | `--log-level` | `ANNOTAMATE_LOG_LEVEL` | `info` |
@@ -488,6 +490,14 @@ Notes:
   list answered 13 requests per second on 40 threads and 70 on 4). Slow work does not use these
   threads: image decoding, uploads, indexing and class changes have their own. Raise the value only
   if the server uses PostgreSQL on another machine and requests spend their time waiting for it.
+- `ANNOTAMATE_REVISIONS_KEEP` is how many saved versions of each image the History tab offers. Older
+  ones are removed when the image is saved again, and saving without a change does not add a version.
+  Lowering the value takes effect image by image, at each one's next save.
+- `ANNOTAMATE_ACTIVITY_RETENTION_DAYS` keeps the database small on long-running servers: when it is
+  set, activity entries and notifications that have been read are deleted once they are older than
+  that many days (checked at start-up and then once a day). Unread notifications are never deleted.
+  The per-member numbers on a project's overview (saves, submitted, reviewed) count activity, so they
+  then cover the kept period only. The default `0` keeps everything.
 - Values are case-insensitive for the log level (`debug`, `info`, `warning`, `error`, `critical`)
   and booleans accept `true` or `false`.
 - `FORWARDED_ALLOW_IPS` is read by uvicorn, not by Annotamate; see

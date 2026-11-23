@@ -27,6 +27,26 @@ Staying responsive with many users and projects of a lakh of images (first part 
   notification and chat tables. SQLite uses a 64 MB page cache, memory-mapped reads and in-memory
   temporary tables, and refreshes the query planner's statistics after indexing and at shutdown.
 
+Growing with the project instead of with every request (second part of the same plan):
+
+- A rescan reads only the label files that changed. The index remembers the size and modification time
+  of every label file it counted, and which version of the class list it was counted with; an unchanged
+  file is not opened again. Rescanning 10,000 images in which nothing changed went from 15 s to 0.5 s
+  on a Windows laptop. Deleting or merging a class and finishing a rename are followed by one complete
+  pass. A file written less than two seconds before a scan is read again at the next one.
+- Indexing works through a project 1,000 images at a time: memory stays flat, and a save waits for
+  one chunk at most instead of for the whole pass.
+- Image lists count their matches on the first page only, and positions come from the database index:
+  deep pages cost about the same as the first one. Previous/next in the editor needs two index seeks,
+  one count up to the image and the cached project count; it used to count every match twice (half
+  the time at 100,000 images).
+- Uploading images no longer renumbers the project: each image stores a natural-sort key and the list
+  is ordered by it.
+- The COCO export writes `annotations.json` into the archive piece by piece (memory no longer grows
+  with the dataset) and remembers each image's pixel size, so later exports do not open the images.
+- `scripts/benchmark.py` measures all of this over real HTTP requests; CI runs it with 10,000 images
+  and fails on a regression.
+
 ### Changed
 
 - **API:** `DELETE /api/projects/{id}/classes/{cid}` answers `202 {started: true}` and the work
@@ -38,7 +58,20 @@ Staying responsive with many users and projects of a lakh of images (first part 
   image index knows the class is used; label files edited outside Annotamate are checked by the job.
 - The class delete dialog shows the progress and can be closed while the job runs; the project pages
   and the editor show "Class change in progress – editing is paused" and are read-only meanwhile.
-- The database is upgraded automatically at start-up (migration `0003`: indexes only).
+- The database is upgraded automatically at start-up (migrations `0003`: indexes only; `0004`: sort
+  keys, label file states, image sizes and class-list versions, which rebuilds the image table once
+  and adds about 15 MB per 100,000 images). Migrations on SQLite now run with foreign keys switched
+  off, so rebuilding a table can never delete the rows that reference it.
+- **API:** `GET /api/projects/{id}/images` returns `total: null` on pages after the first unless
+  `count=true` is passed (`count=false` skips it on the first page too). `ImageItem.position` is
+  unchanged in meaning (0-based place in natural order) but is now computed, not stored.
+- **API:** the COCO export's `annotations.json` has one record per line instead of indented JSON; ids,
+  order and content are unchanged.
+- Revision history keeps the last 20 saves per image (`ANNOTAMATE_REVISIONS_KEEP`; it was a fixed 50),
+  and saving without a change no longer adds a revision.
+- New setting `ANNOTAMATE_ACTIVITY_RETENTION_DAYS` (default 0 = keep everything): activity entries
+  and read notifications older than that are removed once a day. Unread notifications are never
+  removed.
 
 ### Security
 

@@ -116,7 +116,8 @@ Class palette (20 colours, used when a class is created without a colour):
 * **Files panel** (left, resizable 220–420, collapsible): search, filter chips (All, Mine, Todo, In progress, Review,
   Rejected, Done, Flagged, Has open comments), sort, virtualised rows (status icon, name, box count, assignee avatar,
   avatars of people currently on that image, comment badge), footer progress. Rows load in pages of 200 via
-  `useInfiniteQuery`-like windowing keyed by offset.
+  `useInfiniteQuery`-like windowing keyed by offset. The row count comes from the first page (offset 0), the only
+  one for which the server counts the matches (`total` is `null` on the others).
 * **Tool rail**: Select (V), Box (W), Pan (H / hold Space), Fit (F), labels toggle (L), crosshair toggle (C),
   comments pins toggle, undo/redo.
 * **Canvas** (from `@/canvas`): image, boxes, label chips, crosshair, handles, floating box toolbar (class, duplicate,

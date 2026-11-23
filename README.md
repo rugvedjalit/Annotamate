@@ -34,7 +34,7 @@ loses no labels.
 - Fast canvas: zoom at the cursor, pan, crosshair, eight resize handles, multi-select, copy and paste, and "paste previous boxes" for video frames.
 - Undo and redo for every change; autosave with a visible save state; edit conflicts are shown, never silently overwritten.
 - YOLO, Pascal VOC and COCO label files, read and written in place with atomic writes.
-- Revision history for every image: preview and restore any of the last 50 saves.
+- Revision history for every image: preview and restore any of the last 20 saves.
 - Handles datasets of 100,000+ images (virtualised lists, server-side search and filters, natural sort).
 - Dark and light themes.
 
