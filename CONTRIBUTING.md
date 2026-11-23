@@ -34,6 +34,10 @@ changing behaviour, and update it in the same pull request when the behaviour ch
 
 Requirements: Python 3.11 or newer, Node.js 24, Git.
 
+The quickest way is `python3 scripts/bootstrap.py --dev` (Windows: `python scripts\bootstrap.py --dev`):
+it creates `.venv`, installs the package with the development tools and builds the web interface. The
+[setup guide](docs/guides/setup.md) explains each step; the manual equivalent is:
+
 ```bash
 git clone https://github.com/rugvedjalit/Annotamate.git
 cd Annotamate

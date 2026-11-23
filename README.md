@@ -59,10 +59,28 @@ The interface design is shown in the [annotator mockup](docs/mockups/annotator.h
 
 ## Quick start
 
-Annotamate needs Python 3.11 or newer, or Docker. The first time you open it, the browser asks you
-to create the administrator account. When you open it on the same machine no further proof is
-needed; from any other machine the page asks for the one-time **setup token** that the server prints
-in its console and log (for Docker: `docker compose logs annotamate` or `docker logs annotamate`).
+**The [setup guide](docs/guides/setup.md) takes you from a fresh machine to a running server step by
+step, with the expected output of every command.** It suits people and AI agents alike
+([AGENTS.md](AGENTS.md) has the agent-specific rules). The fastest way from a checkout (Python 3.11+
+and Node.js 24 installed):
+
+```bash
+git clone https://github.com/rugvedjalit/Annotamate.git
+cd Annotamate
+python3 scripts/bootstrap.py --start      # Windows: python scripts\bootstrap.py --start
+```
+
+It installs everything into `.venv`, builds the web interface, starts the server and prints the
+address to open.
+
+The first time you open Annotamate, the browser asks you to create the administrator account. On the
+same machine no further proof is needed; from any other machine, through a reverse proxy, and with
+Docker the page also asks for the one-time **setup token** that the server prints in its console and
+log (for Docker: `docker compose logs annotamate` or `docker logs annotamate`). The account can also
+be created on the command line: `annotamate user create admin --admin`.
+
+The release wheel and container image below are published when a version is tagged; until the first
+release, use the setup script above or Docker Compose (which builds the image from the checkout).
 
 ### pip, over an SSH tunnel
 
@@ -107,7 +125,7 @@ the token shown by `docker logs annotamate`). `/data` is where the container see
 git clone https://github.com/rugvedjalit/Annotamate.git
 cd Annotamate
 mkdir -p datasets            # or edit the bind mount in docker-compose.yml
-docker compose up -d
+docker compose up -d --build
 ```
 
 For a team, put Annotamate behind HTTPS. The [deployment guide](docs/guides/deployment.md) covers
@@ -164,6 +182,8 @@ A typical workflow:
 
 | Guide | For |
 | --- | --- |
+| [Setup](docs/guides/setup.md) | Getting a server running in minutes: setup script, Docker Compose, from source, verification, troubleshooting |
+| [AGENTS.md](AGENTS.md) | AI coding agents and automation: non-interactive setup, checks, conventions |
 | [Deployment](docs/guides/deployment.md) | Installing, HTTPS, reverse proxies, permissions, backups, upgrades, troubleshooting |
 | [Administrator](docs/guides/administrator.md) | Accounts, roles, projects, classes, assignments, review, uploads, exports |
 | [Annotator](docs/guides/annotator.md) | The workspace, tools, keyboard shortcuts, comments, chat, reviews |
@@ -172,7 +192,8 @@ A typical workflow:
 
 ## Development
 
-You need Python 3.11+ and Node.js 24.
+You need Python 3.11+ and Node.js 24. `python3 scripts/bootstrap.py --dev` does the installation
+below in one step; [the setup guide](docs/guides/setup.md#7-path-d-development-mode) explains it.
 
 ```bash
 git clone https://github.com/rugvedjalit/Annotamate.git

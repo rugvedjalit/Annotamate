@@ -1,11 +1,11 @@
 # Annotamate with Docker Compose.
 #
 #   mkdir -p datasets
-#   docker compose up -d
+#   docker compose up -d --build
 #   docker compose logs annotamate     (shows the one-time setup token)
 #   open http://localhost:8765 and create the administrator account
 #
-# Full guide: docs/guides/deployment.md
+# Step-by-step setup: docs/guides/setup.md    Production: docs/guides/deployment.md
 
 name: annotamate
 

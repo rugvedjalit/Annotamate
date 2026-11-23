@@ -95,6 +95,15 @@ Findings of a full security audit (authentication, authorization, file handling,
 
 ### Added
 
+- Setup guide (`docs/guides/setup.md`): from a fresh machine to a running server with every command's
+  expected output, for people and AI agents; `AGENTS.md` with the rules for automated work in the
+  repository.
+- `scripts/bootstrap.py`: one-command setup from a checkout on Linux, macOS and Windows (checks Python
+  and Node.js, creates `.venv`, installs, builds the web interface, verifies; optionally creates the
+  administrator from `ANNOTAMATE_ADMIN_PASSWORD` and starts the server).
+- `annotamate user create --password-stdin` and `annotamate user passwd --password-stdin` read the
+  password from standard input, for scripts that must not prompt or expose it on the command line.
+
 - `missing_count` on projects and `POST /api/projects/{id}/prune-missing`; project settings show the
   number of missing images and let managers remove them.
 - WebSocket event `lock.expired`; the editor re-acquires an expired lock or becomes read-only.
