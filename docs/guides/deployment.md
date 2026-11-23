@@ -84,7 +84,8 @@ ssh -N -L 8765:127.0.0.1:8765 you@your-server
 ```
 
 Open <http://localhost:8765>. On the first visit the *Create the administrator account* screen asks for a user
-name and a password; after that you sign in normally.
+name and a password; after that you sign in normally. The tunnel arrives on the server as a local
+connection, so no setup token is asked for.
 
 If port 8765 is taken on your computer, forward another one (`-L 9000:127.0.0.1:8765`) and open
 `http://localhost:9000`.
@@ -150,7 +151,21 @@ docker compose up -d
 docker compose logs -f annotamate
 ```
 
-Open `http://<server>:8765` and create the administrator account.
+Open <http://localhost:8765> and create the administrator account. The Compose file publishes the port
+on `127.0.0.1` only (`"127.0.0.1:8765:8765"`). To reach the app from other machines, switch to the
+commented `"8765:8765"` line, which exposes plain HTTP: do it on a trusted network only, or put a
+[reverse proxy](#7-https-with-a-reverse-proxy) in front.
+
+**The setup token.** Docker's port mapping makes every request look like it comes from a remote
+address, so the first-run screen asks for a one-time *setup token*. The server prints it, in a framed
+block, when it starts without any account:
+
+```bash
+docker compose logs annotamate
+```
+
+Copy the `FIRST-RUN SETUP TOKEN` value into the token field. It only works until the first account
+exists and is generated again at every start while there is none.
 
 What to adapt:
 
@@ -241,8 +256,9 @@ Two more things to know about the sandbox:
 
 **5. Create the first administrator**
 
-Either open the web interface and fill in the *Create the administrator account* screen, or do it on the
-command line. The command must run as the service user with the same settings, so that it uses the
+Either open the web interface and fill in the *Create the administrator account* screen (from another
+machine it asks for the one-time setup token that the service prints in its log: `journalctl -u annotamate`),
+or do it on the command line. The command must run as the service user with the same settings, so that it uses the
 same database:
 
 ```bash
@@ -271,14 +287,20 @@ What the proxy must do:
   host of the request. If the proxy rewrites `Host`, the page loads but live updates never connect.
 - **Forward the path unchanged.** No rewriting and no prefix stripping, also when hosting under a
   [sub-path](#8-hosting-under-a-sub-path).
-- **Allow large request bodies** for image uploads. Annotamate limits each file to
-  `ANNOTAMATE_MAX_UPLOAD_MB` (50 by default); one upload request can carry several files.
+- **Allow large request bodies only for image uploads** (`/api/projects/<id>/upload`). Annotamate
+  limits each file to `ANNOTAMATE_MAX_UPLOAD_MB` (50 by default) and a whole upload request to
+  `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024 by default); every other request body to
+  `ANNOTAMATE_MAX_BODY_MB` (2 by default). The example configurations in `deploy/` use a 2 MB default
+  and a 1 GB limit on the upload path only.
 - **Use generous timeouts** for exports of large datasets.
 - **Send `X-Forwarded-For`**, and tell Annotamate to trust it (next section).
 
 ### Client addresses and the sign-in limit
 
-Annotamate limits failed sign-ins to 10 per address and user name in 10 minutes. Behind a proxy
+Annotamate limits failed sign-ins to 10 per address and user name in 10 minutes and, so that one
+address cannot try many user names, to 30 per public address in total (`ANNOTAMATE_LOGIN_IP_LIMIT`;
+`0` turns it off). Loopback and private addresses only get the first limit, because many users can share
+one of them. Behind a proxy
 the address of the TCP connection is the proxy's, so the limit only sees real client addresses if
 the server trusts the `X-Forwarded-For` header sent by the proxy. The server runs uvicorn with proxy
 headers enabled and trusts them only from the addresses in the `FORWARDED_ALLOW_IPS` environment
@@ -292,7 +314,12 @@ variable (a comma-separated list; default `127.0.0.1`).
 
 Without it every visitor appears to come from the proxy, and failed sign-ins of one person count
 against everyone who uses the same user name. Never use `*` when clients can reach the application
-directly, because they could then forge the header.
+directly, because they could then forge the header. The proxy must also replace, not extend, a header
+sent by the client: the nginx example sets `X-Forwarded-For $remote_addr`, and Caddy ignores incoming
+values by default.
+
+While no account exists, a request that carries proxy headers (`X-Forwarded-For`, `Forwarded`,
+`X-Real-IP`, `Via`) always needs the setup token, even when the proxy runs on the same machine.
 
 ### Caddy
 
@@ -439,6 +466,10 @@ Flags override environment variables.
 | Secure cookies | `--secure-cookies` | `ANNOTAMATE_SECURE_COOKIES` | `false` |
 | Session lifetime (days) | | `ANNOTAMATE_SESSION_DAYS` | `14` |
 | Maximum upload size (MB per file) | | `ANNOTAMATE_MAX_UPLOAD_MB` | `50` |
+| Maximum whole upload request (MB) | | `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` | `1024` |
+| Maximum request body, other routes (MB) | | `ANNOTAMATE_MAX_BODY_MB` | `2` |
+| Largest image accepted (megapixels) | | `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` | `150` |
+| Failed sign-ins per public address in 10 minutes (0 = no limit) | | `ANNOTAMATE_LOGIN_IP_LIMIT` | `30` |
 | Open the browser | `--open` / `--no-open` | | off for `serve`, on for bare `annotamate` |
 | Log level | `--log-level` | `ANNOTAMATE_LOG_LEVEL` | `info` |
 
@@ -640,8 +671,10 @@ WebSocket request in the network tab.
 [section 8](#8-hosting-under-a-sub-path).
 
 **`413` when uploading images.**
-Either a file is larger than `ANNOTAMATE_MAX_UPLOAD_MB`, or the proxy's body limit is too small
-(`client_max_body_size` in nginx, `request_body max_size` in Caddy).
+Either a file is larger than `ANNOTAMATE_MAX_UPLOAD_MB`, the request is larger than
+`ANNOTAMATE_MAX_UPLOAD_REQUEST_MB`, or the proxy's body limit is too small
+(`client_max_body_size` in nginx, `request_body max_size` in Caddy). The proxy examples allow large
+bodies on the upload path only; any other request over 2 MB is refused with `413 too_large`.
 
 **Too many sign-in attempts (`429`).**
 After 10 failed attempts for the same user name from the same address, sign-in is blocked for up to

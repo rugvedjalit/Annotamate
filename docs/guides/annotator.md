@@ -282,8 +282,9 @@ Only one person edits an image at a time.
 - If someone else holds the lock, a banner says so, for example "Alice is editing this image. You
   can view and comment." You see their saved changes as they arrive, and the lock passes on when
   they leave the image.
-- The lock is released when you move to another image or close the tab. If your computer goes to
-  sleep or loses its connection, the lock expires after about a minute.
+- You hold one lock at a time: it is released when you move to another image or close the tab. If your
+  computer goes to sleep or loses its connection, the lock expires after about a minute; when you come
+  back the editor asks for it again and, if somebody else got it meanwhile, becomes read-only.
 - Managers and administrators can **take over** a lock with the *Take over* button in the banner.
   If that happens to you, the editor becomes read-only and a message tells you who took over.
   Changes you had not saved yet stay in your browser; *Copy my boxes* in the banner copies them.
@@ -303,7 +304,12 @@ An image opens read-only, with an explanation, when:
 - someone else holds the edit lock;
 - you are on a small screen or a touch device (narrower than 1024 px, or without a mouse), which is
   view-only;
-- the image itself cannot be decoded;
+- the image itself cannot be decoded, or is larger than the server's pixel limit (150 megapixels by
+  default);
+- another image of the folder has the same name apart from the extension (`a.jpg` and `a.png`) and
+  therefore owns the shared label file: the banner names that image, and an administrator has to rename
+  one of them. In YOLO projects an image called `classes` is read-only too, because `classes.txt` is the
+  class list;
 - the label file contains data Annotamate does not edit, such as segmentation polygons or oriented
   boxes in a YOLO file, or cannot be parsed. The file is protected so that saving can never destroy
   information.

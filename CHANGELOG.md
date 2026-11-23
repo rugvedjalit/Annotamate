@@ -7,6 +7,62 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- First-run setup needs a one-time setup token (printed in the server log and the `annotamate serve`
+  console) unless the request comes from the machine itself without proxy headers. Concurrent setups can no longer create
+  two administrators. `docker-compose.yml` now publishes the port on `127.0.0.1` by default.
+- `GET /api/users` returns only `id`, `username`, `display_name`, `avatar_color` and `online` to
+  non-administrators (no email addresses or admin flags). Administrators keep the full record.
+- Request bodies are limited (413 `too_large`): 2 MB for ordinary routes (`ANNOTAMATE_MAX_BODY_MB`),
+  64 KB for user settings, and `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for uploads. The nginx and
+  Caddy examples allow large bodies on the upload path only. `python-multipart` is now required at
+  `>=0.0.34`.
+- Images above `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` (150) are refused when probed, uploaded or decoded;
+  concurrent requests for the same thumbnail decode it once, and at most three full decodes run at
+  the same time.
+- Sign-in attempts are also limited per public address (30 failures in 10 minutes,
+  `ANNOTAMATE_LOGIN_IP_LIMIT`; loopback and private addresses are exempt so a shared proxy address cannot
+  lock everyone out), and password hashing
+  runs at most four at a time.
+- One edit lock per WebSocket connection, so a script cannot lock a whole project. The session is
+  re-validated on every WebSocket `ping` (closed with 4401 when expired).
+- `base_url` is validated at start-up and escaped where it is written into the page; the CSP
+  `connect-src` is `'self'`; `classes.txt` is read and written with the same root confinement as
+  label files; id lists in requests are bounded; restricted annotators can no longer flag images
+  assigned to someone else; exports read label files under the project's label lock.
+
+### Fixed
+
+- Class delete/merge rewrites are all-or-nothing: every target is checked writable first (including
+  the Windows read-only attribute), originals are backed up, already replaced files are restored if
+  a later one fails, temporary files are always removed, and a journal in the data folder lets the
+  server roll back an interrupted rewrite at the next start. If restoring fails too the API answers
+  `500 migration_incomplete` with the affected files.
+- Images that share a file stem (`a.jpg` and `a.png`; case is ignored on Windows and macOS) no longer overwrite
+  each other's labels: the first owns the label file, the others are read-only with an explanation,
+  uploads of colliding names are skipped, and in YOLO projects the name `classes` is reserved.
+- A VOC/COCO class rename interrupted by a restart is resumed at start-up, and one that could not rewrite
+  every file is retried; while it is pending, old
+  names read as the renamed class and saves write the new name.
+- VOC and COCO saves keep the fields the tool does not model (`pose`, `occluded`, custom elements,
+  `source`, COCO `attributes`, `iscrowd`, `score`, ids, `info`, `licenses`). VOC `<path>` is the
+  image name instead of the server's absolute path.
+- A rescan no longer changes the status of images already in the project, and no longer deletes the
+  history (comments, revisions, status) of files that are temporarily missing: they are hidden and
+  come back with the file.
+
+### Added
+
+- `missing_count` on projects and `POST /api/projects/{id}/prune-missing`; project settings show the
+  number of missing images and let managers remove them.
+- WebSocket event `lock.expired`; the editor re-acquires an expired lock or becomes read-only.
+- `setup_token_required` in `GET /api/auth/state`; the setup page asks for the token when needed.
+- Settings `ANNOTAMATE_MAX_BODY_MB`, `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB`,
+  `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`, `ANNOTAMATE_LOGIN_IP_LIMIT`.
+- Returning to an image whose save finished after leaving it no longer stalls autosave or reports a
+  conflict with the user's own save.
+
 ## [2.0.0] - Unreleased
 
 Annotamate 2 is a rewrite. The single-user desktop program becomes a self-hosted, multi-user web

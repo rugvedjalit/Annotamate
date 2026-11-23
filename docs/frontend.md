@@ -41,7 +41,7 @@ web/src/
   features/
     auth/                     LoginPage, SetupPage
     projects/                 ProjectsPage, NewProjectDialog (+ FolderBrowser), ProjectPage (overview dashboard),
-                              ProjectSettingsPage (General, Classes, Members, Workflow, Danger zone), ImagesTable (bulk assign)
+                              ProjectSettingsPage (General, Classes, Members, Workflow, Danger zone; the latter offers removing `missing_count` images), ImagesTable (bulk assign)
     annotator/                AnnotatorPage, FilesPanel, ToolRail, Inspector (Classes, Objects, Properties, Comments, History),
                               ClassPicker, FloatingBoxToolbar, ZoomControl, StatusBar, ReviewBar, useAnnotationDoc,
                               useImageLock, useAnnotatorKeys
@@ -58,7 +58,7 @@ web/src/
 
 | Path | Page | Notes |
 | --- | --- | --- |
-| `/setup` | SetupPage | only when `setup_required` |
+| `/setup` | SetupPage | only when `setup_required`; asks for the setup token when `setup_token_required` |
 | `/login` | LoginPage | `?next=` redirect |
 | `/` | ProjectsPage | cards: progress bar by status, my assigned count, unread chat, members, format badge; admin "New project" |
 | `/p/:projectId` | ProjectPage | overview: stats, per-member progress, class histogram, activity feed, members with presence, "Continue annotating" |
@@ -150,6 +150,13 @@ Class palette (20 colours, used when a class is created without a colour):
    the lock is no longer re-requested on reconnect (it is requested again when the new holder leaves). Revoked by the
    same user (another tab) → "You are editing this image in another tab" with *Edit here*. Release on image
    change/unmount. A `presence.snapshot` resets the known locks (the server follows it with `lock.state` frames).
+   The server allows one lock per connection, so opening another image releases the previous one. `lock.expired`
+   (swept for inactivity) and a `lock.state` with `holder: null` for an image the client believes it holds both
+   trigger a re-acquire; if someone else got it meanwhile the editor drops to read-only (rules in `lockLogic.ts`).
+   A label file shared with another image (same stem) or an unreadable/over-budget image is read-only, with the
+   server's `readonly_reason` / `error` shown in the banner; a `409 readonly` on save keeps the editor read-only
+   and stops autosave retries. A save that finishes after the workspace unmounted updates the per-image history
+   cache, so returning to the image starts from the saved version.
 5. **Keyboard.** One keymap service; ignores events whose target is an input, textarea, select or contenteditable
    (except Escape). Scopes: global, annotator, class picker, dialogs (Radix handles dialog focus). Browser-reserved
    combos (Mod+W/T/N/Tab, Mod+Shift+T, F5 without modifier is allowed to reload) cannot be bound.

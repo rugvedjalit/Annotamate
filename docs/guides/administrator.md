@@ -28,7 +28,15 @@ the [annotator guide](annotator.md).
 A new server has no accounts. The first person to open it in a browser sees the **Create the
 administrator account** screen and enters a name, a user name and a password (twice). This screen
 exists only while there are no users at all; once the first account is created the server refuses
-any further setup request.
+any further setup request. Two requests that arrive at the same moment cannot both create an
+administrator.
+
+When the server starts without any account it generates a one-time **setup token** and prints it in its
+console and log (`annotamate serve` prints it below the address; with Docker use
+`docker compose logs annotamate`, with systemd `journalctl -u annotamate`). Opening the page on the
+server machine itself (or through an SSH tunnel) needs no token; from any other machine, and through any
+reverse proxy or tunnel service that adds forwarding headers, the screen shows a *Setup token* field and the account is only created when the token matches. This stops a stranger who
+finds a freshly started server from becoming its administrator.
 
 Because the first visitor becomes the administrator, create the account immediately after starting
 a server that other people can reach. You can also create it before anyone opens the site:
@@ -250,7 +258,7 @@ projects, where it is the number written into the label files and the line in `c
 | --- | --- | --- |
 | Add a class | managers and reviewers; annotators if allowed | Appended at the end; `classes.txt` is updated. No label file changes. |
 | Recolour | managers | Nothing on disk. Colours are stored in the database only. |
-| Rename | managers | `classes.txt` is updated. YOLO: no label file changes, because label files contain numbers. VOC and COCO: every label file that uses the class is rewritten with the new name, as a background job (refused while the project is being indexed). |
+| Rename | managers | `classes.txt` is updated. YOLO: no label file changes, because label files contain numbers. VOC and COCO: every label file that uses the class is rewritten with the new name, as a background job (refused while the project is being indexed). The rename is recorded until every file is done, so a restart resumes it; meanwhile files that still carry the old name are read as the renamed class and saves write the new name. |
 | Delete or merge | managers | Affected label files and `classes.txt` are rewritten before the request returns. See below. |
 
 Colours are assigned from a 20-colour palette when a class is created and can be changed at any time.
@@ -276,8 +284,15 @@ What is rewritten:
 - **Pascal VOC and COCO.** Boxes of the deleted class get the target's name, or are removed. COCO
   category ids are renumbered to follow the class order. `classes.txt` is rewritten as well.
 
-The new file contents are prepared first and then replaced together; if one file cannot be
-written, nothing is changed. The dialog shows how many boxes and images use the class before you
+The new file contents are prepared first and then replaced together. Before anything is touched the
+server checks that every file (and its folder) is writable, including the Windows read-only
+attribute, and it keeps a backup of each original next to it. If one file cannot be replaced, the
+files that were already replaced are restored and nothing is changed; the temporary and backup files
+are removed. A journal in the data folder makes the same rollback happen at the next start if the
+server crashes in the middle; it restores only files that still hold the content of the interrupted rewrite,
+so later saves are never overwritten. In the very unlikely case that restoring fails too, the server answers
+`migration_incomplete` with the list of affected files and leaves the hidden `.bak` backups next to
+them so you can restore them by hand. The dialog shows how many boxes and images use the class before you
 confirm, and afterwards how many label files were rewritten. The delete is refused while the project
 is being indexed. Saves in the project wait while it runs, and everyone who has the project open
 sees the new class list immediately.
@@ -399,13 +414,16 @@ project's image folder on the server and appear in the project at once.
 
 - Accepted types: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`, `.tif`, `.tiff`, and the contents must
   be a valid image. Other files, including GIF, are skipped.
-- Each file may be up to 50 MB by default. The limit is the server setting
-  `ANNOTAMATE_MAX_UPLOAD_MB`; a reverse proxy in front may impose its own limit
-  ([deployment guide](deployment.md#7-https-with-a-reverse-proxy)).
+- Each file may be up to 50 MB by default (`ANNOTAMATE_MAX_UPLOAD_MB`) and one upload request up to
+  1024 MB in total (`ANNOTAMATE_MAX_UPLOAD_REQUEST_MB`); a reverse proxy in front may impose its own
+  limit ([deployment guide](deployment.md#7-https-with-a-reverse-proxy)).
 - The browser sends the files in batches of 20.
 - File names are cleaned of unsafe characters; names starting with a dot are refused.
 - **Existing files are never overwritten.** If a name is taken, the new file gets a suffix
   (`-1`, `-2`, …).
+- A file whose name differs from an existing image only by its extension (`a.png` next to `a.jpg`)
+  is skipped, because both would share one label file; so is `classes.*` in a YOLO project.
+- Images with more than 150 megapixels (`ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`) are skipped.
 - New images start as **To do**, or as **Done** if a label file of the same name already exists.
 - When the upload ends, a message gives the number of images added and lists the first skipped
   files with the reason.
@@ -423,13 +441,26 @@ page; people can keep working meanwhile.
 A rescan:
 
 - adds new images (**Done** if they have a label file, otherwise **To do**);
-- marks images that are still **To do** as **Done** when a label file has appeared for them;
-- refreshes box counts and per-class counts from the label files; other statuses and assignments
-  are left alone;
-- removes images that are no longer in the folder from the project, together with their status,
-  comments and revision history. If the folder looks completely empty (for example an unmounted
-  share), nothing is removed, and nothing under a sub-folder that cannot be read is removed either;
+- never changes the status or assignment of an image that is already in the project, even when a
+  label file has appeared for it; box counts and per-class counts are refreshed from the label files;
+- marks images that are no longer in the folder as **missing**. They disappear from the images list,
+  counts, statistics, exports and bulk actions, but their status, comments and revision history are
+  kept: if the file comes back (a remounted share, a restored backup) a rescan makes the image
+  reappear exactly as it was. If the folder looks completely empty (for example an unmounted
+  share), nothing is marked, and nothing under a sub-folder that cannot be read is marked either;
 - does not add classes. Add them under **Settings → Classes**.
+
+**Removing missing images for good.** When a project has missing images, **Settings → Danger zone**
+shows how many and offers **Remove missing images**. After you confirm, those images are deleted from
+the project together with their status, comments and revision history. This cannot be undone;
+it does not touch any file on disk.
+
+**Images that share a label file.** Label files are named after the image, so `a.jpg` and `a.png`
+in the same folder would both use `a.txt` (the comparison ignores upper and lower case). The first
+image in natural order owns the label file; the others are read-only, and the annotator shows which
+image owns it. Rename one of the images to give each its own labels. In YOLO projects an image named
+`classes` (`classes.jpg`) is read-only, because `classes.txt` is the class list. Uploads of such
+files are skipped with the reason.
 
 The server also re-indexes the project when **Include sub-folders** is switched on or off.
 

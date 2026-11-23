@@ -28,12 +28,13 @@ interface ApiError {
 | 404 | `not_found` | Unknown id or not a member of the project (also unknown `/api/...` paths) | |
 | 409 | `conflict` | Annotation `base_version` ≠ current version | `current: AnnotationDoc` |
 | 409 | `in_use` | Deleting a class (`strategy=forbid`) that labels still use | `images: number` (images using it) |
-| 409 | `readonly`, `exists`, `setup_done` | Read-only label file; duplicate; setup already done | |
-| 413 | `too_large` | Upload too big | |
+| 409 | `readonly`, `exists`, `setup_done` | Read-only label file (also: the image shares its label file with an earlier image, or is the reserved YOLO name `classes`); duplicate; setup already done | |
+| 413 | `too_large` | Request body over its limit: 2 MB for ordinary routes (`ANNOTAMATE_MAX_BODY_MB`), 64 KB for `PUT /api/me/settings`, `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for the upload route, `ANNOTAMATE_MAX_UPLOAD_MB` (50) per uploaded file. Checked against `Content-Length` and again while the body streams in | |
 | 422 | `validation_error` | Body/query validation failed | `errors: {loc: string[], msg: string}[]` |
 | 423 | `locked` | Another user holds the image's edit lock | `holder: UserBrief` |
-| 429 | `rate_limited` | Too many login attempts | |
+| 429 | `rate_limited` | Too many failed sign-ins: 10 per address and user name, and 30 per public address in total (`ANNOTAMATE_LOGIN_IP_LIMIT`), in 10 minutes | `retry_after: number` (seconds, also in `Retry-After`) |
 | 500 | `write_failed` | The label file could not be written (disk full, permissions); nothing was changed | |
+| 500 | `migration_incomplete` | A class delete/merge failed half-way and restoring the original label files failed too | `files: string[]` (paths whose content may be wrong; their `.bak` backups are kept next to them) |
 | 500 | `internal_error` | Unexpected server error | |
 
 Pagination:
@@ -99,7 +100,8 @@ interface ProjectSummary {
   name: string
   description: string
   label_format: LabelFormat
-  image_count: number
+  image_count: number          // images present on disk (missing ones are not counted)
+  missing_count: number        // images whose file disappeared (kept hidden, see POST .../prune-missing)
   status_counts: StatusCounts
   member_count: number
   my_role: Role | null        // null for admins who are not members (they act as manager)
@@ -167,7 +169,8 @@ interface Box {
 interface AnnotationDoc {
   version: string | null      // null when no label file exists
   boxes: Box[]
-  readonly_reason: string | null
+  readonly_reason: string | null  // also set when the image shares its label file with an earlier image
+                                  // ("... shares its label file with a.jpg ...") or is a YOLO image named `classes`
   updated_at: string | null
   updated_by: UserBrief | null
 }
@@ -282,15 +285,15 @@ Clients must tolerate missing keys (older entries) and ignore unknown ones.
 
 | Method & path | Auth | Body / query | Response |
 | --- | --- | --- | --- |
-| `GET /api/auth/state` | none | | `{setup_required: boolean, user: User \| null}` |
-| `POST /api/auth/setup` | none, only when 0 users | `{username, display_name, password}` | `User` + cookie. Else `409 setup_done` |
+| `GET /api/auth/state` | none | | `{setup_required: boolean, setup_token_required: boolean, user: User \| null}`. `setup_token_required` is true while setup is open, unless the request comes straight from the server machine (a loopback address and no proxy headers such as `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `Via`). |
+| `POST /api/auth/setup` | none, only when 0 users | `{username, display_name, password, setup_token?}` | `User` + cookie. Else `409 setup_done`. Requests that do not come straight from the server machine (see above) need the one-time `setup_token` the server prints in its log and console at start-up (missing/wrong → `422` on `body.setup_token`). Setup is atomic: of several concurrent requests exactly one succeeds, the others get `409 setup_done`. |
 | `POST /api/auth/login` | none | `{username, password}` | `User` + cookie. Bad creds → `401 {code:"invalid_credentials"}` |
 | `POST /api/auth/logout` | user | | `204` (cookie cleared) |
 | `GET /api/me` | user | | `User` |
 | `PATCH /api/me` | user | `{display_name?, email?, avatar_color?}` | `User` |
 | `POST /api/me/password` | user | `{current_password, new_password}` | `204`; wrong current → `400`. Other sessions are revoked. |
 | `GET /api/me/settings` | user | | `object` (free-form JSON owned by the frontend, `{}` by default) |
-| `PUT /api/me/settings` | user | `object` (≤ 64 KB) | the stored object |
+| `PUT /api/me/settings` | user | `object` (≤ 64 KB; larger bodies are refused with `413` before they are parsed) | the stored object |
 
 Username rules: 3–32 chars, `[a-z0-9_.-]`, stored lowercase, unique. Password ≥ 8 chars.
 
@@ -298,7 +301,7 @@ Username rules: 3–32 chars, `[a-z0-9_.-]`, stored lowercase, unique. Password 
 
 | Method & path | Auth | Body / query | Response |
 | --- | --- | --- | --- |
-| `GET /api/users` | user | `?include_inactive=true` (admin only) | `(User & {online: boolean})[]` sorted by display_name |
+| `GET /api/users` | user | `?include_inactive=true` (admin only) | Admins: `(User & {online: boolean})[]`. Everyone else: `(UserBrief & {online: boolean})[]` only (no email, admin flag, activity or timestamps). Sorted by display_name |
 | `POST /api/users` | admin | `{username, display_name, password, email?, is_admin?}` | `User` (`409 exists`) |
 | `PATCH /api/users/{id}` | admin | `{display_name?, email?, is_admin?, is_active?}` | `User`. Cannot deactivate or demote yourself → `400` |
 | `POST /api/users/{id}/password` | admin | `{new_password}` | `204`, revokes that user's sessions |
@@ -319,7 +322,8 @@ Username rules: 3–32 chars, `[a-z0-9_.-]`, stored lowercase, unique. Password 
 | `GET /api/projects/{pid}` | member | | `Project` |
 | `PATCH /api/projects/{pid}` | manager | `{name?, description?, label_dir?, settings?: Partial<ProjectSettings>, archived?}` | `Project` |
 | `DELETE /api/projects/{pid}` | admin | | `204` (DB rows only; files on disk untouched) |
-| `POST /api/projects/{pid}/rescan` | manager | | `202 {started: true}`; progress over WS (`project.indexing`) |
+| `POST /api/projects/{pid}/rescan` | manager | | `202 {started: true}`; progress over WS (`project.indexing`). Adds new images (a new image with a label file starts as `done`); never changes the status of existing images; images whose file is gone get `missing` (hidden from lists, neighbours, counts, stats, exports, bulk actions and filters; comments, revisions and status are kept) and are restored when the file returns |
+| `POST /api/projects/{pid}/prune-missing` | manager | | `{removed: number}`: permanently deletes the missing images (with their comments and revisions) |
 | `GET /api/projects/{pid}/stats` | member | `?tz_offset=` (viewer's UTC offset in minutes, east positive, −840…840; default 0): `daily` covers the last 30 days of the viewer's calendar | `{status_counts: StatusCounts, images_total, boxes_total, class_counts: {class_id: number, boxes: number, images: number}[], per_user: {user: UserBrief, saves: number, boxes: number, submitted: number, approved: number, rejected: number, reviewed: number}[], daily: {date: "YYYY-MM-DD", saves: number, done: number}[] /* last 30 days */}` |
 | `POST /api/projects/{pid}/upload` | manager | multipart `files[]` (the field name `files` is accepted too; ≤ 1000 files per request), optional `subdir` (relative folder; only for projects with `settings.recursive`, else `400`) | `{added: ImageItem[], skipped: {filename, reason}[]}` |
 | `GET /api/projects/{pid}/export` | manager | `?format=yolo\|voc\|coco&scope=all\|done&include_images=false` | `application/zip` download. YOLO: `labels/*.txt`, `classes.txt`, `data.yaml`. VOC: `Annotations/*.xml`. COCO: single `annotations.json` (dataset-level, ids 1-based). With images: `images/...` |
@@ -354,7 +358,7 @@ Common filter query (images list, neighbours, bulk `filter`):
 | Method & path | Auth | Body / query | Response |
 | --- | --- | --- | --- |
 | `GET /api/projects/{pid}/images` | member | filters + `offset` (0) + `limit` (100, max 500) | `{total: number, offset: number, items: ImageItem[]}` |
-| `GET /api/projects/{pid}/images/{iid}` | member | | `ImageDetail` |
+| `GET /api/projects/{pid}/images/{iid}` | member | | `ImageDetail`. `404` for a missing image. `error` is set when the image cannot be read, including when it exceeds the pixel budget (`ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`, default 150) |
 | `GET /api/projects/{pid}/images/{iid}/neighbors` | member | filters | `{prev_id: number \| null, next_id: number \| null, index: number /* 0-based within filter, -1 if excluded */, total: number}` |
 | `GET /api/projects/{pid}/images/{iid}/file` | member | `?v=` ignored | image bytes, browser-safe (JPEG/PNG/WebP/GIF/BMP as-is unless re-encoding needed); `Cache-Control: private, max-age=31536000, immutable` when `v` present |
 | `GET /api/projects/{pid}/images/{iid}/thumb` | member | `?size=256` (64–512) | WebP thumbnail (cached on disk) |
@@ -367,7 +371,7 @@ Common filter query (images list, neighbours, bulk `filter`):
 | Method & path | Auth | Body | Response |
 | --- | --- | --- | --- |
 | `GET /api/projects/{pid}/images/{iid}/annotation` | member | | `AnnotationDoc` |
-| `PUT /api/projects/{pid}/images/{iid}/annotation` | `can_edit` (+ assignment rule) | `{base_version: string \| null, boxes: Box[], force?: boolean}` | `{version: string, updated_at, box_count, image: ImageItem, boxes: Box[]}` where `boxes` are the boxes as stored (clamped, rounded to the file format, tiny ones dropped, ids kept): exactly what a following `GET` returns. `409 conflict` + `current: AnnotationDoc` if `base_version` ≠ current version and not `force` (`force` allowed for reviewer+ or the lock holder). `409 readonly`. `423 locked` + `holder`. Box coordinates are clamped/normalised server-side; boxes smaller than 1px are dropped; unknown `class_id` → `422`. An empty `boxes` list writes an empty label file (a "background" image). |
+| `PUT /api/projects/{pid}/images/{iid}/annotation` | `can_edit` (+ assignment rule) | `{base_version: string \| null, boxes: Box[], force?: boolean}` | `{version: string, updated_at, box_count, image: ImageItem, boxes: Box[]}` where `boxes` are the boxes as stored (clamped, rounded to the file format, tiny ones dropped, ids kept): exactly what a following `GET` returns. `409 conflict` + `current: AnnotationDoc` if `base_version` ≠ current version and not `force` (`force` allowed for reviewer+ or the lock holder). `409 readonly` (broken/polygon label file, unreadable image, an image that shares its label file with an earlier image of the folder, or the YOLO name `classes`). `423 locked` + `holder`. VOC and COCO saves patch the existing file: boxes that came from it keep fields this tool does not model (VOC `pose`, `occluded`, custom elements, `source`; COCO `attributes`, `iscrowd`, `score`, ids, `info`, `licenses`); new boxes are written in the standard shape. Box coordinates are clamped/normalised server-side; boxes smaller than 1px are dropped; unknown `class_id` → `422`. An empty `boxes` list writes an empty label file (a "background" image). |
 | `GET /api/projects/{pid}/images/{iid}/revisions` | member | | `{id, user: UserBrief \| null, created_at, box_count, version}[]` newest first (max 50) |
 | `GET /api/projects/{pid}/images/{iid}/revisions/{rid}` | member | | `{id, user, created_at, boxes: Box[]}` |
 | `POST /api/projects/{pid}/images/{iid}/revisions/{rid}/restore` | `can_edit` | `{base_version}` | same as PUT |
@@ -440,7 +444,8 @@ Connection lifecycle and close codes:
 { type: 'lock.acquire', image_id: number, force?: boolean }   // force: manager/admin take-over
 { type: 'lock.release', image_id: number }
 { type: 'typing', scope: 'chat' } | { type: 'typing', scope: 'dm', user_id: number }
-{ type: 'ping' }                                    // every 20 s; renews this connection's locks
+{ type: 'ping' }                                    // every 20 s; renews this connection's locks and re-validates the
+                                                    // session (expired -> `error unauthenticated`, close 4401)
 ```
 
 ### Server → client
@@ -458,6 +463,8 @@ Connection lifecycle and close codes:
 { type: 'lock.granted', image_id: number }
 { type: 'lock.denied', image_id: number, holder: UserBrief }
 { type: 'lock.revoked', image_id: number, by: UserBrief }          // someone (or the same user in another tab) took over
+{ type: 'lock.expired', image_id: number }                         // to the holder only: the server's sweep expired the lock
+                                                                   // (no ping for 60 s); re-acquire it or drop to read-only
 { type: 'lock.state', project_id: number, image_id: number, holder: UserBrief | null }  // broadcast to the room
 
 { type: 'image.updated', project_id: number, image: ImageItem, version?: string, by?: UserBrief }  // saves, status, assign, flag
@@ -486,6 +493,8 @@ Ordering and semantics:
 * `subscribe` is answered with `presence.snapshot`, immediately followed by one `lock.state` frame per edit lock
   currently held in the project. A snapshot therefore starts a fresh view: clients drop the locks they knew
   (they may have been released while the client was disconnected) and rebuild them from those frames.
+* **One edit lock per connection.** Acquiring a lock releases any other lock the same connection holds
+  (the room gets `lock.state` with `holder: null` for the released image).
 * Locks belong to a connection. A second tab of the **same user** that asks for a lock it already holds elsewhere
   takes it over without `force`; the old tab gets `lock.revoked` with `by` = that same user (and should stop
   re-requesting it until the new holder lets go). A manager/admin `force` take-over works the same way for

@@ -75,6 +75,9 @@ docs/                             architecture, API, guides
 | Secure cookies | `--secure-cookies` | `ANNOTAMATE_SECURE_COOKIES` | `false` (set `true` behind HTTPS) |
 | Session lifetime (days) | | `ANNOTAMATE_SESSION_DAYS` | `14` |
 | Max upload size (MB) | | `ANNOTAMATE_MAX_UPLOAD_MB` | `50` per file |
+| Max whole upload request (MB) | | `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` | `1024` |
+| Max request body, other routes (MB) | | `ANNOTAMATE_MAX_BODY_MB` | `2` |
+| Max image size (megapixels) | | `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` | `150` |
 | Open browser | `--open/--no-open` | | `--open` only for bare `annotamate` |
 | Log level | `--log-level` | `ANNOTAMATE_LOG_LEVEL` | `info` |
 
@@ -95,6 +98,11 @@ annotamate version
 
 * **First run.** If the DB has no users, the web UI shows a *Create administrator* screen
   (`POST /api/auth/setup`, only allowed while there are zero users). `annotamate user create --admin` also works.
+  While there are no users the server generates a one-time **setup token** at start-up, logs it prominently and
+  prints it in the `annotamate serve` console. Setup requests made on the server machine itself (loopback peer
+  and no proxy/tunnel headers such as `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `Via`) need no token; any other
+  client must send it (`setup_token`; `GET /api/auth/state` reports `setup_token_required`). The check and the
+  creation of the administrator run under one lock, so concurrent setups yield exactly one administrator.
 * **Global role.** `is_admin` users manage accounts, create/delete projects and can open every project as a manager.
 * **Project roles** (`project_members.role`):
 
@@ -131,23 +139,59 @@ Statuses: `todo` → `in_progress` → (`review` →) `done`, with `rejected` go
 | `done`, `review` | `reopen` (annotator who owns it, reviewer+) | `in_progress` |
 
 Independently: `flagged` (bool, anyone who can edit) and `assignee_id` (nullable).
-On index, images that already have a label file start as `done`; others start as `todo`.
+When an image row is first created (index, rescan, upload), an existing label file makes it start as `done`;
+otherwise `todo`. A rescan never changes the status of an existing row.
+
+**Missing images.** A rescan does not delete rows of files that are gone: it sets `images.missing`. Missing images
+are excluded from lists, neighbours, counts, statistics, exports, bulk actions, filters and project summaries
+(`missing_count` reports them), keep their comments, revisions and status, and are restored when the file
+reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-missing`).
 
 ## 7. Annotations on disk
 
 * Label path: `<label_dir or image's own folder>/<image stem>.<txt|xml|json>`; `classes.txt` lives in the label dir
-  (or the image dir when no label dir). Nested images (recursive projects) mirror their sub-folder under the label dir.
+  (or the image dir when no label dir) and is read and written through the same root-confinement check as label
+  files. Nested images (recursive projects) mirror their sub-folder under the label dir.
+* **Shared stems.** Images whose path without extension is equal map to the same label file (`a.jpg` and
+  `a.png`; on Windows and macOS, whose file systems ignore case, also `A.JPG`). `images.label_key` (the path
+  without extension, casefolded only on those platforms; indexed with the project id, recomputed by a rescan) groups
+  them: the first image in natural order owns the file; every later one is read-only, with a `readonly_reason`
+  naming the owner (`409 readonly` on save/restore). Uploads of a colliding file are skipped. In YOLO projects the
+  stem `classes` is reserved for `classes.txt`: such an image is read-only and its upload is skipped.
 * Formats: YOLO (`class cx cy w h`, normalised, 6 decimals), Pascal VOC (XML, integer pixel coords, real depth),
   COCO (one JSON per image, compatible with the desktop app; categories 1-based). Dataset-level export is separate.
 * **Class identity.** In the API boxes reference `ProjectClass.id` (stable). The class *index* (its position) is the
   YOLO id and the order of `classes.txt`. VOC/COCO use class *names*. Renaming a class in a VOC/COCO project, or
-  deleting/merging any class, rewrites affected label files (a background job).
+  deleting/merging any class, rewrites affected label files. A VOC/COCO rename is a background job whose work is
+  recorded in `pending_renames` (committed together with the new name): until every file has been rewritten, label
+  reads map the old name onto the renamed class (so saves always write the new name), creating or renaming another
+  class to the old name or deleting the class is refused with `409`, and the start-up hook resumes unfinished
+  renames. The record is cleared when the rewrite has finished without failures. A file that cannot be read or
+  written keeps the record and the job is retried with back-off (30 s, 2, 10 and then every 30 minutes) and at once
+  by a rescan.
 * **Unknown labels.** A box whose label does not match a project class is returned with `class_id: null` and
   `raw_label` (the name, or the YOLO index as a string). On save, such boxes are written back with their raw label,
   so nothing is lost. GET never modifies the class list.
 * **Read-only files.** YOLO lines with more than 5 values (segmentation/OBB) or unparsable files make the image
   read-only (`readonly_reason`), so saving can never destroy data the tool does not understand.
 * **Atomic writes.** Write to a temp file in the same folder, `fsync`, `os.replace`.
+* **Multi-file rewrites** (class delete/merge, `core.fsutil.atomic_write_many`) are all-or-nothing: pre-flight
+  writability check of every target (including the Windows read-only attribute), all new contents written and
+  `fsync`-ed as temp files, an `fsync`-ed backup copy of every original next to it, a journal in
+  `<data-dir>/journal/` (with the SHA-256 of each old and new content) written before the first replace and
+  removed after the last, rollback of already replaced files if one replace fails
+  (temp and backup files are always cleaned up). If the rollback itself fails the API answers
+  `500 migration_incomplete` with the affected files, keeping their backups and the journal. At start-up, before
+  serving, any leftover journal is rolled back: a target is restored only if it still holds exactly the content
+  that run wrote and its backup matches the recorded hash; a target never replaced keeps its content, and one
+  changed since (a later save) is left alone with its backup kept for inspection. Temporaries are deleted.
+  Class delete/merge refuses (`400`, nothing changed) when an existing label file cannot be read.
+* **Preserving unmodelled fields.** VOC and COCO saves patch the file's current document instead of rebuilding it.
+  Saved boxes are mapped to the original objects/annotations through the deterministic box ids the reader hands
+  out (position in the file), so each mapped element keeps its extra fields (VOC `pose`, `occluded`, custom
+  elements, `source`...; COCO `attributes`, `iscrowd`, `score`, annotation/category ids, `info`, `licenses`...).
+  Document-level extras are kept; new boxes use the standard shape. VOC `<path>` of a new file is the image's
+  file name, never a server path.
 * **Versions.** `version` = first 16 hex chars of SHA-256 of the label file bytes (`null` when no file).
   Saves send `base_version`; a mismatch returns `409 conflict` with the current content.
 * **Revisions.** Every save stores a revision row (boxes JSON, user, time); the last 50 per image are kept and can be restored.
@@ -190,13 +234,28 @@ On index, images that already have a label file start as `done`; others start as
 * CSRF: every non-GET/HEAD/OPTIONS request under `/api` must carry header `X-Annotamate-Client: web`
   (or any non-empty value). No CORS is configured, so browsers cannot send it cross-site.
 * WebSocket: cookie auth + `Origin` must match the request host.
-* Login rate limit: 10 failed attempts per (IP, username) per 10 minutes → `429`.
+* Login rate limit: 10 failed attempts per (IP, username) and, for public addresses only, 30 per IP in total
+  (`ANNOTAMATE_LOGIN_IP_LIMIT`, 0 = off) per 10 minutes → `429`. Loopback and private addresses are exempt from
+  the address-wide limit because a proxy without trusted forwarding headers, Docker's gateway or an office network
+  can make every user share one address. At most
+  four password hashes/verifications (argon2id) run at the same time.
+* Request size limits (ASGI middleware, `413 too_large`, checked against `Content-Length` and the streamed byte
+  count): 2 MB for ordinary routes (`ANNOTAMATE_MAX_BODY_MB`), 64 KB for `PUT /api/me/settings`,
+  `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for the upload route, plus `ANNOTAMATE_MAX_UPLOAD_MB` per file.
+* Images: a pixel budget (`ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`, default 150) is enforced when an image is probed,
+  uploaded or fully decoded (over-budget images report an `error` and are skipped by uploads); at most three full
+  decodes run at once and concurrent requests for the same thumbnail/re-encoded image decode it only once.
+* `base_url` is validated at start-up (`^/[A-Za-z0-9._~\-/]*$`, no `.`/`..` segments, normalised to a trailing
+  slash) and HTML-escaped where it is injected into the page.
+* Edit locks: one per WebSocket connection; the session is re-validated on every `ping` (close `4401` when expired).
 * Filesystem: project folders and every served/written file are resolved with `realpath` and must stay inside
   the roots / project folders. The client never sends paths except in the admin-only folder browser and project
   creation, both validated against the roots.
 * Uploads: manager-only, image extensions only, size-limited, filenames sanitised, never overwrite (suffix `-1`, `-2`…).
 * Security headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`,
-  `X-Frame-Options: DENY`, a strict `Content-Security-Policy` for the SPA (self only; `img-src 'self' blob: data:`).
+  `X-Frame-Options: DENY`, a strict `Content-Security-Policy` for the SPA (self only: `connect-src 'self'`, which
+  covers the same-origin WebSocket; `img-src 'self' blob: data:`).
+* `GET /api/users` returns the full `User` to administrators only; everyone else gets `UserBrief & {online}`.
 
 ## 11. Frontend summary
 

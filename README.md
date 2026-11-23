@@ -60,7 +60,9 @@ The interface design is shown in the [annotator mockup](docs/mockups/annotator.h
 ## Quick start
 
 Annotamate needs Python 3.10 or newer, or Docker. The first time you open it, the browser asks you
-to create the administrator account.
+to create the administrator account. When you open it on the same machine no further proof is
+needed; from any other machine the page asks for the one-time **setup token** that the server prints
+in its console and log (for Docker: `docker compose logs annotamate` or `docker logs annotamate`).
 
 ### pip, over an SSH tunnel
 
@@ -87,15 +89,17 @@ Nothing is exposed to the network; SSH provides the encryption.
 
 ```bash
 docker run -d --name annotamate --restart unless-stopped \
-  -p 8765:8765 \
+  -p 127.0.0.1:8765:8765 \
   -v /data/datasets:/data \
   -v annotamate-state:/var/lib/annotamate \
   --user "$(id -u):$(id -g)" \
   ghcr.io/rugvedjalit/annotamate:latest
 ```
 
-Open `http://<server>:8765`. `/data` is where the container sees your datasets; `--user` makes the
-label files it writes belong to you. The image is built for `linux/amd64` and `linux/arm64`.
+Open <http://localhost:8765> and create the administrator account. The port is published on the
+machine itself only; use `-p 8765:8765` to reach it from other machines (then the setup page asks for
+the token shown by `docker logs annotamate`). `/data` is where the container sees your datasets;
+`--user` makes the label files it writes belong to you. The image is built for `linux/amd64` and `linux/arm64`.
 
 ### Docker Compose
 
@@ -125,6 +129,9 @@ flag, which takes precedence.
 | Secure cookies | `--secure-cookies` | `ANNOTAMATE_SECURE_COOKIES` | `false` (set `true` behind HTTPS) |
 | Session lifetime, days | | `ANNOTAMATE_SESSION_DAYS` | `14` |
 | Maximum upload size, MB per file | | `ANNOTAMATE_MAX_UPLOAD_MB` | `50` |
+| Maximum whole upload request, MB | | `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` | `1024` |
+| Maximum request body of other routes, MB | | `ANNOTAMATE_MAX_BODY_MB` | `2` |
+| Largest image, megapixels | | `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` | `150` |
 | Log level (`critical`, `error`, `warning`, `info`, `debug`) | `--log-level` | `ANNOTAMATE_LOG_LEVEL` | `info` |
 
 Project folders must be inside one of the roots. The data directory holds the database and caches,
