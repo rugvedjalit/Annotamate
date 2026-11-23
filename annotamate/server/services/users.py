@@ -77,13 +77,16 @@ def lookup_session(session: Session, token: str | None) -> tuple[UserSession, Us
     return user_session, user
 
 
-def touch_session(user_session: UserSession, user: User, days: int) -> bool:
-    """Slide the expiry forward; returns True when the cookie should be re-sent."""
+def touch_session(user_session: UserSession, user: User, days: int, max_days: int | None = None) -> bool:
+    """Slide the expiry forward (never past ``created_at + max_days``); True when the cookie should be re-sent."""
     now = utcnow()
     if now - user_session.last_used_at < SESSION_REFRESH:
         return False
     user_session.last_used_at = now
-    user_session.expires_at = now + timedelta(days=days)
+    expires = now + timedelta(days=days)
+    if max_days is not None:
+        expires = min(expires, user_session.created_at + timedelta(days=max_days))
+    user_session.expires_at = expires
     user.last_seen_at = now
     return True
 

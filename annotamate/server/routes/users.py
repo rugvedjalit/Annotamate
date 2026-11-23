@@ -1,5 +1,7 @@
 """User directory and administration."""
 
+import threading
+
 from fastapi import APIRouter, Response
 from sqlalchemy import func, select
 
@@ -13,6 +15,10 @@ from annotamate.server.services import serialize
 from annotamate.server.services.users import create_user, revoke_sessions
 
 router = APIRouter(tags=["users"])
+
+#: Serialises changes to admin rights and account status, so two administrators demoting or deactivating
+#: each other at the same moment cannot leave the server without one.
+_ACCOUNT_CHANGES = threading.Lock()
 
 
 @router.get("/users", response_model=list[UserWithOnline] | list[UserBriefWithOnline])
@@ -47,10 +53,23 @@ def _get_user(db: DB, user_id: int) -> User:
 
 @router.patch("/users/{user_id}", response_model=UserOut)
 def edit_user(user_id: int, body: UserPatch, admin: AdminUser, ctx: Ctx, db: DB) -> dict:
+    with _ACCOUNT_CHANGES:
+        db.refresh(admin)  # may have been demoted or deactivated by a request that finished meanwhile
+        if not (admin.is_admin and admin.is_active):
+            raise forbidden("Only administrators can change accounts.")
+        return _edit_user(user_id, body, admin, ctx, db)
+
+
+def _edit_user(user_id: int, body: UserPatch, admin: User, ctx: Ctx, db: DB) -> dict:
     user = _get_user(db, user_id)
     fields = body.model_fields_set
     if user.id == admin.id and ((body.is_active is False) or (body.is_admin is False)):
         raise bad_request("You cannot deactivate or demote your own account.")
+    if user.is_admin and user.is_active and (body.is_admin is False or body.is_active is False):
+        others = db.scalar(select(func.count()).select_from(User).where(
+            User.is_admin.is_(True), User.is_active.is_(True), User.id != user.id))
+        if not others:
+            raise bad_request("At least one active administrator must remain.")
     if "display_name" in fields and body.display_name is not None:
         user.display_name = body.display_name
     if "email" in fields:
@@ -77,7 +96,9 @@ def edit_user(user_id: int, body: UserPatch, admin: AdminUser, ctx: Ctx, db: DB)
 
 
 @router.post("/users/{user_id}/password", status_code=204)
-def reset_password(user_id: int, body: AdminPassword, _admin: AdminUser, ctx: Ctx, db: DB) -> Response:
+def reset_password(user_id: int, body: AdminPassword, admin: AdminUser, ctx: Ctx, db: DB) -> Response:
+    if user_id == admin.id:  # a stolen session must not be able to replace the password without knowing it
+        raise bad_request("Change your own password on your account page; it asks for the current one.")
     user = _get_user(db, user_id)
     user.password_hash = hash_password(body.new_password)
     revoked = revoke_sessions(db, user.id)

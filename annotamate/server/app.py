@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from html import escape
@@ -27,6 +28,7 @@ from annotamate.core.images import configure as configure_images
 from annotamate.server.config import Settings
 from annotamate.server.context import AppContext, JobRunner
 from annotamate.server.db import Database
+from annotamate.server.deps import CurrentUser
 from annotamate.server.errors import error_body, install_error_handlers, not_found
 from annotamate.server.models import Project, ProjectClass
 from annotamate.server.routes import api_router
@@ -52,7 +54,14 @@ SECURITY_HEADERS = {
     "x-content-type-options": "nosniff",
     "referrer-policy": "same-origin",
     "x-frame-options": "DENY",
+    "cross-origin-opener-policy": "same-origin",
+    "cross-origin-resource-policy": "same-origin",
+    "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
 }
+#: Sent with ``secure_cookies`` (the app is served over HTTPS): browsers then refuse plain HTTP for a year.
+HSTS = "max-age=31536000"
+#: Routes that hash a password (argon2id: ~64 MB and noticeable CPU per call), as ``(method, path suffix)``.
+_HASHING_ROUTES = re.compile(r"/(auth/login|auth/setup|me/password|users|users/\d+/password)")
 #: Fixed types for SPA assets: on Windows ``mimetypes`` reads the registry, which may map ``.js`` to
 #: ``text/plain`` (fatal for module scripts with ``nosniff``).
 STATIC_TYPES = {
@@ -147,6 +156,49 @@ class BodyLimitMiddleware:
         await response(scope, receive, send)
 
 
+class PasswordGate:
+    """Admission control for the routes that hash a password.
+
+    At most ``limit`` such requests run at once; further ones get an immediate ``503 busy`` instead of
+    queueing for a worker thread, so a sign-in flood (from addresses the rate limiter cannot tell apart)
+    cannot tie up the thread pool and stall the rest of the server. The counter is loop-agnostic.
+    """
+
+    LIMIT = 16
+
+    def __init__(self, app: ASGIApp, settings: Settings, limit: int | None = None) -> None:
+        self.app = app
+        self.api_prefix = settings.api_prefix
+        self.limit = self.LIMIT if limit is None else limit
+        self.active = 0
+        self._lock = threading.Lock()
+
+    def _gated(self, scope: Scope) -> bool:
+        if scope["type"] != "http" or scope["method"] != "POST":
+            return False
+        path: str = scope["path"]
+        return path.startswith(self.api_prefix) and _HASHING_ROUTES.fullmatch(path[len(self.api_prefix):]) is not None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not self._gated(scope):
+            await self.app(scope, receive, send)
+            return
+        with self._lock:
+            admitted = self.active < self.limit
+            if admitted:
+                self.active += 1
+        if not admitted:
+            response = JSONResponse(error_body(503, "The server is busy. Try again in a moment.", "busy"),
+                                    status_code=503, headers={"Retry-After": "2"})
+            await response(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
 class HttpMiddleware:
     """CSRF header check for mutating API requests, security headers and sliding session cookies."""
 
@@ -154,6 +206,24 @@ class HttpMiddleware:
         self.app = app
         self.settings = settings
         self.api_prefix = settings.api_prefix
+        self._warned_proxy = False
+
+    def _check_forwarding(self, scope: Scope) -> None:
+        """Warn once when a proxy sends ``X-Forwarded-For`` that uvicorn did not apply (peer not trusted).
+
+        Then every client appears with the proxy's address: the sign-in limits treat all users as one client.
+        """
+        if self._warned_proxy:
+            return
+        forwarded = Headers(scope=scope).get("x-forwarded-for")
+        client = scope.get("client")
+        if not forwarded or not client:
+            return
+        if client[0] not in {part.strip() for part in forwarded.split(",")}:
+            self._warned_proxy = True
+            log.warning("Requests from %s carry an X-Forwarded-For header that is not trusted, so every client "
+                        "appears with the proxy's address. Set FORWARDED_ALLOW_IPS to the proxy's address "
+                        "(see the deployment guide).", client[0])
 
     def _is_api(self, path: str) -> bool:
         return path == self.api_prefix or path.startswith(self.api_prefix + "/")
@@ -162,15 +232,17 @@ class HttpMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if (scope["method"] not in SAFE_METHODS and self._is_api(scope["path"])
+        self._check_forwarding(scope)
+        api = self._is_api(scope["path"])
+        if (scope["method"] not in SAFE_METHODS and api
                 and not Headers(scope=scope).get(CSRF_HEADER, "").strip()):
             response = JSONResponse(error_body(403, f"Missing {CSRF_HEADER} header.", "csrf"), status_code=403)
-            await response(scope, receive, self._wrap(send, {}))
+            await response(scope, receive, self._wrap(send, {}, api))
             return
         state = scope.setdefault("state", {})
-        await self.app(scope, receive, self._wrap(send, state))
+        await self.app(scope, receive, self._wrap(send, state, api))
 
-    def _wrap(self, send: Send, state: dict) -> Send:
+    def _wrap(self, send: Send, state: dict, api: bool = False) -> Send:
         async def wrapped(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
@@ -179,6 +251,10 @@ class HttpMiddleware:
                         headers[name] = value
                 if "content-security-policy" not in headers:
                     headers["content-security-policy"] = DEFAULT_CSP
+                if self.settings.secure_cookies and "strict-transport-security" not in headers:
+                    headers["strict-transport-security"] = HSTS
+                if api and "cache-control" not in headers:  # personal data: never stored by browsers or proxies
+                    headers["cache-control"] = "no-store"
                 token = state.get("refresh_session")
                 if token:
                     cookie = Response()
@@ -338,12 +414,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
-        openapi_url=f"{settings.api_prefix}/openapi.json",
+        openapi_url=None,
     )
     app.state.ctx = ctx
+
+    @app.get(f"{settings.api_prefix}/openapi.json", include_in_schema=False)
+    def openapi_schema(_user: CurrentUser) -> JSONResponse:
+        """The API description, for signed-in users only (it maps every route for an attacker otherwise)."""
+        return JSONResponse(app.openapi())
+
     install_error_handlers(app)
     app.include_router(api_router(), prefix=settings.api_prefix)
     _install_spa(app, settings)
+    app.add_middleware(PasswordGate, settings=settings)
     app.add_middleware(BodyLimitMiddleware, settings=settings)
     app.add_middleware(HttpMiddleware, settings=settings)
     return app

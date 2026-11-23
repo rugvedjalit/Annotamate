@@ -80,9 +80,35 @@ FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-for
                       "cf-connecting-ip", "true-client-ip", "via")
 
 
+LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _hostname(netloc: str) -> str:
+    """Host part of a ``Host`` header or URL authority, lower-case, without port or IPv6 brackets."""
+    netloc = netloc.strip().lower().rsplit("@", 1)[-1]
+    if netloc.startswith("["):
+        return netloc[1:].split("]", 1)[0]
+    return netloc.split(":", 1)[0] if netloc.count(":") <= 1 else netloc
+
+
 def is_local_request(peer: str | None, headers: Mapping[str, str]) -> bool:
-    """A request made on this machine directly, not relayed by a proxy or tunnel running here."""
-    return is_loopback_address(peer) and not any(h in headers for h in FORWARDING_HEADERS)
+    """A request made on this machine directly, not relayed by a proxy or tunnel and not a DNS-rebinding page.
+
+    The TCP peer must be loopback, no proxy header may be present, the ``Host`` header must name this machine
+    (``localhost``, ``127.0.0.1`` or ``[::1]``; a rebinding page sends its own domain), and an ``Origin``, if
+    sent, must name the same host.
+    """
+    if not is_loopback_address(peer) or any(h in headers for h in FORWARDING_HEADERS):
+        return False
+    host = _hostname(headers.get("host", ""))
+    if host not in LOCAL_HOSTNAMES:
+        return False
+    origin = headers.get("origin")
+    if origin is not None:
+        authority = origin.split("://", 1)[1] if "://" in origin else ""
+        if _hostname(authority.split("/", 1)[0]) != host:
+            return False
+    return True
 
 
 def new_setup_token() -> str:
@@ -100,23 +126,53 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-class LoginRateLimiter:
-    """Failed-login limits in a sliding ``window`` (seconds): ``max_failures`` per (IP, username) and, so that
-    one address cannot walk through many usernames, ``max_ip_failures`` per IP in total (0 = off).
+def address_key(ip: str) -> str:
+    """The unit the address-wide limit counts: the IPv6 /64 a host gets (rotating inside it gains nothing),
+    otherwise the address itself (non-IP strings are used as they are)."""
+    address = _ip(ip)
+    if isinstance(address, ipaddress.IPv6Address):
+        return str(ipaddress.IPv6Network((address, 64), strict=False))
+    return str(address) if address is not None else ip
 
-    The address-wide limit applies to public addresses only. Loopback and private addresses are often shared
-    by every user (a proxy whose client addresses are not trusted, Docker's gateway, office networks), and an
-    address-wide lock-out there would let one person keep everyone else from signing in.
+
+class LoginRateLimiter:
+    """Failed sign-ins in a sliding ``window`` (seconds), counted three ways:
+
+    * ``max_failures`` per (address, username): one client guessing one account;
+    * ``max_ip_failures`` per address (IPv6: per /64) across usernames, so one client cannot walk through many
+      accounts. Loopback and private addresses get ``PRIVATE_FACTOR`` times as many, because a proxy whose
+      forwarding headers are not trusted, Docker's gateway or an office network can make every user share one;
+    * ``max_account_failures`` per username across all addresses, so rotating addresses does not give unlimited
+      guesses against one account.
+
+    ``attempt`` checks and records in one step (concurrent guesses cannot slip past the limit while a hash is
+    being verified); a good password then ``release``-s the recorded attempt. ``0`` turns a limit off.
     """
 
-    def __init__(self, max_failures: int = 10, window: float = 600.0, max_ip_failures: int = 30) -> None:
+    PRIVATE_FACTOR = 10
+    MAX_KEYS = 50_000
+
+    def __init__(self, max_failures: int = 10, window: float = 600.0, max_ip_failures: int = 30,
+                 max_account_failures: int = 100) -> None:
         self.max_failures = max_failures
         self.max_ip_failures = max_ip_failures
+        self.max_account_failures = max_account_failures
         self.window = window
-        self._failures: dict[tuple[str, str | None], deque[float]] = {}
+        self._failures: dict[tuple[str, ...], deque[float]] = {}
         self._lock = threading.Lock()
 
-    def _recent(self, key: tuple[str, str | None], now: float) -> deque[float]:
+    def _limits(self, ip: str, username: str) -> list[tuple[tuple[str, ...], int]]:
+        name = username.lower()
+        addr = address_key(ip)
+        limits: list[tuple[tuple[str, ...], int]] = [(("pair", addr, name), self.max_failures)]
+        if self.max_ip_failures > 0:
+            factor = 1 if is_public_address(ip) else self.PRIVATE_FACTOR
+            limits.append((("addr", addr), self.max_ip_failures * factor))
+        if self.max_account_failures > 0:
+            limits.append((("user", name), self.max_account_failures))
+        return [(key, limit) for key, limit in limits if limit > 0]
+
+    def _recent(self, key: tuple[str, ...], now: float) -> deque[float]:
         attempts = self._failures.get(key)
         if attempts is None:
             return deque()
@@ -126,38 +182,66 @@ class LoginRateLimiter:
             self._failures.pop(key, None)
         return attempts
 
-    def _wait(self, key: tuple[str, str | None], limit: int, now: float) -> int:
+    def _wait(self, key: tuple[str, ...], limit: int, now: float) -> int:
         attempts = self._recent(key, now)
         if len(attempts) < limit:
             return 0
         return max(1, int(self.window - (now - attempts[0])) + 1)
 
+    def _record(self, limits: list[tuple[tuple[str, ...], int]], now: float) -> None:
+        for key, _limit in limits:
+            self._failures.setdefault(key, deque()).append(now)
+        if len(self._failures) > self.MAX_KEYS:
+            self._evict(now)
+
+    def _evict(self, now: float) -> None:
+        """Bound memory under a flood: drop expired entries, then the oldest per-account buckets.
+
+        Address-wide buckets are never evicted early, so filling the table cannot lift an attacker's own limit.
+        """
+        for key in list(self._failures):
+            self._recent(key, now)
+        excess = len(self._failures) - int(self.MAX_KEYS * 0.9)
+        if excess > 0:
+            evictable = sorted((k for k in self._failures if k[0] != "addr"), key=lambda k: self._failures[k][-1])
+            for key in evictable[:excess]:
+                del self._failures[key]
+
     def retry_after(self, ip: str, username: str) -> int:
         """Seconds until another attempt is allowed (0 when allowed now)."""
         now = time.monotonic()
         with self._lock:
-            wait = self._wait((ip, username.lower()), self.max_failures, now)
-            if self._per_address(ip):
-                wait = max(wait, self._wait((ip, None), self.max_ip_failures, now))
-            return wait
+            return max((self._wait(key, limit, now) for key, limit in self._limits(ip, username)), default=0)
 
-    def _per_address(self, ip: str) -> bool:
-        return self.max_ip_failures > 0 and is_public_address(ip)
+    def attempt(self, ip: str, username: str) -> int:
+        """Check and record a sign-in attempt atomically; returns the seconds to wait (0 = go ahead)."""
+        now = time.monotonic()
+        with self._lock:
+            limits = self._limits(ip, username)
+            wait = max((self._wait(key, limit, now) for key, limit in limits), default=0)
+            if not wait:
+                self._record(limits, now)
+            return wait
 
     def failure(self, ip: str, username: str) -> None:
         now = time.monotonic()
         with self._lock:
-            keys: list[tuple[str, str | None]] = [(ip, username.lower())]
-            if self._per_address(ip):
-                keys.append((ip, None))
-            for key in keys:
+            limits = self._limits(ip, username)
+            for key, _limit in limits:
                 self._recent(key, now)
-                self._failures.setdefault(key, deque()).append(now)
-            if len(self._failures) > 10_000:  # bound memory under a credential-stuffing flood
-                oldest = min(self._failures, key=lambda k: self._failures[k][-1])
-                self._failures.pop(oldest, None)
+            self._record(limits, now)
+
+    def release(self, ip: str, username: str) -> None:
+        """Take back the attempt ``attempt`` recorded (the password was right)."""
+        with self._lock:
+            for key, _limit in self._limits(ip, username):
+                attempts = self._failures.get(key)
+                if attempts:
+                    attempts.pop()
+                    if not attempts:
+                        del self._failures[key]
 
     def success(self, ip: str, username: str) -> None:
-        """A good login clears that account's counter (not the address-wide one)."""
+        """A good login clears that account's counter for this address (not the address-wide one)."""
         with self._lock:
-            self._failures.pop((ip, username.lower()), None)
+            self._failures.pop(("pair", address_key(ip), username.lower()), None)

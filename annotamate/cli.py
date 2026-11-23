@@ -241,7 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("username")
     create.add_argument("--admin", action="store_true", help="grant administrator rights")
     create.add_argument("--display-name")
-    create.add_argument("--password", help="password (prompted when omitted)")
+    create.add_argument("--password", help="password (prompted when omitted; a value given here can be seen "
+                        "in the process list and the shell history, so prefer the prompt)")
     data_dir_option(create)
     create.set_defaults(func=cmd_user_create)
     passwd = user_sub.add_parser("passwd", help="set a new password (prompts)")

@@ -228,6 +228,10 @@ def test_unauthenticated_requests(client, admin):
 # ------------------------------------------------------------------------------------- first-run setup token
 
 
+#: A page opened on the server machine itself.
+LOCAL = "http://localhost:8765"
+
+
 def _setup_body(**extra):
     return {"username": "root", "display_name": "Root", "password": PASSWORD, **extra}
 
@@ -249,8 +253,9 @@ def test_loopback_clients_need_no_token(app):
     from fastapi.testclient import TestClient
 
     for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
-        assert TestClient(app, client=(host, 50000)).get("/api/auth/state").json()["setup_token_required"] is False
-    local = TestClient(app, client=("127.0.0.1", 50000))
+        state = TestClient(app, client=(host, 50000), base_url=LOCAL).get("/api/auth/state").json()
+        assert state["setup_token_required"] is False
+    local = TestClient(app, client=("127.0.0.1", 50000), base_url=LOCAL)
     assert local.post("/api/auth/setup", json=_setup_body(), headers=CSRF).status_code == 200
 
 
@@ -265,7 +270,8 @@ def test_token_is_logged_at_startup_and_not_created_when_accounts_exist(tmp_path
     assert first.state.ctx.setup_token and first.state.ctx.setup_token in caplog.text
     from fastapi.testclient import TestClient
 
-    TestClient(first, client=("127.0.0.1", 1)).post("/api/auth/setup", json=_setup_body(), headers=CSRF)
+    local = TestClient(first, client=("127.0.0.1", 1), base_url=LOCAL)
+    local.post("/api/auth/setup", json=_setup_body(), headers=CSRF)
     assert create_app(settings).state.ctx.setup_token is None
 
 
@@ -280,7 +286,7 @@ def test_concurrent_setups_create_exactly_one_administrator(app):
     barrier = threading.Barrier(6)
 
     def attempt(n: int) -> None:
-        local = TestClient(app, client=("127.0.0.1", 40000 + n))
+        local = TestClient(app, client=("127.0.0.1", 40000 + n), base_url=LOCAL)
         barrier.wait()
         body = _setup_body(username=f"root{n}")
         results.append(local.post("/api/auth/setup", json=body, headers=CSRF).status_code)
@@ -377,13 +383,87 @@ def test_login_ip_limit_comes_from_the_settings(tmp_path, root):
 def test_proxied_requests_need_the_setup_token_even_from_loopback(app):
     from fastapi.testclient import TestClient
 
-    local = TestClient(app, client=("127.0.0.1", 50000))
+    local = TestClient(app, client=("127.0.0.1", 50000), base_url=LOCAL)
     for header in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"):
-        headers = {**CSRF, header: "203.0.113.9"}
+        headers = {**CSRF, header: "5.6.7.8"}
         assert local.get("/api/auth/state", headers=headers).json()["setup_token_required"] is True, header
         refused = local.post("/api/auth/setup", json=_setup_body(), headers=headers)
         assert refused.status_code == 422, header
     token = app.state.ctx.setup_token
     ok = local.post("/api/auth/setup", json=_setup_body(setup_token=token),
-                    headers={**CSRF, "X-Forwarded-For": "203.0.113.9"})
+                    headers={**CSRF, "X-Forwarded-For": "5.6.7.8"})
     assert ok.status_code == 200
+
+
+def test_dns_rebinding_page_on_the_server_needs_the_setup_token(app):
+    """A page of another site, rebound to 127.0.0.1, reaches the server from loopback but with its own Host."""
+    from fastapi.testclient import TestClient
+
+    rebound = TestClient(app, client=("127.0.0.1", 50000), base_url="http://attacker.example:8765")
+    headers = {**CSRF, "Origin": "http://attacker.example:8765"}
+    assert rebound.get("/api/auth/state", headers=headers).json()["setup_token_required"] is True
+    assert rebound.post("/api/auth/setup", json=_setup_body(), headers=headers).status_code == 422
+    local = TestClient(app, client=("127.0.0.1", 50000), base_url=LOCAL)
+    foreign_origin = {**CSRF, "Origin": "http://attacker.example"}
+    assert local.post("/api/auth/setup", json=_setup_body(), headers=foreign_origin).status_code == 422
+    for host in ("http://127.0.0.1:8765", "http://[::1]:8765", LOCAL):
+        assert TestClient(app, client=("127.0.0.1", 1), base_url=host).get(
+            "/api/auth/state").json()["setup_token_required"] is False, host
+
+
+def test_limiter_counts_ipv6_per_64_and_each_account_across_addresses():
+    from annotamate.server.security import LoginRateLimiter
+
+    limiter = LoginRateLimiter(max_failures=10, window=600, max_ip_failures=30, max_account_failures=50)
+    for n in range(30):  # rotating inside one /64 is one address
+        assert limiter.attempt(f"2a00:1450:1:2::{n + 1:x}", f"user{n}") == 0
+    assert limiter.attempt("2a00:1450:1:2::ffff", "fresh") > 0
+    assert limiter.attempt("2a00:1450:1:3::1", "fresh") == 0  # the next /64 is another address
+    for n in range(50):  # many addresses against one account
+        assert limiter.attempt(f"203.0.{n}.1", "admin") == 0
+    assert limiter.attempt("198.51.100.7", "admin") > 0
+
+
+def test_limiter_attempt_is_atomic_and_release_takes_it_back():
+    import threading
+
+    from annotamate.server.security import LoginRateLimiter
+
+    limiter = LoginRateLimiter(max_failures=10, window=600)
+    allowed: list[int] = []
+    barrier = threading.Barrier(40)
+
+    def guess() -> None:
+        barrier.wait()
+        allowed.append(limiter.attempt("203.0.113.5", "admin") == 0)
+
+    threads = [threading.Thread(target=guess) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(allowed) == 10
+    ok = LoginRateLimiter(max_failures=2, window=600)
+    for _ in range(5):  # correct passwords are taken back and never lock the account
+        assert ok.attempt("203.0.113.5", "ann") == 0
+        ok.release("203.0.113.5", "ann")
+        ok.success("203.0.113.5", "ann")
+
+
+def test_filling_the_limiter_table_does_not_lift_an_address_limit(monkeypatch):
+    from annotamate.server.security import LoginRateLimiter
+
+    monkeypatch.setattr(LoginRateLimiter, "MAX_KEYS", 200)
+    limiter = LoginRateLimiter(max_failures=10, window=600, max_ip_failures=30)
+    for n in range(30):
+        limiter.failure("5.6.7.8", f"user{n}")
+    for n in range(500):  # junk from elsewhere fills the table
+        limiter.failure(f"9.{n // 250}.{n % 250}.1", f"junk{n}")
+    assert limiter.retry_after("5.6.7.8", "anyone") > 0
+
+
+def test_junk_usernames_share_one_limiter_bucket(client):
+    for n in range(12):
+        client.post("/api/auth/login", json={"username": f"Not A Name {n}!", "password": "x" * 8}, headers=CSRF)
+    blocked = client.post("/api/auth/login", json={"username": "???", "password": "x" * 8}, headers=CSRF)
+    assert blocked.status_code == 429

@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     base_url: str = "/"
     secure_cookies: bool = False
     session_days: int = Field(14, ge=1, le=3650)
+    #: Absolute session lifetime: a session ends this many days after sign-in, however often it is used.
+    session_max_days: int = Field(90, ge=1, le=3650)
     max_upload_mb: int = Field(50, ge=1)
     #: Largest request body for everything except uploads (JSON, forms), in MB.
     max_body_mb: int = Field(2, ge=1)

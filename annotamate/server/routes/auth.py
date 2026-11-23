@@ -10,7 +10,7 @@ from annotamate.server.config import Settings
 from annotamate.server.deps import DB, Ctx, CurrentUser, optional_user
 from annotamate.server.errors import ApiError, bad_request, validation_error
 from annotamate.server.models import UserSession
-from annotamate.server.schemas import AuthState, LoginIn, MePatch, PasswordChange, SetupIn, User
+from annotamate.server.schemas import USERNAME_RE, AuthState, LoginIn, MePatch, PasswordChange, SetupIn, User
 from annotamate.server.security import SESSION_COOKIE, hash_password, is_local_request, verify_password
 from annotamate.server.services import serialize
 from annotamate.server.services.users import (
@@ -25,6 +25,8 @@ from annotamate.server.services.users import (
 router = APIRouter(tags=["auth"])
 
 MAX_SETTINGS_BYTES = 64 * 1024
+#: Limiter bucket shared by every sign-in with a name no account can have.
+INVALID_NAME_BUCKET = "\x00invalid"
 
 
 def set_session_cookie(response: Response, settings: Settings, token: str) -> None:
@@ -78,18 +80,21 @@ def setup(body: SetupIn, request: Request, response: Response, ctx: Ctx, db: DB)
 def login(body: LoginIn, request: Request, response: Response, ctx: Ctx, db: DB) -> dict:
     ip, agent = _client(request)
     username = body.username.strip().lower()
-    wait = ctx.limiter.retry_after(ip, username)
+    # Names no account can have share one limiter bucket, so junk names cannot fill the limiter's table.
+    valid_name = USERNAME_RE.fullmatch(username) is not None
+    bucket = username if valid_name else INVALID_NAME_BUCKET
+    wait = ctx.limiter.attempt(ip, bucket)  # counted before hashing: parallel guesses cannot exceed the limit
     if wait:
         raise ApiError(429, "rate_limited", "Too many failed sign-in attempts. Try again later.",
                        headers={"Retry-After": str(wait)}, retry_after=wait)
-    user = find_by_username(db, username)
+    user = find_by_username(db, username) if valid_name else None
     valid, rehash = verify_password(user.password_hash if user else None, body.password)
     if user is None or not valid:
-        ctx.limiter.failure(ip, username)
         raise ApiError(401, "invalid_credentials", "Wrong username or password.")
     if not user.is_active:
         raise ApiError(403, "forbidden", "This account has been deactivated.")
-    ctx.limiter.success(ip, username)
+    ctx.limiter.release(ip, bucket)
+    ctx.limiter.success(ip, bucket)
     if rehash:
         user.password_hash = hash_password(body.password)
     purge_expired_sessions(db)

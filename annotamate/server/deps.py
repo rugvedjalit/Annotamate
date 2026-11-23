@@ -38,7 +38,7 @@ def optional_user(request: Request, ctx: Ctx, db: DB) -> User | None:
         return None
     user_session, user = found
     request.state.session_id = user_session.id
-    if touch_session(user_session, user, ctx.settings.session_days):
+    if touch_session(user_session, user, ctx.settings.session_days, ctx.settings.session_max_days):
         db.commit()
         request.state.refresh_session = token
     return user

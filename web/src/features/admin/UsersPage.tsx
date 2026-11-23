@@ -279,9 +279,15 @@ function UserRow({ user: u, isSelf, onEdit, onReset, onConfirm }: UserRowProps) 
             <DropdownMenuItem icon={<Pencil />} onSelect={onEdit}>
               Edit details
             </DropdownMenuItem>
-            <DropdownMenuItem icon={<KeyRound />} onSelect={onReset}>
-              Reset password
-            </DropdownMenuItem>
+            {isSelf ? (
+              <DropdownMenuItem icon={<KeyRound />} onSelect={() => navigate('/account')}>
+                Change your password
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem icon={<KeyRound />} onSelect={onReset}>
+                Reset password
+              </DropdownMenuItem>
+            )}
             {!isSelf && u.is_active && (
               <DropdownMenuItem icon={<MessagesSquare />} onSelect={() => navigate(`/messages/${u.id}`)}>
                 Send a message
