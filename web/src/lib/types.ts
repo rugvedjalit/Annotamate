@@ -60,6 +60,14 @@ export interface Permissions {
   can_delete: boolean
 }
 
+/** A class delete/merge that is rewriting label files in the background (edits are refused with `409 migrating`). */
+export interface ClassMigration {
+  kind: 'delete' | 'merge'
+  class_name: string
+  done: number
+  total: number
+}
+
 export interface ProjectSummary {
   id: number
   name: string
@@ -73,6 +81,8 @@ export interface ProjectSummary {
   unread_chat: number
   archived: boolean
   indexing: boolean
+  /** Set while a class delete/merge job runs: saving, class changes, upload and export are paused. */
+  class_migration: ClassMigration | null
   /** Images whose file disappeared from disk (hidden everywhere until the file returns or they are removed). */
   missing_count: number
   created_at: string
@@ -226,6 +236,7 @@ export type ActivityType =
   | 'class_added'
   | 'class_updated'
   | 'class_deleted'
+  | 'class_delete_failed'
   | 'member_added'
   | 'member_updated'
   | 'member_removed'
@@ -516,6 +527,25 @@ export interface ServerMessageMap {
     done: number
     total: number
     finished: boolean
+  }
+  /**
+   * Progress of a background class delete/merge: one event when the job starts, throttled progress, then
+   * exactly one with `finished: true` (`rewritten_files` on success; `error` + `code` on failure, the
+   * files were rolled back and the class still exists).
+   */
+  'classes.migration': {
+    type: 'classes.migration'
+    project_id: number
+    kind: 'delete' | 'merge'
+    class_name: string
+    done: number
+    total: number
+    finished: boolean
+    error?: string
+    /** 'in_use' (with `images`), 'bad_request', 'migration_incomplete', 'interrupted' or 'error'. */
+    code?: string
+    images?: number
+    rewritten_files?: number
   }
   'members.updated': { type: 'members.updated'; project_id: number }
   'chat.message': { type: 'chat.message'; message: ChatMessage }

@@ -125,8 +125,9 @@ export const createClass = (pid: number, body: { name: string; color?: string })
   http.post<ProjectClass>(`projects/${pid}/classes`, body)
 export const updateClass = (pid: number, cid: number, body: { name?: string; color?: string }) =>
   http.patch<ProjectClass>(`projects/${pid}/classes/${cid}`, body)
+/** Answers `202 {started: true}`: the label files are rewritten in the background (`classes.migration` events). */
 export const deleteClass = (pid: number, cid: number, strategy: ClassDeleteStrategy, mergeInto?: number) =>
-  http.delete<{ rewritten_files: number }>(`projects/${pid}/classes/${cid}`, {
+  http.delete<{ started: boolean }>(`projects/${pid}/classes/${cid}`, {
     query: { strategy, merge_into: strategy === 'merge' ? mergeInto : undefined },
   })
 

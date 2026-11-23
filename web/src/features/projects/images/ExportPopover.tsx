@@ -11,16 +11,25 @@ import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import { CheckboxField } from '@/components/ui/Checkbox'
 
 /** Export as a zip (plain GET download, cookie-authenticated). */
-export function ExportPopover({ projectId, defaultFormat }: { projectId: number; defaultFormat: LabelFormat }) {
+export function ExportPopover({
+  projectId,
+  defaultFormat,
+  disabledReason,
+}: {
+  projectId: number
+  defaultFormat: LabelFormat
+  /** Why exporting is not possible right now (a class change is rewriting label files). */
+  disabledReason?: string
+}) {
   const [format, setFormat] = useState<LabelFormat>(defaultFormat)
   const [scope, setScope] = useState<'all' | 'done'>('all')
   const [withImages, setWithImages] = useState(false)
   const [open, setOpen] = useState(false)
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open && !disabledReason} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <Button variant="secondary">
+        <Button variant="secondary" disabled={!!disabledReason} title={disabledReason}>
           <Download />
           Export
         </Button>

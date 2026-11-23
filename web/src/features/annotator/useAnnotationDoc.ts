@@ -2,6 +2,7 @@
 // with debounced autosave, awaited flush before navigation, conflict handling and per-image history (20 images).
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { getAnnotation, restoreRevision as restoreRevisionApi, saveAnnotation } from '@/lib/endpoints'
 import { ApiError, errorMessage } from '@/lib/api'
 import { qk } from '@/lib/queryKeys'
@@ -169,6 +170,13 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
           applyFor(docKey, { type: 'saveConflict', current: err.extra.current as AnnotationDoc })
         } else if (err instanceof ApiError && err.code === 'readonly') {
           applyFor(docKey, { type: 'readonly', reason: err.detail })
+        } else if (err instanceof ApiError && err.code === 'migrating') {
+          // A class delete/merge is rewriting label files. The boxes stay in memory (dirty); the project is
+          // refetched so the workspace turns read-only, and saving resumes when the migration ends.
+          applyFor(docKey, { type: 'saveError', message: err.detail })
+          retryAttempt.current = 0
+          toast.error('Saving is paused', { id: `class-migration-save:${projectId}`, description: err.detail })
+          void qc.invalidateQueries({ queryKey: qk.project(projectId) })
         } else if (err instanceof ApiError && err.status === 423) {
           applyFor(docKey, { type: 'saveError', message: err.detail })
           optsRef.current.onLocked?.((err.extra.holder as UserBrief | undefined) ?? null)
@@ -261,11 +269,16 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
       if (m.by && m.by.id === useSession.getState().user?.id) return
       refreshIfChanged(m.version)
     })
+    // A class delete/merge rewrote label files: reload this one if it changed.
+    const offMigration = realtime.on('classes.migration', (m) => {
+      if (m.project_id === projectId && m.finished) refreshIfChanged()
+    })
     const offOpen = realtime.onOpen(({ reconnected }) => {
       if (reconnected) refreshIfChanged()
     })
     return () => {
       offUpdate()
+      offMigration()
       offOpen()
     }
   }, [key, projectId, imageId, apply])

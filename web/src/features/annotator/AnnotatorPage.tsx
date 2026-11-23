@@ -46,6 +46,7 @@ import { useImagePrefetch } from './useImagePrefetch'
 import { useAnnotator } from './store'
 import { WorkspaceContext, type ReadOnlyInfo, type Workspace } from './workspaceContext'
 import type { AnnotatorLinkState } from '@/features/notifications/notificationUtils'
+import { classMigrationPercent, useClassMigration } from '@/features/projects/useClassMigration'
 
 const STATUS_TOASTS: Record<StatusAction, string> = {
   submit: 'Submitted',
@@ -181,21 +182,28 @@ function AnnotatorWorkspace({ project, imageId }: { project: Project; imageId: n
   const baseEditable = perms.can_edit && !!image && !assignedElsewhere && !smallScreen && !imageBroken
   const lock = useImageLock(imageId, baseEditable)
   const lockOk = lock.status === 'held' || lock.status === 'unavailable'
+  // A class delete/merge is rewriting label files: the lock is kept, but nothing is edited or saved until it
+  // ends (unsaved boxes stay in memory and are saved afterwards).
+  const migration = useClassMigration(project)
   const doc = useAnnotationDoc(projectId, imageId, {
-    canSave: baseEditable && lockOk,
+    canSave: baseEditable && lockOk && !migration,
     forceAllowed: lock.status === 'held' || perms.can_review,
     autosave: settings.autosave,
     autosaveDelayMs: settings.autosave_delay_ms,
     onLocked: lock.markDenied,
   })
   const editable =
-    baseEditable && lockOk && doc.ready && !doc.state.readonlyReason && !preview && doc.state.save !== 'conflict'
+    baseEditable && lockOk && !migration && doc.ready && !doc.state.readonlyReason && !preview && doc.state.save !== 'conflict'
 
   const readOnly: ReadOnlyInfo | null = (() => {
     if (smallScreen) return { kind: 'device', message: 'Editing needs a larger screen with a mouse. This device is view-only: you can browse, comment and chat.' }
     if (imageBroken) return { kind: 'image', message: image?.error ?? 'This image cannot be decoded.' }
     if (!perms.can_edit) return { kind: 'permission', message: 'You have view-only access to this project. You can comment and chat.' }
     if (assignedElsewhere) return { kind: 'assigned', message: `Assigned to ${image?.assignee?.display_name}. Only the assignee can edit it in this project.` }
+    if (migration) {
+      const percent = classMigrationPercent(migration)
+      return { kind: 'migrating', message: `Class change in progress – editing is paused${percent ? ` (${percent})` : ''}. You can view and comment.` }
+    }
     if (doc.state.readonlyReason) return { kind: 'file', message: `This label file is read-only: ${doc.state.readonlyReason}` }
     if (lock.status === 'revoked' && lock.holder && lock.holder.id === me?.id)
       return { kind: 'revoked', message: 'You are editing this image in another tab. This tab is read-only.', holder: lock.holder }

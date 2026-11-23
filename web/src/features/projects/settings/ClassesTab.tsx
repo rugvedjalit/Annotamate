@@ -17,6 +17,7 @@ import { EmptyState } from '@/components/ui/Feedback'
 import { Tooltip } from '@/components/ui/Tooltip'
 import { ColorSwatches } from '@/components/ColorSwatches'
 import { useProjectStats } from '../overview/chartUtils'
+import { CLASS_MIGRATION_HINT, useClassMigration } from '../useClassMigration'
 import { DeleteClassDialog } from './DeleteClassDialog'
 import { SettingsCard } from './SettingsCard'
 
@@ -150,6 +151,8 @@ export function ClassesTab({ project }: { project: Project }) {
   const [name, setName] = useState('')
   const [color, setColor] = useState(() => nextClassColor(classes.map((c) => c.color)))
   const [deleting, setDeleting] = useState<ProjectClass | null>(null)
+  /** A class delete/merge is rewriting label files: the server refuses other class changes meanwhile. */
+  const paused = !!useClassMigration(project)
   const usageById = new Map(stats.data?.class_counts.map((c) => [c.class_id, { boxes: c.boxes, images: c.images }]))
   const duplicate = classes.some((c) => c.name.toLowerCase() === name.trim().toLowerCase())
 
@@ -182,7 +185,7 @@ export function ClassesTab({ project }: { project: Project }) {
   function add(e: FormEvent) {
     e.preventDefault()
     const v = name.trim()
-    if (!v || duplicate) return
+    if (!v || duplicate || paused) return
     create.mutate({ name: v, color })
   }
 
@@ -208,11 +211,12 @@ export function ClassesTab({ project }: { project: Project }) {
             className="w-auto min-w-56 flex-1"
             aria-invalid={duplicate}
           />
-          <Button type="submit" variant="primary" disabled={!name.trim() || duplicate} loading={create.isPending}>
+          <Button type="submit" variant="primary" disabled={!name.trim() || duplicate || paused} loading={create.isPending}>
             {!create.isPending && <Plus />}
             Add class
           </Button>
           {duplicate && <p className="w-full text-xs text-danger">A class with this name already exists.</p>}
+          {paused && <p className="w-full text-xs text-muted">{CLASS_MIGRATION_HINT}</p>}
         </form>
       </SettingsCard>
 
@@ -226,7 +230,7 @@ export function ClassesTab({ project }: { project: Project }) {
                 key={`${c.id}:${c.name}`}
                 cls={c}
                 usage={usageById.get(c.id) ?? (stats.data ? { boxes: 0, images: 0 } : undefined)}
-                busy={update.isPending}
+                busy={update.isPending || paused}
                 onRename={(n) => update.mutateAsync({ cls: c, body: { name: n } })}
                 onRecolor={(col) => update.mutate({ cls: c, body: { color: col } })}
                 onDelete={() => setDeleting(c)}

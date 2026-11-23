@@ -1,9 +1,9 @@
 // Live state fed by the WebSocket: connection, online users, project presence, image locks,
-// indexing progress and typing indicators.
+// indexing and class-migration progress and typing indicators.
 import { create } from 'zustand'
 import { RealtimeClient, type ConnectionState } from '@/lib/realtime'
 import { wsUrl } from '@/lib/config'
-import type { PresenceEntry, UserBrief } from '@/lib/types'
+import type { ClassMigration, PresenceEntry, UserBrief } from '@/lib/types'
 
 /** The app-wide WebSocket client (one connection per tab). */
 export const realtime = new RealtimeClient({ url: wsUrl })
@@ -20,6 +20,23 @@ export interface IndexingProgress {
   finished: boolean
 }
 
+/** Last `classes.migration` event of a project (the final one stays for a few seconds). */
+export interface ClassMigrationProgress extends ClassMigration {
+  finished: boolean
+  error?: string
+  code?: string
+  images?: number
+  rewritten_files?: number
+}
+
+/** A class delete/merge this tab asked for: the result toast is shown when its final event arrives. */
+export interface StartedClassMigration {
+  className: string
+  mergeIntoName: string | null
+  /** The delete dialog is still open (it shows an "in use" refusal itself). */
+  dialogOpen: boolean
+}
+
 interface RealtimeState {
   connection: ConnectionState
   everConnected: boolean
@@ -30,6 +47,10 @@ interface RealtimeState {
   /** imageId → lock holder, from lock.state broadcasts in the subscribed project. */
   locks: Record<number, UserBrief>
   indexing: Record<number, IndexingProgress>
+  /** projectId → progress of the running (or just finished) class delete/merge. */
+  classMigration: Record<number, ClassMigrationProgress>
+  /** projectId → the class delete/merge started in this tab. */
+  classMigrationStarted: Record<number, StartedClassMigration>
   /** userId → {user, until} for the subscribed project's chat. */
   chatTyping: Record<number, { user: UserBrief; until: number }>
   /** userId → until, for DMs. */
@@ -43,6 +64,8 @@ interface RealtimeState {
   clearProject: () => void
   setLock: (imageId: number, holder: UserBrief | null) => void
   setIndexing: (projectId: number, p: IndexingProgress | null) => void
+  setClassMigration: (projectId: number, p: ClassMigrationProgress | null) => void
+  setClassMigrationStarted: (projectId: number, s: StartedClassMigration | null) => void
   setChatTyping: (user: UserBrief) => void
   setDmTyping: (userId: number) => void
   pruneTyping: () => void
@@ -59,6 +82,8 @@ const initial = {
   presence: {},
   locks: {},
   indexing: {},
+  classMigration: {},
+  classMigrationStarted: {},
   chatTyping: {},
   dmTyping: {},
 }
@@ -106,6 +131,20 @@ export const useRealtime = create<RealtimeState>()((set) => ({
       if (p) indexing[projectId] = p
       else delete indexing[projectId]
       return { indexing }
+    }),
+  setClassMigration: (projectId, p) =>
+    set((s) => {
+      const classMigration = { ...s.classMigration }
+      if (p) classMigration[projectId] = p
+      else delete classMigration[projectId]
+      return { classMigration }
+    }),
+  setClassMigrationStarted: (projectId, started) =>
+    set((s) => {
+      const classMigrationStarted = { ...s.classMigrationStarted }
+      if (started) classMigrationStarted[projectId] = started
+      else delete classMigrationStarted[projectId]
+      return { classMigrationStarted }
     }),
   setChatTyping: (user) =>
     set((s) => ({ chatTyping: { ...s.chatTyping, [user.id]: { user, until: Date.now() + TYPING_TTL_MS } } })),

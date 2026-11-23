@@ -1,5 +1,6 @@
 // Human-readable descriptions for project activity entries (data shapes: docs/api.md, "Activity data").
 import {
+  CircleAlert,
   CircleCheck,
   Flag,
   FolderPlus,
@@ -206,6 +207,17 @@ export function describeActivity(a: Activity): ActivityDescription {
       const boxes = str(d, 'strategy') === 'delete_boxes' ? ' and its boxes' : ''
       return { before: `deleted the class ${quote(name)}${boxes}${files}` }
     }
+    case 'class_delete_failed': {
+      const name = str(d, 'name')
+      const into = str(d, 'merge_into_name')
+      const error = str(d, 'error')
+      const what = name
+        ? into
+          ? `could not merge the class ${quote(name)} into ${quote(into)}`
+          : `could not delete the class ${quote(name)}`
+        : 'could not delete a class'
+      return { before: error ? `${what}: ${error}` : what }
+    }
     case 'member_added': {
       const u = user(d, 'member')
       const r = role(d, 'role')
@@ -260,6 +272,7 @@ export const ACTIVITY_ICONS: Record<ActivityType, LucideIcon> = {
   class_added: Tag,
   class_updated: Pencil,
   class_deleted: Trash2,
+  class_delete_failed: CircleAlert,
   member_added: UserPlus,
   member_updated: UserRoundCog,
   member_removed: UserMinus,

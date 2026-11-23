@@ -90,6 +90,7 @@ export const DATASETS = {
   screens: 5,
   subpath: 3,
   manage: 2,
+  classes: 3,
 } as const
 
 export type DatasetName = keyof typeof DATASETS

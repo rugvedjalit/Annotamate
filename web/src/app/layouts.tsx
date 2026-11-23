@@ -23,6 +23,7 @@ import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Button } from '@/components/ui/Button'
 import { EmptyState, ErrorState, LoadingBlock, Skeleton } from '@/components/ui/Feedback'
 import { ChatDrawer } from '@/features/chat/ChatDrawer'
+import { ClassMigrationBanner } from '@/features/projects/ClassMigrationBanner'
 
 /** Everything behind sign-in: realtime connection, settings, global shortcuts and dialogs. */
 export function AuthedLayout() {
@@ -184,6 +185,7 @@ export function ProjectShell() {
         }
       />
       <ConnectionBanner />
+      <ClassMigrationBanner project={project} />
       <main className="min-h-0 flex-1 overflow-y-auto">
         <ErrorBoundary name="This page" resetKey={projectId}>
           <Outlet />

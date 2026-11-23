@@ -1,4 +1,4 @@
-import { Copy, Eye, FileLock2, ImageOff, Lock, MonitorSmartphone, UserRound } from 'lucide-react'
+import { Copy, Eye, FileLock2, ImageOff, Lock, MonitorSmartphone, Tags, UserRound } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { Spinner } from '@/components/ui/Feedback'
 import { cn } from '@/lib/utils'
@@ -11,6 +11,7 @@ const ICONS = {
   locked: Lock,
   revoked: Lock,
   assigned: UserRound,
+  migrating: Tags,
   file: FileLock2,
   image: ImageOff,
   device: MonitorSmartphone,
@@ -50,7 +51,11 @@ export function LockBanner() {
         tone === 'neutral' && 'border-line bg-panel',
       )}
     >
-      <Icon className={cn('size-4 shrink-0', tone === 'warn' ? 'text-warn' : tone === 'danger' ? 'text-danger' : 'text-muted')} aria-hidden />
+      {ro.kind === 'migrating' ? (
+        <Spinner className="size-3.5 shrink-0" />
+      ) : (
+        <Icon className={cn('size-4 shrink-0', tone === 'warn' ? 'text-warn' : tone === 'danger' ? 'text-danger' : 'text-muted')} aria-hidden />
+      )}
       <span className="min-w-0 flex-1 text-fg">{ro.message}</span>
       {ro.kind === 'revoked' && hasLocalChanges && (
         <Button size="xs" variant="secondary" onClick={() => ws.actions.copy(ws.doc.boxes.map((b) => b.id))}>

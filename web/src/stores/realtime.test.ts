@@ -18,6 +18,22 @@ describe('realtime store', () => {
     expect(s().locks).toEqual({ 10: alice })
   })
 
+  it('keeps class-migration progress and the change started in this tab per project', () => {
+    const s = () => useRealtime.getState()
+    const running = { kind: 'merge' as const, class_name: 'truck', done: 2, total: 8, finished: false }
+    s().setClassMigration(7, running)
+    s().setClassMigration(8, { ...running, kind: 'delete' })
+    s().setClassMigrationStarted(7, { className: 'truck', mergeIntoName: 'car', dialogOpen: true })
+    expect(s().classMigration[7]).toBe(running)
+    expect(s().classMigration[8]?.kind).toBe('delete')
+    s().setClassMigration(7, null)
+    s().setClassMigrationStarted(7, null)
+    expect(s().classMigration).toEqual({ 8: { ...running, kind: 'delete' } })
+    expect(s().classMigrationStarted).toEqual({})
+    s().reset()
+    expect(s().classMigration).toEqual({})
+  })
+
   it('presence updates carry the image filename and remove people who left', () => {
     const s = () => useRealtime.getState()
     s().setPresenceSnapshot(7, [])

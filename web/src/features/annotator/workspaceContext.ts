@@ -12,6 +12,7 @@ export type ReadOnlyKind =
   | 'revoked' // someone took over from us
   | 'acquiring' // waiting for the lock
   | 'assigned' // restrict_to_assigned and assigned to someone else
+  | 'migrating' // a class delete/merge is rewriting label files (saving is paused)
   | 'file' // label file cannot be edited safely (readonly_reason)
   | 'image' // image cannot be decoded
   | 'device' // small/touch screens are view-only

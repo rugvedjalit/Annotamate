@@ -24,6 +24,7 @@ import { SelectionBar } from './images/SelectionBar'
 import { DistributeDialog } from './images/DistributeDialog'
 import { UploadButton } from './images/UploadButton'
 import { ExportPopover } from './images/ExportPopover'
+import { CLASS_MIGRATION_HINT, useClassMigration } from './useClassMigration'
 import {
   GRID_COLS,
   HEADER_HEIGHT,
@@ -49,6 +50,7 @@ export function ImagesTablePage() {
   const pages = useImagePages(projectId, filters)
   const total = pages.total
   const perms = project.permissions
+  const pausedReason = useClassMigration(project) ? CLASS_MIGRATION_HINT : undefined
   const classesById = useMemo(() => new Map(project.classes.map((c) => [c.id, c])), [project.classes])
 
   const [rawSelection, setSelection] = useState<Selection>(() => emptySelection(filterKey))
@@ -231,7 +233,7 @@ export function ImagesTablePage() {
               ? 'Upload images or add files to the project folder and rescan.'
               : 'A manager can add images to this project.'
         }
-        action={perms.can_manage ? <UploadButton projectId={projectId} /> : undefined}
+        action={perms.can_manage ? <UploadButton projectId={projectId} disabledReason={pausedReason} /> : undefined}
       />
     )
   }
@@ -256,8 +258,8 @@ export function ImagesTablePage() {
               <Shuffle />
               Distribute…
             </Button>
-            <UploadButton projectId={projectId} />
-            <ExportPopover projectId={projectId} defaultFormat={project.label_format} />
+            <UploadButton projectId={projectId} disabledReason={pausedReason} />
+            <ExportPopover projectId={projectId} defaultFormat={project.label_format} disabledReason={pausedReason} />
           </>
         )}
       </header>

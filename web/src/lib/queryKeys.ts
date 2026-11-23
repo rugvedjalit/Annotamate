@@ -30,6 +30,8 @@ export const qk = {
   neighborsAll: (pid: number) => ['project', pid, 'neighbors'] as const,
   neighbors: (pid: number, iid: number, filters: ImageFilters) =>
     ['project', pid, 'neighbors', iid, toFilterQuery(filters)] as const,
+  /** Prefix of every annotation document of a project. */
+  annotationsAll: (pid: number) => ['project', pid, 'annotation'] as const,
   annotation: (pid: number, iid: number) => ['project', pid, 'annotation', iid] as const,
   revisions: (pid: number, iid: number) => ['project', pid, 'revisions', iid] as const,
   revision: (pid: number, iid: number, rid: number) => ['project', pid, 'revisions', iid, rid] as const,

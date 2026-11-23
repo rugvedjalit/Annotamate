@@ -196,6 +196,30 @@ describe('useAnnotationDoc', () => {
     expect(result.current.state.save).toBe('error')
   })
 
+  it('a 409 "migrating" keeps the boxes dirty without a conflict; saving resumes when the class change ends', async () => {
+    saveAnnotation.mockRejectedValueOnce(new ApiError(409, 'migrating', 'A class is being removed from the label files.'))
+    const auto = { ...options, autosave: true, autosaveDelayMs: 10 }
+    const { result, rerender, qc } = setup(auto)
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    await waitFor(() => expect(result.current.ready).toBe(true))
+    act(() => result.current.commit([]))
+    await waitFor(() => expect(result.current.state.save).toBe('error'))
+    expect(result.current.state.dirty).toBe(true)
+    expect(result.current.state.conflict).toBeNull()
+    expect(result.current.state.saveError).toBe('A class is being removed from the label files.')
+    expect(result.current.boxes).toEqual([])
+    // The project is refetched, so the workspace learns about the migration and pauses saving.
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['project', 1] })
+    rerender({ o: { ...auto, canSave: false } })
+    expect(await result.current.flush()).toBe(true) // leaving is allowed, the edits stay in this tab
+    expect(saveAnnotation).toHaveBeenCalledTimes(1)
+    // Migration over: the pending boxes are saved by the retry.
+    rerender({ o: auto })
+    await waitFor(() => expect(saveAnnotation).toHaveBeenCalledTimes(2), { timeout: 4000 })
+    await waitFor(() => expect(result.current.state.save).toBe('saved'))
+    expect(result.current.state.dirty).toBe(false)
+  })
+
   it('a save finishing after the workspace unmounted still updates the history cache', async () => {
     let finish: (r: SaveAnnotationResult) => void = () => undefined
     saveAnnotation.mockReturnValueOnce(new Promise<SaveAnnotationResult>((resolve) => (finish = resolve)))

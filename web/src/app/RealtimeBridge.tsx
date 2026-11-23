@@ -2,7 +2,7 @@
 // the TanStack Query caches (setQueryData where possible, throttled invalidation otherwise).
 import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router'
-import { useQueryClient, type QueryClient, type QueryKey } from '@tanstack/react-query'
+import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { qk } from '@/lib/queryKeys'
 import { getAuthState } from '@/lib/endpoints'
@@ -28,29 +28,8 @@ import { useSession } from '@/stores/session'
 import { useSettings } from '@/stores/settings'
 import { useUi } from '@/stores/ui'
 import { notificationHref, notificationState } from '@/features/notifications/notificationUtils'
-
-/** Collects query keys and invalidates them once per window (bursty events → one refetch). */
-function createThrottledInvalidator(qc: QueryClient, delayMs: number) {
-  const pending = new Map<string, QueryKey>()
-  let timer: ReturnType<typeof setTimeout> | null = null
-  return {
-    add(...keys: QueryKey[]) {
-      for (const k of keys) pending.set(JSON.stringify(k), k)
-      if (timer) return
-      timer = setTimeout(() => {
-        timer = null
-        const keysNow = [...pending.values()]
-        pending.clear()
-        for (const k of keysNow) void qc.invalidateQueries({ queryKey: k })
-      }, delayMs)
-    },
-    cancel() {
-      if (timer) clearTimeout(timer)
-      timer = null
-      pending.clear()
-    },
-  }
-}
+import { applyClassMigrationEvent } from './classMigrationEvents'
+import { createThrottledInvalidator, INVALIDATE_THROTTLE_MS } from './throttledInvalidator'
 
 const QUIET_ERROR_CODES = new Set(['locked', 'lock_denied', 'not_subscribed', 'not_found', 'unauthenticated'])
 const TOAST_TYPES = new Set<Notification['type']>([
@@ -84,7 +63,7 @@ export function RealtimeBridge() {
   useEffect(() => {
     const navigate = (to: string, state?: unknown) => void navRef.current(to, state === undefined ? undefined : { state })
     const store = useRealtime.getState()
-    const throttled = createThrottledInvalidator(qc, 1500)
+    const throttled = createThrottledInvalidator(qc, INVALIDATE_THROTTLE_MS)
     const me = () => useSession.getState().user?.id ?? -1
     const offs: (() => void)[] = []
 
@@ -92,7 +71,13 @@ export function RealtimeBridge() {
     offs.push(
       realtime.onOpen(({ reconnected }) => {
         // Missed events while disconnected: refetch what is on screen, mark the rest stale.
-        if (reconnected) void qc.invalidateQueries()
+        if (!reconnected) return
+        // A final classes.migration event may have been missed: the refetched projects say what still runs.
+        const live = useRealtime.getState()
+        for (const [pid, p] of Object.entries(live.classMigration)) {
+          if (!p.finished) live.setClassMigration(Number(pid), null)
+        }
+        void qc.invalidateQueries()
       }),
     )
     offs.push(
@@ -156,6 +141,7 @@ export function RealtimeBridge() {
         }
       }),
     )
+    offs.push(realtime.on('classes.migration', (m) => applyClassMigrationEvent(qc, m)))
     offs.push(
       realtime.on('members.updated', (m) => {
         throttled.add(qk.members(m.project_id), qk.project(m.project_id), qk.projectsAll)

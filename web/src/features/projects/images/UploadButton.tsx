@@ -14,7 +14,7 @@ const BATCH = 20
 const ACCEPT = 'image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff,.tif,.tiff,.jpg,.jpeg,.png,.webp,.bmp,.gif'
 
 /** Manager upload: sends files in batches with progress, then summarises added / skipped files. */
-export function UploadButton({ projectId }: { projectId: number }) {
+export function UploadButton({ projectId, disabledReason }: { projectId: number; disabledReason?: string }) {
   const input = useRef<HTMLInputElement>(null)
   const qc = useQueryClient()
   const { data: meta } = useMeta()
@@ -78,7 +78,7 @@ export function UploadButton({ projectId }: { projectId: number }) {
         tabIndex={-1}
         onChange={(e) => void upload(e.target.files)}
       />
-      <Button variant="secondary" loading={busy} onClick={() => input.current?.click()}>
+      <Button variant="secondary" loading={busy} disabled={!!disabledReason} title={disabledReason} onClick={() => input.current?.click()}>
         {!busy && <Upload />}
         Upload
       </Button>

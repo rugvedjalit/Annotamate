@@ -67,6 +67,20 @@ describe('describeActivity', () => {
       act('class_deleted', { class_id: 4, name: 'truck', strategy: 'merge', merge_into: 1, merge_into_name: 'car', rewritten_files: 1 }, false),
       'merged the class “truck” into “car” (1 label file updated)',
     ],
+    [
+      'class delete failed',
+      act('class_delete_failed', { class_id: 4, name: 'truck', strategy: 'forbid', error: 'The class is still used in 3 images.', code: 'in_use' }, false),
+      'could not delete the class “truck”: The class is still used in 3 images.',
+    ],
+    [
+      'class merge failed',
+      act(
+        'class_delete_failed',
+        { class_id: 4, name: 'truck', strategy: 'merge', merge_into: 1, merge_into_name: 'car', error: 'The server restarted.', code: 'interrupted' },
+        false,
+      ),
+      'could not merge the class “truck” into “car”: The server restarted.',
+    ],
     ['member added', act('member_added', { member: bob, role: 'reviewer' }, false), 'added Bob as reviewer'],
     [
       'member role',
