@@ -89,7 +89,7 @@ These came from reading the code. Each one is a "bugless" requirement for the we
 
 | Decision | Choice | Why |
 | --- | --- | --- |
-| Backend | **Python ≥ 3.10, FastAPI + Uvicorn** | ML servers already run Python. Reuses Pillow and the existing format logic. `pip install` needs no Node on the server. OpenAPI comes for free. |
+| Backend | **Python ≥ 3.11, FastAPI + Uvicorn** | ML servers already run Python. Reuses Pillow and the existing format logic. `pip install` needs no Node on the server. OpenAPI comes for free. |
 | Frontend | **React + TypeScript (strict) + Vite** | Mature, large ecosystem, easy to hire for. |
 | UI primitives | **Radix UI** (shadcn/ui-style components in the repo) + **Tailwind CSS** + **lucide** icons | Focus traps, menus, popovers and dialogs are where UI bugs usually come from; Radix handles them and is accessible. |
 | State | **Zustand** (editor state), **TanStack Query** (server state), **TanStack Virtual** (100k-row lists), **Immer patches** (undo history) | Small and predictable; keeps editor state separate from cached server data. |

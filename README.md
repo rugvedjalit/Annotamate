@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/rugvedjalit/Annotamate/actions/workflows/ci.yml"><img src="https://github.com/rugvedjalit/Annotamate/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT licence"></a>
-  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10 or newer">
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11 or newer">
 </p>
 
 ---
@@ -59,7 +59,7 @@ The interface design is shown in the [annotator mockup](docs/mockups/annotator.h
 
 ## Quick start
 
-Annotamate needs Python 3.10 or newer, or Docker. The first time you open it, the browser asks you
+Annotamate needs Python 3.11 or newer, or Docker. The first time you open it, the browser asks you
 to create the administrator account. When you open it on the same machine no further proof is
 needed; from any other machine the page asks for the one-time **setup token** that the server prints
 in its console and log (for Docker: `docker compose logs annotamate` or `docker logs annotamate`).
@@ -172,7 +172,7 @@ A typical workflow:
 
 ## Development
 
-You need Python 3.10+ and Node.js 24.
+You need Python 3.11+ and Node.js 24.
 
 ```bash
 git clone https://github.com/rugvedjalit/Annotamate.git

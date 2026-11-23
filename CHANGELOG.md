@@ -16,8 +16,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-administrators (no email addresses or admin flags). Administrators keep the full record.
 - Request bodies are limited (413 `too_large`): 2 MB for ordinary routes (`ANNOTAMATE_MAX_BODY_MB`),
   64 KB for user settings, and `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for uploads. The nginx and
-  Caddy examples allow large bodies on the upload path only. `python-multipart` is now required at
-  `>=0.0.34`.
+  Caddy examples allow large bodies on the upload path only.
+- Dependency minimums exclude versions with published security advisories: Pillow 13.0,
+  Starlette 1.3.1, h11 0.16 and python-multipart 0.0.34. Python 3.11 or newer is now required
+  (3.10 reached its end of life in October 2026, and the patched Pillow and python-multipart
+  releases no longer support it).
 - Images above `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` (150) are refused when probed, uploaded or decoded;
   concurrent requests for the same thumbnail decode it once, and at most three full decodes run at
   the same time.
@@ -140,7 +143,7 @@ continue to work.
 - **`annotamate` now starts the web application** on localhost and opens the browser. The desktop
   program is still available as `annotamate desktop` with the `desktop` extra
   (`pip install "annotamate[desktop]"`).
-- Python 3.10 or newer is required.
+- Python 3.11 or newer is required.
 - Packaging moved to `pyproject.toml`; the built web interface is shipped inside the wheel.
 - Images are listed in natural order (`img2` before `img10`) instead of plain alphabetical order.
 - EXIF orientation is a project setting and is **applied by default**, which matches OpenCV and

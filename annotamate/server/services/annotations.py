@@ -6,7 +6,7 @@ import logging
 import os
 import posixpath
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -90,7 +90,7 @@ def build_doc(session: Session, paths: ProjectPaths, image: Image, label: LabelF
         updated_at = serialize.iso(current.created_at)
         updated_by = serialize.briefs(session, [current.user_id]).get(current.user_id) if current.user_id else None
     elif label.mtime is not None:
-        updated_at = serialize.iso(datetime.fromtimestamp(label.mtime, timezone.utc).replace(tzinfo=None))
+        updated_at = serialize.iso(datetime.fromtimestamp(label.mtime, UTC).replace(tzinfo=None))
         updated_by = None
     else:
         updated_at, updated_by = None, None

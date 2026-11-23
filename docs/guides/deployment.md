@@ -42,7 +42,7 @@ A few facts shape every deployment:
   Python wheel and the container image.
 - **No outbound connections.** Fonts and icons are bundled; the application works on an air-gapped network.
 
-Requirements: Python 3.10 or newer (or Docker), on Linux, macOS or Windows. Resource needs are
+Requirements: Python 3.11 or newer (or Docker), on Linux, macOS or Windows. Resource needs are
 modest; disk space for the cache grows with the number of images that have been viewed.
 
 ## 2. Choosing a setup

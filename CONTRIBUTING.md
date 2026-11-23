@@ -32,7 +32,7 @@ changing behaviour, and update it in the same pull request when the behaviour ch
 
 ## Development setup
 
-Requirements: Python 3.10 or newer, Node.js 24, Git.
+Requirements: Python 3.11 or newer, Node.js 24, Git.
 
 ```bash
 git clone https://github.com/rugvedjalit/Annotamate.git
