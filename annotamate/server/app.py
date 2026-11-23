@@ -11,6 +11,7 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -21,7 +22,8 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from annotamate import __version__
-from annotamate.core.fsutil import OutsideRootError, resolve_inside
+from annotamate.core.fsutil import OutsideRootError, recover_journals, resolve_inside
+from annotamate.core.images import configure as configure_images
 from annotamate.server.config import Settings
 from annotamate.server.context import AppContext, JobRunner
 from annotamate.server.db import Database
@@ -29,16 +31,20 @@ from annotamate.server.errors import error_body, install_error_handlers, not_fou
 from annotamate.server.models import Project, ProjectClass
 from annotamate.server.routes import api_router
 from annotamate.server.routes.auth import set_session_cookie
-from annotamate.server.security import CSRF_HEADER
+from annotamate.server.security import CSRF_HEADER, new_setup_token
+from annotamate.server.services.classes import resume_renames
 from annotamate.server.services.indexing import index_project
+from annotamate.server.services.users import user_count
 
 log = logging.getLogger("annotamate.server")
 
 CONFIG_PLACEHOLDER = "<!--annotamate:config-->"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+#: Raw size limit of ``PUT /me/settings`` (the route still checks the compact JSON size).
+MAX_SETTINGS_BODY = 64 * 1024
 CSP_TEMPLATE = (
     "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'{scripts}; "
-    "connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; base-uri 'self'; "
+    "connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; "
     "frame-ancestors 'none'; form-action 'self'"
 )
 DEFAULT_CSP = CSP_TEMPLATE.format(scripts="")
@@ -69,6 +75,76 @@ code{{background:#eef1f5;padding:.15rem .35rem;border-radius:4px}}</style></head
 <p><code>cd web &amp;&amp; npm ci &amp;&amp; npm run build</code></p>
 <p>then reload this page. The API is available under <code>{base}api/</code>.</p></body></html>
 """
+
+
+class BodyTooLargeError(BaseException):  # not an Exception: handlers that turn body errors into 400s must not catch it
+    """Raised from ``receive`` once a request body exceeds its limit."""
+
+
+class BodyLimitMiddleware:
+    """Rejects oversized request bodies with ``413 too_large``.
+
+    The limit is checked against ``Content-Length`` up front and again while the body streams in, so a
+    client cannot get past it with chunked encoding or a lying header. Uploads (``POST .../upload``) have their
+    own, larger limit; the settings endpoint a small one; everything else ``max_body_mb``.
+    """
+
+    def __init__(self, app: ASGIApp, settings: Settings) -> None:
+        self.app = app
+        self.settings = settings
+        prefix = re.escape(settings.api_prefix)
+        self._upload = re.compile(rf"^{prefix}/projects/\d+/upload/?$")
+        self._settings_path = f"{settings.api_prefix}/me/settings"
+
+    def limit_for(self, scope: Scope) -> int:
+        path, method = scope["path"], scope["method"]
+        if method == "POST" and self._upload.match(path):
+            return self.settings.max_upload_request_bytes
+        if method == "PUT" and path == self._settings_path:
+            return MAX_SETTINGS_BODY
+        return self.settings.max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
+            await self.app(scope, receive, send)
+            return
+        limit = self.limit_for(scope)
+        declared = Headers(scope=scope).get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) > limit:
+            await self._reject(scope, receive, send, limit)
+            return
+        received = 0
+        started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise BodyTooLargeError
+            return message
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except BodyTooLargeError:
+            if started:
+                raise
+            await self._reject(scope, receive, send, limit)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send, limit: int) -> None:
+        size = f"{limit // (1024 * 1024)} MB" if limit >= 1024 * 1024 else f"{limit // 1024} KB"
+        detail = f"The request is larger than the {size} limit."
+        response = JSONResponse(error_body(413, detail, "too_large"), status_code=413,
+                                headers={"Connection": "close"})
+        await response(scope, receive, send)
 
 
 class HttpMiddleware:
@@ -139,7 +215,8 @@ class SpaRenderer:
             html = html.replace("</head>", f"{script}</head>", 1)
         if "<base " not in html.lower():
             # Relative asset URLs ("./assets/...") must resolve from the base URL on deep client-side routes.
-            html = _HEAD_TAG.sub(lambda m: f'{m.group(0)}<base href="{self.base_url}">', html, count=1)
+            base = escape(self.base_url, quote=True)
+            html = _HEAD_TAG.sub(lambda m: f'{m.group(0)}<base href="{base}">', html, count=1)
         hashes = []
         for body in _INLINE_SCRIPT.findall(html):
             digest = base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode("ascii")
@@ -226,9 +303,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the application. The database is migrated to the latest schema before this returns."""
     settings = settings or Settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    for restored in recover_journals(str(settings.journal_dir)):
+        log.warning("Rolled back an interrupted label rewrite: restored %s", restored)
+    configure_images(max_megapixels=settings.max_image_megapixels)
     db = Database(settings.db_url)
     db.migrate()
     ctx = AppContext(settings, db)
+    with db.session() as session:
+        if user_count(session) == 0:
+            ctx.setup_token = new_setup_token()
+            log.warning("\n%s\n  FIRST-RUN SETUP TOKEN: %s\n  Enter it on the setup page to create the administrator "
+                        "(not needed when you open the page on this machine).\n%s",
+                        "=" * 72, ctx.setup_token, "=" * 72)
     db.publish = lambda items: ctx.hub.publish(items)
 
     @asynccontextmanager
@@ -239,6 +325,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         quiet_connection_resets(loop)
         ctx.hub.start(loop)
         await run_in_threadpool(_resume_indexing, ctx)
+        await run_in_threadpool(resume_renames, ctx)
         try:
             yield
         finally:
@@ -257,5 +344,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_error_handlers(app)
     app.include_router(api_router(), prefix=settings.api_prefix)
     _install_spa(app, settings)
+    app.add_middleware(BodyLimitMiddleware, settings=settings)
     app.add_middleware(HttpMiddleware, settings=settings)
     return app

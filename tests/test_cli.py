@@ -194,6 +194,7 @@ def test_serve_on_all_interfaces_warns(tmp_path, data_dir, capsys, fake_uvicorn)
     out, err = capsys.readouterr()
     assert "http://localhost:8799/sub/" in out
     assert "No accounts yet" in out
+    assert "Setup token" in out and fake_uvicorn[0].app.state.ctx.setup_token in out
     assert "WARNING" in err
     assert "--secure-cookies" in err
     (config,) = fake_uvicorn
@@ -232,3 +233,8 @@ def test_environment_settings_are_used(tmp_path, data_dir, monkeypatch, capsys, 
     assert settings.data_dir == data_dir
     assert len(settings.roots) == 2
     capsys.readouterr()
+
+
+def test_serve_rejects_an_invalid_base_url(tmp_path, data_dir, capsys, fake_uvicorn):
+    assert run("serve", "--data-dir", str(data_dir), "--root", str(tmp_path), "--base-url", '/a"><script>/') == 2
+    assert "base_url" in capsys.readouterr().err and fake_uvicorn == []

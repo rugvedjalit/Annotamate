@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from annotamate.server.deps import DB, Access, Ctx
 from annotamate.server.models import Comment as CommentRow
+from annotamate.server.models import Image
 from annotamate.server.schemas import Comment, CommentCreate, CommentPage, CommentPatch
 from annotamate.server.services import comments as svc
 from annotamate.server.services import serialize
@@ -50,7 +51,9 @@ def delete_comment(cid: int, access: Access, db: DB) -> Response:
 @router.get("/projects/{pid}/comments", response_model=CommentPage)
 def project_comments(access: Access, db: DB, resolved: bool | None = None, before_id: int | None = None,
                      limit: Annotated[int, Query(ge=1, le=200)] = 50) -> dict:
-    query = select(CommentRow).where(CommentRow.project_id == access.project.id, CommentRow.deleted.is_(False))
+    query = (select(CommentRow).join(Image, Image.id == CommentRow.image_id)
+             .where(CommentRow.project_id == access.project.id, CommentRow.deleted.is_(False),
+                    Image.missing.is_(False)))
     if resolved is not None:
         query = query.where(CommentRow.resolved.is_(resolved))
     rows, has_more = page(query, CommentRow.id, before_id, limit, db)

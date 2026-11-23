@@ -47,7 +47,7 @@ def post_chat(session: Session, access: ProjectAccess, body: str, image_id: int 
     project, user = access.project, access.user
     if image_id is not None:
         image = session.get(Image, image_id)
-        if image is None or image.project_id != project.id:
+        if image is None or image.project_id != project.id or image.missing:
             raise bad_request("The shared image is not part of this project.")
     mentions = notify.parse_mentions(session, body, project_id=project.id)
     message = ChatMessage(project_id=project.id, user_id=user.id, body=body, image_id=image_id, mentions=mentions)

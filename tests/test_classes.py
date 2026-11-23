@@ -196,3 +196,86 @@ def test_invalid_strategy(admin, create_project, dataset):
                         params={"strategy": "nuke"}).status_code == 422
     assert admin.delete(f"/api/projects/{project['id']}/classes/{cid}").json() == {"rewritten_files": 0}
     assert admin.get(f"/api/projects/{project['id']}/classes").json() == []
+
+
+# ------------------------------------------------------------------------------ all-or-nothing rewrites
+
+
+def _hidden(folder):
+    return sorted(p.name for p in folder.iterdir() if p.name.endswith((".tmp", ".bak")))
+
+
+def test_failed_delete_rolls_everything_back_and_a_retry_works(admin, app, create_project, root, monkeypatch):
+    from annotamate.core import fsutil
+
+    folder, project = _yolo_project(create_project, root)
+    pid = project["id"]
+    a, b, _c = project["classes"]
+    before = {n: (folder / n).read_text() for n in ("i1.txt", "i2.txt", "i3.txt")}
+    real = fsutil._replace
+
+    def flaky(src, dst):
+        if dst.endswith("i3.txt") and src.endswith(".tmp"):
+            raise PermissionError(13, "file in use", dst)
+        real(src, dst)
+
+    monkeypatch.setattr(fsutil, "_replace", flaky)
+    response = admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
+                            params={"strategy": "merge", "merge_into": b["id"]})
+    assert response.status_code == 400 and "Nothing was changed" in response.json()["detail"]
+    assert {n: (folder / n).read_text() for n in before} == before
+    assert _hidden(folder) == []
+    assert [c_["name"] for c_ in admin.get(f"/api/projects/{pid}").json()["classes"]] == ["a", "b", "c"]
+    monkeypatch.setattr(fsutil, "_replace", real)
+    retry = admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
+                         params={"strategy": "merge", "merge_into": b["id"]})
+    assert retry.status_code == 200
+    assert (folder / "i1.txt").read_text() == "0 0.5 0.5 0.1 0.1\n1 0.2 0.2 0.1 0.1\n"
+
+
+def test_failed_rollback_is_reported_honestly(admin, create_project, root, monkeypatch):
+    from annotamate.core import fsutil
+
+    folder, project = _yolo_project(create_project, root)
+    pid = project["id"]
+    a, b, _c = project["classes"]
+    real = fsutil._replace
+
+    def flaky(src, dst):
+        if dst.endswith("i3.txt") and src.endswith(".tmp"):
+            raise PermissionError(13, "file in use", dst)
+        if dst.endswith("i1.txt") and src.endswith(".bak"):
+            raise PermissionError(13, "file in use", dst)
+        real(src, dst)
+
+    monkeypatch.setattr(fsutil, "_replace", flaky)
+    response = admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
+                            params={"strategy": "merge", "merge_into": b["id"]})
+    assert response.status_code == 500
+    body = response.json()
+    assert body["code"] == "migration_incomplete" and [f.endswith("i1.txt") for f in body["files"]] == [True]
+    assert any(n.endswith(".bak") for n in _hidden(folder))
+
+
+def test_startup_rolls_back_an_interrupted_rewrite(tmp_path, settings, root):
+    import json as _json
+
+    from annotamate.server import create_app
+
+    folder = root / "crashed"
+    folder.mkdir()
+    target = folder / "x.txt"
+    target.write_text("half-migrated")
+    bak = folder / ".x.txt.aa.bak"
+    bak.write_text("original")
+    tmp = folder / ".x.txt.aa.tmp"
+    tmp.write_text("new")
+    import hashlib
+
+    settings.journal_dir.mkdir(parents=True)
+    entry = {"path": str(target), "tmp": str(tmp), "bak": str(bak),
+             "old": hashlib.sha256(b"original").hexdigest(), "new": hashlib.sha256(b"half-migrated").hexdigest()}
+    (settings.journal_dir / "label-rewrite-1.json").write_text(_json.dumps({"files": [entry]}))
+    create_app(settings)
+    assert target.read_text() == "original"
+    assert _hidden(folder) == [] and not list(settings.journal_dir.iterdir())

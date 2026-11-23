@@ -81,6 +81,9 @@ def get_comment(session: Session, project_id: int, comment_id: int) -> Comment:
     comment = session.get(Comment, comment_id)
     if comment is None or comment.project_id != project_id:
         raise not_found("Comment not found.")
+    image = session.get(Image, comment.image_id)
+    if image is None or image.missing:  # hidden with its image until the file is back
+        raise not_found("Comment not found.")
     return comment
 
 

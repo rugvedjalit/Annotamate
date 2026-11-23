@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from annotamate.server.models import Activity, Image, ImageClassCount, ProjectClass, ProjectMember, utcnow
@@ -17,18 +17,21 @@ DAYS = 30
 
 def project_stats(session: Session, project_id: int, tz_offset_minutes: int = 0) -> dict[str, Any]:
     """Aggregates for the overview. ``tz_offset_minutes`` (east of UTC) sets the viewer's calendar days."""
+    live = Image.missing.is_(False)
     status_counts = dict.fromkeys(STATUSES, 0)
-    for status, n in session.execute(select(Image.status, func.count()).where(Image.project_id == project_id)
+    for status, n in session.execute(select(Image.status, func.count()).where(Image.project_id == project_id, live)
                                      .group_by(Image.status)):
         status_counts[status] = n
     boxes_total = session.scalar(select(func.coalesce(func.sum(Image.box_count), 0))
-                                 .where(Image.project_id == project_id)) or 0
+                                 .where(Image.project_id == project_id, live)) or 0
 
     class_counts = [
         {"class_id": cid, "boxes": int(boxes or 0), "images": int(images or 0)}
         for cid, boxes, images in session.execute(
-            select(ProjectClass.id, func.sum(ImageClassCount.count), func.count(ImageClassCount.image_id))
+            select(ProjectClass.id, func.sum(case((Image.id.is_not(None), ImageClassCount.count), else_=0)),
+                   func.count(Image.id))
             .outerjoin(ImageClassCount, ImageClassCount.class_id == ProjectClass.id)
+            .outerjoin(Image, and_(Image.id == ImageClassCount.image_id, live))
             .where(ProjectClass.project_id == project_id)
             .group_by(ProjectClass.id, ProjectClass.position).order_by(ProjectClass.position)
         )
@@ -50,7 +53,7 @@ def project_stats(session: Session, project_id: int, tz_offset_minutes: int = 0)
         bucket(uid)["saves"] = int(n or 0)
     for uid, n in session.execute(
         select(Image.last_editor_id, func.sum(Image.box_count)).where(
-            Image.project_id == project_id, Image.last_editor_id.is_not(None)).group_by(Image.last_editor_id)
+            Image.project_id == project_id, live, Image.last_editor_id.is_not(None)).group_by(Image.last_editor_id)
     ):
         bucket(uid)["boxes"] = int(n or 0)
     status_events = (Activity.project_id == project_id, Activity.type == "status_changed")

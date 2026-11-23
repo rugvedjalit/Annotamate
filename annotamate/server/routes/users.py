@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from annotamate.server.deps import DB, AdminUser, Ctx, CurrentUser
 from annotamate.server.errors import bad_request, forbidden, not_found
 from annotamate.server.models import ProjectMember, User
-from annotamate.server.schemas import AdminPassword, UserCreate, UserPatch, UserWithOnline
+from annotamate.server.schemas import AdminPassword, UserBriefWithOnline, UserCreate, UserPatch, UserWithOnline
 from annotamate.server.schemas import User as UserOut
 from annotamate.server.security import hash_password
 from annotamate.server.services import serialize
@@ -15,8 +15,9 @@ from annotamate.server.services.users import create_user, revoke_sessions
 router = APIRouter(tags=["users"])
 
 
-@router.get("/users", response_model=list[UserWithOnline])
+@router.get("/users", response_model=list[UserWithOnline] | list[UserBriefWithOnline])
 def list_users(user: CurrentUser, ctx: Ctx, db: DB, include_inactive: bool = False) -> list[dict]:
+    """Administrators get every field; everyone else gets ``id, username, display_name, avatar_color, online``."""
     if include_inactive and not user.is_admin:
         raise forbidden("Only administrators can list deactivated accounts.")
     query = select(User)
@@ -24,7 +25,9 @@ def list_users(user: CurrentUser, ctx: Ctx, db: DB, include_inactive: bool = Fal
         query = query.where(User.is_active.is_(True))
     online = set(ctx.hub.online_user_ids())
     rows = db.scalars(query.order_by(func.lower(User.display_name), User.id))
-    return [serialize.user_out(u, online=u.id in online) for u in rows]
+    if user.is_admin:
+        return [serialize.user_out(u, online=u.id in online) for u in rows]
+    return [serialize.user_brief_out(u, u.id in online) for u in rows]
 
 
 @router.post("/users", response_model=UserOut)

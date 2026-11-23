@@ -125,7 +125,7 @@ def test_rescan_adds_and_removes(admin, app, create_project, dataset):
     items = images_of(admin, pid)
     assert [i["filename"] for i in items] == ["img1.jpg", "img2.jpg", "img3.jpg"]
     assert items[0]["id"] == keep["id"] and items[0]["comment_count"] == 1
-    assert items[1]["status"] == "done" and items[1]["box_count"] == 1  # label appeared: todo -> done
+    assert items[1]["status"] == "todo" and items[1]["box_count"] == 1  # workflow status is never changed by a rescan
     activity = admin.get(f"/api/projects/{pid}/activity").json()["items"]
     rescanned = next(a for a in activity if a["type"] == "rescanned")
     assert rescanned["data"] == {"added": 1, "removed": 1, "total": 3}
@@ -158,9 +158,9 @@ def test_project_list_and_summary(admin, make_user, create_project, dataset, roo
     summaries = bob.get("/api/projects").json()
     assert len(summaries) == 1
     summary = summaries[0]
-    assert set(summary) == {"id", "name", "description", "label_format", "image_count", "status_counts",
-                            "member_count", "my_role", "my_assigned_todo", "unread_chat", "archived", "indexing",
-                            "created_at", "updated_at", "members_preview"}
+    assert set(summary) == {"id", "name", "description", "label_format", "image_count", "missing_count",
+                            "status_counts", "member_count", "my_role", "my_assigned_todo", "unread_chat",
+                            "archived", "indexing", "created_at", "updated_at", "members_preview"}
     assert summary["my_role"] == "annotator" and summary["member_count"] == 2
     # Card avatars without one /members request per card: managers first, then by name.
     assert [u["username"] for u in summary["members_preview"]] == ["admin", "bob"]

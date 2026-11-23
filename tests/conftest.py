@@ -127,8 +127,10 @@ def login(client: TestClient, username: str, password: str = PASSWORD) -> ApiUse
 @pytest.fixture
 def admin(client: TestClient) -> ApiUser:
     client.cookies.clear()
+    # The test client is not a loopback address, so the one-time setup token printed at start-up is required.
     response = client.post("/api/auth/setup", json={"username": "admin", "display_name": "Ada Admin",
-                                                    "password": PASSWORD}, headers=CSRF)
+                                                    "password": PASSWORD,
+                                                    "setup_token": client.app.state.ctx.setup_token}, headers=CSRF)
     assert response.status_code == 200, response.text
     token = response.cookies[SESSION_COOKIE]
     client.cookies.clear()

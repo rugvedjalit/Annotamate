@@ -49,6 +49,11 @@ def user_out(user: User, online: bool | None = None) -> Json:
     return out
 
 
+def user_brief_out(user: User, online: bool) -> Json:
+    """What any signed-in user may see of another account: no email, no admin flag."""
+    return {**brief(user), "online": online}
+
+
 def briefs(session: Session, ids: Iterable[int | None]) -> dict[int, Json]:
     wanted = {i for i in ids if i is not None}
     if not wanted:
@@ -68,7 +73,8 @@ def image_refs(session: Session, ids: Iterable[int | None]) -> dict[int, Json]:
     wanted = {i for i in ids if i is not None}
     if not wanted:
         return {}
-    rows = session.execute(select(Image.id, Image.filename).where(Image.id.in_(wanted)))
+    # Missing images are left out, so chat, activity and notifications show them like deleted ones (no link).
+    rows = session.execute(select(Image.id, Image.filename).where(Image.id.in_(wanted), Image.missing.is_(False)))
     return {r.id: {"id": r.id, "filename": r.filename} for r in rows}
 
 

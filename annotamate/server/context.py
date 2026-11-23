@@ -112,10 +112,17 @@ class AppContext:
     label_locks: LabelLocks = field(default_factory=LabelLocks)
     progress: dict[int, IndexProgress] = field(default_factory=dict)
     class_epochs: dict[int, int] = field(default_factory=dict)
+    #: Failed attempts of a project's pending VOC/COCO rename job (drives the retry back-off).
+    rename_retries: dict[int, int] = field(default_factory=dict)
+    #: One-time token required for the first-run setup from non-loopback clients (``None`` once accounts exist).
+    setup_token: str | None = None
+    #: Serialises the first-run setup so two concurrent requests cannot both create an administrator.
+    setup_lock: threading.Lock = field(default_factory=threading.Lock)
     thumbs: DiskCache = field(init=False)
     renders: DiskCache = field(init=False)
 
     def __post_init__(self) -> None:
+        self.limiter.max_ip_failures = self.settings.login_ip_limit
         cache = self.settings.cache_dir
         limit = self.settings.cache_max_mb * 1024 * 1024
         self.thumbs = DiskCache(str(cache / "thumbs"), limit)

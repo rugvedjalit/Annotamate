@@ -91,7 +91,7 @@ def test_csp_allows_exactly_the_inline_scripts(tmp_path, static_dir):
     assert "'self'" in script_src
     csp = response.headers["content-security-policy"]
     assert "img-src 'self' blob: data:" in csp
-    assert "connect-src 'self' ws: wss:" in csp
+    assert "connect-src 'self';" in csp
 
 
 def test_static_files_and_cache_headers(tmp_path, static_dir):
@@ -180,7 +180,8 @@ def test_base_url_prefixes_everything(tmp_path, static_dir):
 
 def test_base_url_cookie_csrf_and_websocket(tmp_path, static_dir):
     with spa_client(tmp_path, static_dir, base_url="/x/") as client:
-        body = {"username": "admin", "display_name": "Admin", "password": PASSWORD}
+        body = {"username": "admin", "display_name": "Admin", "password": PASSWORD,
+                "setup_token": client.app.state.ctx.setup_token}
         refused = client.post("/x/api/auth/setup", json=body)
         assert refused.status_code == 403
         assert refused.json()["code"] == "csrf"
@@ -207,7 +208,8 @@ def test_secure_cookies_flag(tmp_path, static_dir):
     settings = Settings(data_dir=tmp_path / "data", roots=[str(tmp_path)], secure_cookies=True, static_dir=static_dir)
     with TestClient(create_app(settings)) as client:
         response = client.post("/api/auth/setup", headers=CSRF,
-                               json={"username": "admin", "display_name": "Admin", "password": PASSWORD})
+                               json={"username": "admin", "display_name": "Admin", "password": PASSWORD,
+                                     "setup_token": client.app.state.ctx.setup_token})
         assert "Secure" in response.headers["set-cookie"]
 
 
@@ -248,3 +250,18 @@ def test_http_errors_use_the_uniform_body(client):
     wrong_method = client.delete("/api/health", headers=CSRF)
     assert wrong_method.status_code == 405
     assert wrong_method.json()["code"] == "method_not_allowed"
+
+
+# ------------------------------------------------------------------------------------------- base URL checks
+
+
+@pytest.mark.parametrize("value", ['/a"><script>/', "/a b/", "/a?x=1/", "/a/../b/", "/a/./b/", "/a\b/", "/é/"])
+def test_invalid_base_urls_are_rejected_at_startup(tmp_path, value):
+    with pytest.raises(ValueError, match="base_url"):
+        Settings(data_dir=tmp_path / "d", roots=[str(tmp_path)], base_url=value)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("", "/"), ("/", "/"), ("x", "/x/"), ("/a/b", "/a/b/"),
+                                                 ("/A_b.c-d~e/", "/A_b.c-d~e/")])
+def test_valid_base_urls_are_normalised(tmp_path, value, expected):
+    assert Settings(data_dir=tmp_path / "d", roots=[str(tmp_path)], base_url=value).base_url == expected

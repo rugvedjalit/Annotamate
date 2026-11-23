@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import sys
 
 from annotamate.core.classes import CLASSES_FILENAME
 from annotamate.core.formats import EXTENSIONS
@@ -30,6 +31,28 @@ def resolve_in_roots(settings: Settings, path: str, *, what: str = "Folder") -> 
         except OutsideRootError:
             continue
     raise bad_request(f"{what} is outside the folders this server may access.")
+
+
+#: A YOLO image named ``classes.<ext>`` would map onto ``classes.txt``, the class list.
+RESERVED_YOLO_KEY = "classes"
+
+
+#: Windows and macOS file systems ignore case by default: there ``A.txt`` and ``a.txt`` are one file.
+#: Elsewhere (Linux) they are two files, so case must not be folded or distinct images would collide.
+CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
+
+
+def fold_case(path: str) -> str:
+    """``path`` as the file system compares names (case-folded only where case is ignored)."""
+    return path.casefold() if CASE_INSENSITIVE_FS else path
+
+
+def label_key(rel_path: str) -> str:
+    """Image path without extension, as the file system compares it: images with one key share a label file.
+
+    ``a.jpg`` and ``a.png`` always collide; ``A.jpg`` and ``a.jpg`` only on case-insensitive file systems.
+    """
+    return fold_case(posixpath.splitext(rel_path)[0])
 
 
 class ProjectPaths:
@@ -64,4 +87,5 @@ class ProjectPaths:
         return resolve_inside(self.label_root, self.label_rel(rel_path))
 
     def classes_file(self) -> str:
-        return os.path.join(self.label_root, CLASSES_FILENAME)
+        """Real path of ``classes.txt``; raises ``OutsideRootError`` when it resolves outside the label folder."""
+        return resolve_inside(self.label_root, CLASSES_FILENAME)

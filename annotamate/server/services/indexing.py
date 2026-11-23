@@ -22,7 +22,7 @@ from annotamate.server.errors import ApiError
 from annotamate.server.models import Image, ImageClassCount, Project, ProjectClass, utcnow
 from annotamate.server.services import notify
 from annotamate.server.services.labels import ClassTable, load_class_table, sync_classes_file
-from annotamate.server.services.paths import ProjectPaths
+from annotamate.server.services.paths import RESERVED_YOLO_KEY, ProjectPaths, label_key
 
 log = logging.getLogger("annotamate.indexing")
 
@@ -111,10 +111,24 @@ def counts_for(table: ClassTable, parsed: ParsedLabel) -> tuple[dict[int, int], 
     return per_class, unknown, sum(parsed.labels.values())
 
 
+def label_owners(rel_paths: list[str], fmt: str) -> dict[str, str]:
+    """``label key -> rel path`` of the image that owns each label file: the first in natural order.
+
+    ``rel_paths`` must be in natural order. For YOLO the key ``classes`` (``classes.txt``) has no owner.
+    """
+    owners: dict[str, str] = {}
+    for rel in rel_paths:
+        owners.setdefault(label_key(rel), rel)
+    if fmt == "yolo":
+        owners.pop(RESERVED_YOLO_KEY, None)
+    return owners
+
+
 def renumber(session: Session, project_id: int) -> None:
     """Make ``sort_index`` the 0-based natural-sort position of every image in the project."""
-    rows = session.execute(select(Image.id, Image.rel_path, Image.sort_index).where(Image.project_id == project_id))
-    ordered = sorted(rows, key=lambda r: natural_key(r.rel_path))
+    rows = session.execute(select(Image.id, Image.rel_path, Image.sort_index, Image.missing)
+                           .where(Image.project_id == project_id))
+    ordered = sorted(rows, key=lambda r: (r.missing, natural_key(r.rel_path)))
     changes = [{"_id": r.id, "_pos": pos} for pos, r in enumerate(ordered) if r.sort_index != pos]
     stmt = update(Image).where(Image.id == bindparam("_id")).values(sort_index=bindparam("_pos"))
     for start in range(0, len(changes), BATCH):
@@ -229,7 +243,11 @@ class Indexer:
         """Create classes from ``classes.txt`` or, for VOC/COCO, from the label files themselves."""
         if session.scalar(select(ProjectClass.id).where(ProjectClass.project_id == project.id).limit(1)):
             return
-        names = read_classes(paths.classes_file()) or []
+        try:
+            names = read_classes(paths.classes_file()) or []
+        except OutsideRootError:
+            log.warning("Project %s: classes.txt resolves outside the label folder; ignored", project.id)
+            names = []
         from_file = bool(names)
         if not names and not uses_class_index(project.label_format):
             seen: dict[str, None] = {}
@@ -250,7 +268,7 @@ class Indexer:
             try:
                 sync_classes_file(paths, table)
             except OSError:
-                log.warning("Could not write %s", paths.classes_file())
+                log.warning("Could not write classes.txt for project %s", project.id)
 
     def _sync(self, session: Session, result: ScanResult, parsed: dict[str, ParsedLabel], table: ClassTable,
               pre_ids: set[int], started: datetime) -> tuple[int, int]:
@@ -258,7 +276,7 @@ class Indexer:
         existing = {
             r.rel_path: r for r in session.execute(
                 select(Image.id, Image.rel_path, Image.status, Image.has_label, Image.box_count, Image.unknown_count,
-                       Image.updated_at).where(Image.project_id == self.project_id)
+                       Image.updated_at, Image.missing, Image.label_key).where(Image.project_id == self.project_id)
             )
         }
         old_counts: dict[int, dict[int, int]] = {}
@@ -271,15 +289,18 @@ class Indexer:
         new_rows: list[dict] = []
         new_counts: dict[str, dict[int, int]] = {}
         updates: list[dict] = []
-        now_done: list[int] = []
         count_changes: dict[int, dict[int, int]] = {}
+        owners = label_owners(rel_paths, table.fmt)
         for position, rel in enumerate(rel_paths):
-            item = parsed[rel]
+            key = label_key(rel)
+            # Sharing a label file with an earlier image (or the reserved name) means no labels of its own.
+            item = parsed[rel] if owners.get(key) == rel else ParsedLabel(False, Counter(), [])
             per_class, unknown, boxes = counts_for(table, item)
             row = existing.get(rel)
             if row is None:
                 new_rows.append({
                     "project_id": self.project_id, "rel_path": rel, "filename": posixpath.basename(rel),
+                    "label_key": key, "missing": False,
                     "sort_index": position, "status": "done" if item.has_label else "todo",
                     "has_label": item.has_label, "box_count": boxes, "unknown_count": unknown, "flagged": False,
                     "comment_count": 0, "open_comment_count": 0,
@@ -287,26 +308,29 @@ class Indexer:
                 if per_class:
                     new_counts[rel] = per_class
                 continue
-            if row.updated_at is not None and row.updated_at >= started:
+            if row.updated_at is not None and row.updated_at >= started and not row.missing:
                 continue  # saved while we were scanning: the save already stored fresh counts
-            if (row.has_label, row.box_count, row.unknown_count) != (item.has_label, boxes, unknown):
-                updates.append({"_id": row.id, "_has": item.has_label, "_boxes": boxes, "_unknown": unknown})
-            if row.status == "todo" and item.has_label:
-                now_done.append(row.id)
+            if ((row.has_label, row.box_count, row.unknown_count, row.label_key, row.missing)
+                    != (item.has_label, boxes, unknown, key, False)):
+                updates.append({"_id": row.id, "_has": item.has_label, "_boxes": boxes, "_unknown": unknown,
+                                "_key": key})
             if old_counts.get(row.id, {}) != per_class:
                 count_changes[row.id] = per_class
 
         on_disk = set(rel_paths)
         unreadable = tuple(result.unreadable)
         stale = [r.id for rel, r in existing.items()
-                 if rel not in on_disk and r.id in pre_ids and not (unreadable and rel.startswith(unreadable))]
+                 if rel not in on_disk and r.id in pre_ids and not r.missing
+                 and not (unreadable and rel.startswith(unreadable))]
         if not rel_paths and stale:
             # e.g. an unmounted network share: never wipe comments, revisions and statuses
             log.warning("Project %s: the image folder looks empty; keeping %d indexed images", self.project_id,
                         len(stale))
             stale = []
         for start in range(0, len(stale), BATCH):
-            session.execute(delete(Image).where(Image.id.in_(stale[start:start + BATCH])))
+            # Soft delete: comments, revisions and workflow state survive a temporarily missing file.
+            session.execute(update(Image).where(Image.id.in_(stale[start:start + BATCH])).values(missing=True)
+                            .execution_options(synchronize_session=False))
 
         for start in range(0, len(new_rows), BATCH):
             chunk = new_rows[start:start + BATCH]
@@ -320,13 +344,9 @@ class Indexer:
         if updates:
             stmt = (update(Image).where(Image.id == bindparam("_id"))
                     .values(has_label=bindparam("_has"), box_count=bindparam("_boxes"),
-                            unknown_count=bindparam("_unknown")))
+                            unknown_count=bindparam("_unknown"), label_key=bindparam("_key"), missing=False))
             for start in range(0, len(updates), BATCH):
                 session.connection().execute(stmt, updates[start:start + BATCH])
-        for start in range(0, len(now_done), BATCH):
-            # conditional, so a status change committed since the rows were read is never overwritten
-            session.execute(update(Image).where(Image.id.in_(now_done[start:start + BATCH]), Image.status == "todo")
-                            .values(status="done").execution_options(synchronize_session=False))
         for image_id, per_class in count_changes.items():
             replace_class_counts(session, image_id, per_class)
         return len(new_rows), len(stale)

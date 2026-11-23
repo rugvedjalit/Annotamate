@@ -351,6 +351,7 @@ class Hub:
         assert project_id is not None
         now = time.monotonic()
         revoked: Connection | None = None
+        dropped: list[EditLock] = []
         with self._mutex:
             lock = self._locks.get(image_id)
             if lock is not None and lock.expires_at <= now:
@@ -366,6 +367,13 @@ class Hub:
                 holder = dict(lock.conn.brief)
                 self._enqueue(conn, {"type": "lock.denied", "image_id": image_id, "holder": holder})
                 return
+            # One edit lock per connection: taking a new one lets go of any other, so a script cannot
+            # lock a whole project.
+            dropped = [lk for lk in self._locks.values() if lk.conn is conn and lk.image_id != image_id]
+            for other in dropped:
+                del self._locks[other.image_id]
+        for other in dropped:
+            self._lock_state(other.project_id, other.image_id, None)
         if revoked is not None:
             self._enqueue(revoked, {"type": "lock.revoked", "image_id": image_id, "by": dict(conn.brief)})
         self._enqueue(conn, {"type": "lock.granted", "image_id": image_id})
@@ -402,6 +410,7 @@ class Hub:
             for lock in expired:
                 del self._locks[lock.image_id]
         for lock in expired:
+            self._enqueue(lock.conn, {"type": "lock.expired", "image_id": lock.image_id})
             self._lock_state(lock.project_id, lock.image_id, None)
 
     async def _sweep_forever(self) -> None:

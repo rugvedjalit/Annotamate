@@ -6,7 +6,7 @@ import logging
 import os
 from typing import Any
 
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.orm import Session
 
 from annotamate.core.classes import next_color
@@ -61,9 +61,12 @@ def summaries(ctx: AppContext, session: Session, projects: list[Project], user: 
     ids = [p.id for p in projects]
     if not ids:
         return []
+    live = Image.missing.is_(False)
+    missing = dict(session.execute(select(Image.project_id, func.count()).where(
+        Image.project_id.in_(ids), Image.missing.is_(True)).group_by(Image.project_id)).all())
     counts: dict[int, dict[str, int]] = {pid: dict.fromkeys(STATUSES, 0) for pid in ids}
     for pid, status, n in session.execute(
-        select(Image.project_id, Image.status, func.count()).where(Image.project_id.in_(ids))
+        select(Image.project_id, Image.status, func.count()).where(Image.project_id.in_(ids), live)
         .group_by(Image.project_id, Image.status)
     ):
         counts[pid][status] = n
@@ -72,7 +75,7 @@ def summaries(ctx: AppContext, session: Session, projects: list[Project], user: 
     roles = dict(session.execute(select(ProjectMember.project_id, ProjectMember.role).where(
         ProjectMember.project_id.in_(ids), ProjectMember.user_id == user.id)).all())
     assigned = dict(session.execute(select(Image.project_id, func.count()).where(
-        Image.project_id.in_(ids), Image.assignee_id == user.id, Image.status != "done")
+        Image.project_id.in_(ids), live, Image.assignee_id == user.id, Image.status != "done")
         .group_by(Image.project_id)).all())
     unread = dict(session.execute(
         select(ChatMessage.project_id, func.count())
@@ -88,6 +91,7 @@ def summaries(ctx: AppContext, session: Session, projects: list[Project], user: 
             "description": p.description,
             "label_format": p.label_format,
             "image_count": sum(counts[p.id].values()),
+            "missing_count": missing.get(p.id, 0),
             "status_counts": counts[p.id],
             "member_count": members.get(p.id, 0),
             "my_role": roles.get(p.id),
@@ -130,11 +134,12 @@ def members_out(session: Session, project_id: int, user_ids: list[int] | None = 
         query = query.where(ProjectMember.user_id.in_(user_ids))
     rows = session.execute(query).all()
     ids = [m.user_id for m, _ in rows]
+    live = Image.missing.is_(False)
     assigned = dict(session.execute(select(Image.assignee_id, func.count()).where(
-        Image.project_id == project_id, Image.assignee_id.in_(ids)).group_by(Image.assignee_id)).all()) \
+        Image.project_id == project_id, live, Image.assignee_id.in_(ids)).group_by(Image.assignee_id)).all()) \
         if ids else {}
     done = dict(session.execute(select(Image.done_by_id, func.count()).where(
-        Image.project_id == project_id, Image.done_by_id.in_(ids), Image.status.in_(("done", "review")))
+        Image.project_id == project_id, live, Image.done_by_id.in_(ids), Image.status.in_(("done", "review")))
         .group_by(Image.done_by_id)).all()) if ids else {}
     out = [
         {"user": serialize.brief(u), "role": m.role, "joined_at": serialize.iso(m.joined_at),
@@ -215,6 +220,21 @@ def create_project(ctx: AppContext, session: Session, creator: User, body: Proje
     session.commit()
     index_project(ctx, project.id, discover_classes=class_names is None)
     return project
+
+
+def prune_missing(ctx: AppContext, session: Session, access: ProjectAccess) -> int:
+    """Permanently delete the index rows (and their comments, revisions, ...) of images whose file is gone."""
+    access.require_manage()
+    project = access.project
+    with ctx.label_locks(project.id):
+        removed = session.execute(delete(Image).where(Image.project_id == project.id, Image.missing.is_(True))
+                                  .execution_options(synchronize_session=False)).rowcount or 0
+        if removed:
+            emit(session, ("project", project.id), {"type": "images.bulk_updated", "project_id": project.id,
+                                                    "count": removed})
+            emit(session, ("project", project.id), {"type": "project.updated", "project_id": project.id})
+        session.commit()
+    return removed
 
 
 def update_project(ctx: AppContext, session: Session, access: ProjectAccess, body: ProjectPatch) -> None:

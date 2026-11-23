@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -591,3 +592,68 @@ def test_member_events_and_bulk_updates(client, team):
         assert event == {"type": "images.bulk_updated", "project_id": team.pid, "count": 2}
         team.manager.patch(f"/api/projects/{team.pid}", json={"description": "new"})
         assert receive_until(ws, "project.updated")["project_id"] == team.pid
+
+
+# ------------------------------------------------------------------------- one lock per connection
+
+
+def test_acquiring_a_second_lock_releases_the_first(client, team):
+    hub = team.admin.client.app.state.ctx.hub
+    first, second = team.images[0], team.images[1]
+    with team.alice.ws() as w1, team.bob.ws() as w2:
+        hello(w1)
+        hello(w2)
+        subscribe(w1, team.pid)
+        subscribe(w2, team.pid)
+        assert acquire(w1, first)["type"] == "lock.granted"
+        receive_until(w2, "lock.state", holder_is(team.alice))
+        assert acquire(w1, second)["type"] == "lock.granted"
+        released = receive_until(w2, "lock.state", lambda m: m["image_id"] == first and m["holder"] is None)
+        assert released["project_id"] == team.pid
+        assert hub.lock_holder(first) is None and hub.lock_holder(second)[0] == team.alice.id
+        # a denied request keeps the lock the connection already holds
+        assert acquire(w2, second)["type"] == "lock.denied"
+        assert acquire(w2, first)["type"] == "lock.granted"
+        assert acquire(w2, second)["type"] == "lock.denied"
+        assert hub.lock_holder(first)[0] == team.bob.id
+        # re-acquiring the same image is a refresh, not a release
+        assert acquire(w1, second)["type"] == "lock.granted"
+        assert hub.lock_holder(second)[0] == team.alice.id
+
+
+def test_sweep_tells_the_holder_that_the_lock_expired(client, team):
+    hub = team.admin.client.app.state.ctx.hub
+    image = team.images[0]
+    with team.alice.ws() as w1, team.bob.ws() as w2:
+        hello(w1)
+        hello(w2)
+        subscribe(w1, team.pid)
+        subscribe(w2, team.pid)
+        acquire(w1, image)
+        receive_until(w2, "lock.state", holder_is(team.alice))
+        with hub._mutex:
+            hub._locks[image].expires_at = time.monotonic() - 1
+        hub.loop.call_soon_threadsafe(hub.sweep)
+        assert receive_until(w1, "lock.expired") == {"type": "lock.expired", "image_id": image}
+        receive_until(w2, "lock.state", holder_is(None))
+        assert "lock.expired" not in [m["type"] for m in collect_until_pong(w2)]  # only the holder is told
+
+
+def test_ping_closes_a_socket_whose_session_expired(client, team):
+    from sqlalchemy import update
+
+    from annotamate.server.models import UserSession, utcnow
+
+    ctx = team.admin.client.app.state.ctx
+    with team.alice.ws() as ws:
+        hello(ws)
+        ws.send_json({"type": "ping"})
+        receive_until(ws, "pong")
+        with ctx.db.session() as session:
+            session.execute(update(UserSession).where(UserSession.user_id == team.alice.id)
+                            .values(expires_at=utcnow() - timedelta(minutes=1)))
+            session.commit()
+        ws.send_json({"type": "ping"})
+        with pytest.raises(WebSocketDisconnect) as exc:
+            receive_until(ws, "pong")
+        assert exc.value.code == 4401

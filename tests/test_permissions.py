@@ -199,3 +199,26 @@ def test_annotator_assignment_rules(team):
     assert reviewer.patch(url, json={"assignee_id": None}).status_code == 403  # not theirs
     assert annotator.patch(url, json={"assignee_id": None}).json()["assignee"] is None
     assert users["manager"].patch(url, json={"assignee_id": users["viewer"].id}).status_code == 400
+
+
+def test_restricted_annotator_cannot_flag_images_assigned_to_others(team, admin):
+    project, users, _ = team
+    pid = project["id"]
+    admin.patch(f"/api/projects/{pid}", json={"settings": {"restrict_to_assigned": True}})
+    annotator, reviewer = users["annotator"], users["reviewer"]
+    first, second, _third = images_of(admin, pid)
+    admin.patch(f"/api/projects/{pid}/images/{first['id']}", json={"assignee_id": reviewer.id})
+    refused = annotator.patch(f"/api/projects/{pid}/images/{first['id']}", json={"flagged": True})
+    assert refused.status_code == 403
+    assert annotator.patch(f"/api/projects/{pid}/images/{second['id']}", json={"flagged": True}).status_code == 200
+    assert reviewer.patch(f"/api/projects/{pid}/images/{first['id']}", json={"flagged": True}).status_code == 200
+
+
+def test_id_lists_are_bounded(team):
+    project, users, _ = team
+    pid = project["id"]
+    admin_like = users["reviewer"]
+    too_many = list(range(5001))
+    assert admin_like.post(f"/api/projects/{pid}/images/bulk",
+                           json={"image_ids": too_many, "action": "flag"}).status_code == 422
+    assert admin_like.post("/api/notifications/read", json={"ids": too_many}).status_code == 422

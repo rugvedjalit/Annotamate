@@ -65,7 +65,7 @@ class ImageFilter:
                          class_id=body.class_id, has_comments=body.has_comments, sort=body.sort, loc="filter")
 
     def conditions(self, project_id: int, user_id: int) -> list[ColumnElement[bool]]:
-        conds: list[ColumnElement[bool]] = [Image.project_id == project_id]
+        conds: list[ColumnElement[bool]] = [Image.project_id == project_id, Image.missing.is_(False)]
         if self.q:
             pattern = "%" + self.q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             conds.append(func.lower(Image.rel_path).like(pattern, escape="\\"))
@@ -130,7 +130,7 @@ def neighbors(session: Session, access: ProjectAccess, image: Image, flt: ImageF
 
 def get_image(session: Session, project_id: int, image_id: int) -> Image:
     image = session.get(Image, image_id)
-    if image is None or image.project_id != project_id:
+    if image is None or image.project_id != project_id or image.missing:
         raise not_found("Image not found.")
     return image
 
@@ -160,6 +160,8 @@ def patch_image(session: Session, access: ProjectAccess, image: Image, fields: d
     user, project = access.user, access.project
     if "flagged" in fields and fields["flagged"] is not None and fields["flagged"] != image.flagged:
         access.require_edit()
+        if access.restricted_annotator and image.assignee_id not in (None, user.id):
+            raise forbidden("This image is assigned to someone else.")
         image.flagged = bool(fields["flagged"])
         notify.record(session, project.id, "flagged", user=user, image_id=image.id, data={"flagged": image.flagged})
     if "assignee_id" in fields and fields["assignee_id"] != image.assignee_id:
@@ -250,7 +252,8 @@ def _target_ids(session: Session, access: ProjectAccess, image_ids: list[int] | 
         pairs: list[tuple[int, int]] = []
         for start in range(0, len(wanted), 500):
             pairs.extend(session.execute(select(Image.id, Image.sort_index).where(
-                Image.project_id == project_id, Image.id.in_(wanted[start:start + 500]))).all())
+                Image.project_id == project_id, Image.missing.is_(False),
+                Image.id.in_(wanted[start:start + 500]))).all())
         if len(pairs) != len(wanted):
             raise bad_request("Some images do not belong to this project.")
         ids = [image_id for image_id, _ in sorted(pairs, key=lambda p: p[1])]

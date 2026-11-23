@@ -7,6 +7,7 @@ import logging
 import posixpath
 import zipfile
 from collections.abc import Iterator
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,7 +58,8 @@ class _Sink:
 
 def select_items(session: Session, project: Project, scope: str) -> list[ExportItem]:
     """``all`` = every image with a label file; ``done`` = every image whose status is done."""
-    query = select(Image.rel_path, Image.filename).where(Image.project_id == project.id)
+    query = select(Image.rel_path, Image.filename).where(Image.project_id == project.id,
+                                                         Image.missing.is_(False))
     query = query.where(Image.status == "done") if scope == "done" else query.where(Image.has_label.is_(True))
     return [ExportItem(r.rel_path, r.filename) for r in session.execute(query.order_by(Image.sort_index))]
 
@@ -76,7 +78,8 @@ def data_yaml(names: list[str], include_images: bool) -> str:
 
 class Exporter:
     def __init__(self, paths: ProjectPaths, table: ClassTable, fmt: str, items: list[ExportItem],
-                 include_images: bool) -> None:
+                 include_images: bool, label_lock: AbstractContextManager[Any] | None = None) -> None:
+        self.label_lock = label_lock or nullcontext()
         self.paths = paths
         self.table = table
         self.fmt = fmt
@@ -86,7 +89,7 @@ class Exporter:
 
     def _read(self, item: ExportItem) -> tuple[bytes | None, ImageContext | None]:
         try:
-            with open(self.paths.label_file(item.rel_path), "rb") as fh:
+            with self.label_lock, open(self.paths.label_file(item.rel_path), "rb") as fh:  # not mid-save/migration
                 data: bytes | None = fh.read()
         except (OSError, OutsideRootError):
             data = None

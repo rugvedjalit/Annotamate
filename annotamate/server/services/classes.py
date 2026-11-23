@@ -7,18 +7,20 @@ assigned twice and no annotation save interleaves with a migration.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from collections import Counter
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from annotamate.core.classes import next_color
 from annotamate.core.formats import parse_label, relabel, uses_class_index
-from annotamate.core.fsutil import atomic_write, atomic_write_many
+from annotamate.core.fsutil import MigrationIncompleteError, atomic_write, atomic_write_many
 from annotamate.server.context import AppContext
 from annotamate.server.db import emit
 from annotamate.server.errors import ApiError, bad_request, conflict, not_found
-from annotamate.server.models import Image, Project, ProjectClass
+from annotamate.server.models import Image, PendingRename, Project, ProjectClass
 from annotamate.server.services import notify, serialize
 from annotamate.server.services.access import ProjectAccess
 from annotamate.server.services.indexing import (
@@ -28,8 +30,8 @@ from annotamate.server.services.indexing import (
     replace_class_counts,
     schedule_unknown_recount,
 )
-from annotamate.server.services.labels import ClassTable, load_class_table, sync_classes_file
-from annotamate.server.services.paths import ProjectPaths
+from annotamate.server.services.labels import ClassTable, load_class_table, pending_aliases, sync_classes_file
+from annotamate.server.services.paths import RESERVED_YOLO_KEY, ProjectPaths, fold_case, label_key
 
 log = logging.getLogger("annotamate.classes")
 
@@ -59,6 +61,12 @@ def _refuse_while_indexing(ctx: AppContext, project_id: int) -> None:
         raise conflict("conflict", "The project is being indexed. Try again when indexing has finished.")
 
 
+def _refuse_while_renaming(session: Session, project_id: int) -> None:
+    if has_pending_renames(session, project_id):
+        raise conflict("conflict", "A class rename is still being applied to the label files. "
+                                   "Try again in a moment.")
+
+
 def _after_change(ctx: AppContext, session: Session, project: Project) -> ClassTable:
     """Keep ``classes.txt`` in sync and queue the ``classes.updated`` broadcast."""
     session.flush()
@@ -82,6 +90,7 @@ def add_class(ctx: AppContext, session: Session, access: ProjectAccess, name: st
         existing = list(session.scalars(select(ProjectClass).where(ProjectClass.project_id == project.id)))
         if any(c.name == name for c in existing):
             raise conflict("exists", f"A class named '{name}' already exists.")
+        _refuse_reused_name(session, project, name)
         cls = ProjectClass(project_id=project.id, position=len(existing), name=name,
                            color=(color or next_color([c.color for c in existing])).lower())
         session.add(cls)
@@ -110,6 +119,9 @@ def update_class(ctx: AppContext, session: Session, access: ProjectAccess, cls: 
                     raise conflict("exists", f"A class named '{name}' already exists.")
                 if not uses_class_index(project.label_format):
                     _refuse_while_indexing(ctx, project.id)
+                    _refuse_reused_name(session, project, name)
+                    # Persisted with the new name, so an interrupted rewrite is resumed at the next start.
+                    session.add(PendingRename(project_id=project.id, old_name=old_name, new_name=name))
                 cls.name = name
                 changes["name"] = name
                 changes["old_name"] = old_name
@@ -128,9 +140,52 @@ def update_class(ctx: AppContext, session: Session, access: ProjectAccess, cls: 
         if uses_class_index(project.label_format):
             schedule_unknown_recount(ctx, session, project.id)
         else:
-            new_name = cls.name
-            ctx.jobs.submit(("rename", project.id), lambda: rename_in_files(ctx, project.id, {old_name: new_name}))
+            schedule_rename(ctx, project.id)
     return cls
+
+
+def _refuse_reused_name(session: Session, project: Project, name: str) -> None:
+    """A name that files may still carry (renamed class, rewrite pending) cannot be given to another class."""
+    if name in pending_aliases(session, project.id) and not uses_class_index(project.label_format):
+        raise conflict("conflict", f"'{name}' is the previous name of a class whose rename is still being applied "
+                                   "to the label files. Try again in a moment.")
+
+
+#: Seconds before retrying a rename job that could not rewrite every file (the last value repeats).
+RENAME_RETRY_DELAYS: tuple[float, ...] = (30, 120, 600, 1800)
+
+
+def schedule_rename(ctx: AppContext, project_id: int) -> None:
+    """Queue (or resume) the label-file rewrite for the project's pending VOC/COCO renames."""
+    ctx.jobs.submit(("rename", project_id), lambda: rename_in_files(ctx, project_id), coalesce=True)
+
+
+def _retry_rename_later(ctx: AppContext, project_id: int) -> None:
+    """Some files could not be rewritten: try again later, backing off (a rescan also retries at once)."""
+    attempt = ctx.rename_retries.get(project_id, 0)
+    ctx.rename_retries[project_id] = attempt + 1
+    delay = RENAME_RETRY_DELAYS[min(attempt, len(RENAME_RETRY_DELAYS) - 1)]
+
+    def fire() -> None:
+        if not ctx.jobs.stopping.is_set():
+            schedule_rename(ctx, project_id)
+
+    timer = threading.Timer(delay, fire)
+    timer.daemon = True
+    timer.start()
+
+
+def has_pending_renames(session: Session, project_id: int) -> bool:
+    query = select(PendingRename.id).where(PendingRename.project_id == project_id).limit(1)
+    return session.scalar(query) is not None
+
+
+def resume_renames(ctx: AppContext) -> None:
+    """Start-up hook: finish the renames that were interrupted by a restart."""
+    with ctx.db.session() as session:
+        project_ids = list(session.scalars(select(PendingRename.project_id).distinct()))
+    for project_id in project_ids:
+        schedule_rename(ctx, project_id)
 
 
 def _label_files(session: Session, paths: ProjectPaths) -> list[tuple[int, str]]:
@@ -141,11 +196,16 @@ def _label_files(session: Session, paths: ProjectPaths) -> list[tuple[int, str]]
     """
     lister = LabelLister(paths)
     rows = session.execute(select(Image.id, Image.rel_path).where(Image.project_id == paths.project.id)
-                           .order_by(Image.id))
+                           .order_by(Image.missing, Image.sort_index, Image.id))
     out = []
+    seen: set[str] = set()
+    reserved = uses_class_index(paths.project.label_format)
     for image_id, rel_path in rows:
+        if reserved and label_key(rel_path) == RESERVED_YOLO_KEY:
+            continue  # classes.txt is the class list, never a label file
         path = lister.path(paths.label_rel(rel_path))
-        if path is not None:
+        if path is not None and fold_case(path) not in seen:  # images sharing a stem share one file
+            seen.add(fold_case(path))
             out.append((image_id, path))
     return out
 
@@ -158,13 +218,24 @@ def _read(path: str) -> bytes | None:
         return None
 
 
-def rename_in_files(ctx: AppContext, project_id: int, name_map: dict[str, str | None]) -> None:
-    """Background job: apply a VOC/COCO class rename to every label file of the project."""
+def rename_in_files(ctx: AppContext, project_id: int) -> None:
+    """Background job: apply the project's pending VOC/COCO class renames to every label file.
+
+    Until it has rewritten every file the renames stay recorded (``pending_renames``): readers map the old
+    names onto the renamed classes and a restart resumes the job. Failed files keep the records alive.
+    """
     with ctx.db.session() as session:
         project = session.get(Project, project_id)
         if project is None:
             return
+        pending = list(session.scalars(select(PendingRename).where(PendingRename.project_id == project_id)
+                                       .order_by(PendingRename.id)))
+        if not pending:
+            return
+        last_id = pending[-1].id
+        name_map: dict[str, str | None] = dict(pending_aliases(session, project_id))
         images = _label_files(session, ProjectPaths(ctx.settings, project))
+    failed = 0
     for start in range(0, len(images), BATCH):
         if ctx.jobs.stopping.is_set():
             return
@@ -184,6 +255,9 @@ def rename_in_files(ctx: AppContext, project_id: int, name_map: dict[str, str | 
                 path = chunk[image.id]
                 data = _read(path)
                 if data is None:
+                    if os.path.lexists(path):  # unreadable right now (permissions, sharing violation): retry
+                        log.warning("Could not read %s; the class rename will be retried", path)
+                        failed += 1
                     continue
                 new, changed = relabel(project.label_format, data, name_map=name_map, class_names=table.names)
                 if changed:
@@ -191,9 +265,19 @@ def rename_in_files(ctx: AppContext, project_id: int, name_map: dict[str, str | 
                         atomic_write(path, new)
                     except OSError as exc:
                         log.warning("Could not rewrite %s: %s", path, exc)
+                        failed += 1
                         continue
                     _recount(session, table, project.label_format, image, new)
             ctx.bump_class_epoch(project_id)  # an index pass that read these files must read them again
+            session.commit()
+    if failed:
+        log.warning("Project %s: %d label files could not be renamed; the rename stays pending", project_id, failed)
+        _retry_rename_later(ctx, project_id)
+    else:
+        ctx.rename_retries.pop(project_id, None)
+        with ctx.db.session() as session:
+            session.execute(delete(PendingRename).where(PendingRename.project_id == project_id,
+                                                        PendingRename.id <= last_id))
             session.commit()
     ctx.hub.send_project(project_id, {"type": "images.bulk_updated", "project_id": project_id,
                                       "count": len(images)})
@@ -229,6 +313,7 @@ def delete_class(ctx: AppContext, session: Session, access: ProjectAccess, cls: 
 
     with ctx.label_locks(project.id):
         _refuse_while_indexing(ctx, project.id)
+        _refuse_while_renaming(session, project.id)
         paths = ProjectPaths(ctx.settings, project)
         paths.check()
         old = load_class_table(session, project.id, fmt).classes
@@ -250,12 +335,18 @@ def delete_class(ctx: AppContext, session: Session, access: ProjectAccess, cls: 
         staged: list[tuple[str, bytes]] = []
         touched: dict[int, bytes] = {}  # images that contained the deleted class: their counts change
         in_use = 0
+        in_use_missing = 0  # of those, images whose file is gone (their label files are migrated too)
+        missing_ids = set(session.scalars(select(Image.id).where(Image.project_id == project.id,
+                                                                 Image.missing.is_(True))))
         for image_id, path in _label_files(session, paths):
             data = _read(path)
             if data is None:
-                continue
+                if not os.path.lexists(path):
+                    continue  # deleted since it was listed
+                raise bad_request(f"The label file {os.path.basename(path)} could not be read. Nothing was changed.")
             uses = any(b.label == key for b in parse_label(fmt, data).boxes)
             in_use += uses
+            in_use_missing += uses and image_id in missing_ids
             if strategy == "forbid" and in_use:
                 continue  # keep counting, nothing will be written
             new, changed = relabel(fmt, data, index_map=index_map, name_map=name_map, class_names=new_names)
@@ -264,12 +355,20 @@ def delete_class(ctx: AppContext, session: Session, access: ProjectAccess, cls: 
             if uses:
                 touched[image_id] = new
         if strategy == "forbid" and in_use:
-            raise conflict("in_use", f"{in_use} images still use '{cls.name}'.", images=in_use)
+            hint = (f" {in_use_missing} of them are missing from the image folder; restore their files or remove "
+                    "them in the project settings.") if in_use_missing else ""
+            raise conflict("in_use", f"{in_use} images still use '{cls.name}'.{hint}", images=in_use)
         try:
-            atomic_write_many(staged)
+            atomic_write_many(staged, journal_dir=str(ctx.settings.journal_dir))
+        except MigrationIncompleteError as exc:
+            log.error("Class migration for project %s left files in an unknown state: %s", project.id, exc.files)
+            raise ApiError(500, "migration_incomplete",
+                           "Some label files could not be restored after a failed rewrite. Their original content "
+                           "is kept in hidden .bak files next to them.", files=exc.files) from None
         except OSError as exc:
-            raise bad_request(f"Label files could not be rewritten ({exc.strerror or exc}); nothing was changed.") \
-                from None
+            where = f" ({os.path.basename(exc.filename)})" if exc.filename else ""
+            raise bad_request(f"Label files could not be rewritten: {exc.strerror or exc}{where}. "
+                              "Nothing was changed.") from None
 
         removed: dict[str, object] = {"class_id": cls.id, "name": cls.name, "strategy": strategy}
         if target is not None:

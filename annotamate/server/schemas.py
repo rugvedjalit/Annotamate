@@ -20,6 +20,7 @@ ROLES: tuple[str, ...] = ("viewer", "annotator", "reviewer", "manager")
 STATUSES: tuple[str, ...] = ("todo", "in_progress", "review", "done", "rejected")
 USERNAME_RE = re.compile(r"^[a-z0-9_.-]{3,32}$")
 MAX_BODY = 4000
+MAX_IDS = 5000  # upper bound for id lists in requests
 
 
 def _username(value: str) -> str:
@@ -84,6 +85,10 @@ class User(UserBrief):
     last_seen_at: str | None
 
 
+class UserBriefWithOnline(UserBrief):
+    online: bool
+
+
 class UserWithOnline(User):
     online: bool
 
@@ -133,6 +138,8 @@ class ProjectSummary(Model):
     description: str
     label_format: LabelFormat
     image_count: int
+    #: Images whose file disappeared from disk (kept hidden until they return or a manager removes them).
+    missing_count: int = 0
     status_counts: StatusCounts
     member_count: int
     my_role: Role | None
@@ -327,6 +334,8 @@ class Meta(Model):
 
 class AuthState(Model):
     setup_required: bool
+    #: True while the first-run setup needs ``setup_token`` (non-loopback client, no account yet).
+    setup_token_required: bool = False
     user: User | None
 
 
@@ -422,6 +431,10 @@ class RescanResult(Model):
     started: bool
 
 
+class PruneResult(Model):
+    removed: int
+
+
 class ClassDeleteResult(Model):
     rewritten_files: int
 
@@ -451,6 +464,7 @@ class SetupIn(Model):
     username: str
     display_name: str
     password: str
+    setup_token: str | None = None
 
     _u = field_validator("username")(_username)
     _p = field_validator("password")(_password)
@@ -522,9 +536,9 @@ class ProjectCreate(Model):
     image_dir: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
     label_dir: Annotated[str, StringConstraints(max_length=4096)] | None = None
     label_format: LabelFormat
-    classes: list[str] | None = None
+    classes: Annotated[list[str], Field(max_length=1000)] | None = None
     settings: ProjectSettingsPatch | None = None
-    members: list[MemberIn] | None = None
+    members: Annotated[list[MemberIn], Field(max_length=1000)] | None = None
 
 
 class ProjectPatch(Model):
@@ -557,7 +571,7 @@ class StatusActionIn(Model):
 
 class ImageFilterIn(Model):
     q: str | None = None
-    status: str | list[str] | None = None
+    status: str | Annotated[list[str], Field(max_length=len(STATUSES))] | None = None
     assignee: str | int | None = None
     flagged: bool | None = None
     class_id: int | None = None
@@ -566,12 +580,12 @@ class ImageFilterIn(Model):
 
 
 class BulkIn(Model):
-    image_ids: list[int] | None = None
+    image_ids: Annotated[list[int], Field(max_length=MAX_IDS)] | None = None
     filter: ImageFilterIn | None = None
     action: Literal["assign", "unassign", "flag", "unflag", "set_status", "distribute"]
     assignee_id: int | None = None
     status: ImageStatus | None = None
-    user_ids: list[int] | None = None
+    user_ids: Annotated[list[int], Field(max_length=MAX_IDS)] | None = None
     limit: Annotated[int, Field(ge=1)] | None = None
 
 
@@ -635,5 +649,5 @@ class DirectMessageCreate(Model):
 
 
 class NotificationsReadIn(Model):
-    ids: list[int] | None = None
+    ids: Annotated[list[int], Field(max_length=MAX_IDS)] | None = None
     all: bool = False

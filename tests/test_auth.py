@@ -19,9 +19,10 @@ def test_health_and_meta(client):
 
 def test_setup_flow(client):
     state = client.get("/api/auth/state").json()
-    assert state == {"setup_required": True, "user": None}
+    assert state == {"setup_required": True, "setup_token_required": True, "user": None}
     response = client.post("/api/auth/setup", json={"username": "Root.User", "display_name": " Root  User ",
-                                                    "password": PASSWORD}, headers=CSRF)
+                                                    "password": PASSWORD,
+                                                    "setup_token": client.app.state.ctx.setup_token}, headers=CSRF)
     assert response.status_code == 200
     user = response.json()
     assert user["username"] == "root.user"
@@ -32,7 +33,8 @@ def test_setup_flow(client):
     assert f"{SESSION_COOKIE}=" in cookie and "HttpOnly" in cookie and "samesite=lax" in cookie.lower()
     assert "Path=/" in cookie and "Secure" not in cookie
     state = client.get("/api/auth/state").json()
-    assert state["setup_required"] is False and state["user"]["username"] == "root.user"
+    assert state["setup_required"] is False and state["setup_token_required"] is False
+    assert state["user"]["username"] == "root.user"
 
     client.cookies.clear()
     again = client.post("/api/auth/setup", json={"username": "other", "display_name": "O", "password": PASSWORD},
@@ -59,7 +61,8 @@ def test_secure_cookie_flag(tmp_path, root):
     app = create_app(Settings(data_dir=tmp_path / "d", roots=[str(root)], secure_cookies=True))
     with TestClient(app) as client:
         response = client.post("/api/auth/setup", json={"username": "admin", "display_name": "A",
-                                                        "password": PASSWORD}, headers=CSRF)
+                                                        "password": PASSWORD, "setup_token": app.state.ctx.setup_token},
+                               headers=CSRF)
         assert "Secure" in response.headers["set-cookie"]
 
 
@@ -220,3 +223,167 @@ def test_unauthenticated_requests(client, admin):
         assert response.json() == {"detail": "Please sign in.", "code": "unauthenticated"}
     forged = ApiUser(client, "forged-token", {"id": 0})
     assert forged.get("/api/me").status_code == 401
+
+
+# ------------------------------------------------------------------------------------- first-run setup token
+
+
+def _setup_body(**extra):
+    return {"username": "root", "display_name": "Root", "password": PASSWORD, **extra}
+
+
+def test_setup_needs_the_token_from_remote_clients(client):
+    ctx = client.app.state.ctx
+    assert ctx.setup_token and len(ctx.setup_token) >= 16
+    missing = client.post("/api/auth/setup", json=_setup_body(), headers=CSRF)
+    assert missing.status_code == 422 and ("body", "setup_token") in {tuple(e["loc"]) for e in missing.json()["errors"]}
+    wrong = client.post("/api/auth/setup", json=_setup_body(setup_token="nope"), headers=CSRF)
+    assert wrong.status_code == 422
+    assert client.get("/api/auth/state").json()["setup_required"] is True
+    ok = client.post("/api/auth/setup", json=_setup_body(setup_token=f" {ctx.setup_token} "), headers=CSRF)
+    assert ok.status_code == 200
+    assert ctx.setup_token is None  # used up
+
+
+def test_loopback_clients_need_no_token(app):
+    from fastapi.testclient import TestClient
+
+    for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+        assert TestClient(app, client=(host, 50000)).get("/api/auth/state").json()["setup_token_required"] is False
+    local = TestClient(app, client=("127.0.0.1", 50000))
+    assert local.post("/api/auth/setup", json=_setup_body(), headers=CSRF).status_code == 200
+
+
+def test_token_is_logged_at_startup_and_not_created_when_accounts_exist(tmp_path, root, caplog):
+    import logging
+
+    from annotamate.server import Settings, create_app
+
+    settings = Settings(data_dir=tmp_path / "d", roots=[str(root)])
+    with caplog.at_level(logging.WARNING, logger="annotamate.server"):
+        first = create_app(settings)
+    assert first.state.ctx.setup_token and first.state.ctx.setup_token in caplog.text
+    from fastapi.testclient import TestClient
+
+    TestClient(first, client=("127.0.0.1", 1)).post("/api/auth/setup", json=_setup_body(), headers=CSRF)
+    assert create_app(settings).state.ctx.setup_token is None
+
+
+def test_concurrent_setups_create_exactly_one_administrator(app):
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from annotamate.server.models import User
+
+    results: list[int] = []
+    barrier = threading.Barrier(6)
+
+    def attempt(n: int) -> None:
+        local = TestClient(app, client=("127.0.0.1", 40000 + n))
+        barrier.wait()
+        body = _setup_body(username=f"root{n}")
+        results.append(local.post("/api/auth/setup", json=body, headers=CSRF).status_code)
+
+    threads = [threading.Thread(target=attempt, args=(n,)) for n in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == [200, 409, 409, 409, 409, 409]
+    with app.state.ctx.db.session() as session:
+        assert len(list(session.scalars(select(User)))) == 1
+
+
+def test_user_list_hides_private_fields_from_non_admins(admin, make_user):
+    ann = make_user("ann", "Ann")
+    seen = ann.get("/api/users").json()
+    assert {u["username"] for u in seen} == {"admin", "ann"}
+    assert all(set(u) == {"id", "username", "display_name", "avatar_color", "online"} for u in seen)
+    full = admin.get("/api/users").json()
+    assert all({"email", "is_admin", "is_active", "created_at", "last_seen_at", "online"} <= set(u) for u in full)
+    assert ann.get("/api/users", params={"include_inactive": True}).status_code == 403
+
+
+def test_rate_limiter_limits_an_address_across_usernames():
+    from annotamate.server.security import LoginRateLimiter
+
+    limiter = LoginRateLimiter(max_failures=10, window=600, max_ip_failures=5)
+    for n in range(5):
+        limiter.failure("1.2.3.4", f"user{n}")
+    assert limiter.retry_after("1.2.3.4", "someone-new") > 0  # one more username does not help
+    assert limiter.retry_after("5.6.7.8", "someone-new") == 0
+    limiter.success("1.2.3.4", "user0")  # a good login does not reset the address-wide counter
+    assert limiter.retry_after("1.2.3.4", "user0") > 0
+
+
+def test_password_hashing_is_limited_to_a_few_at_a_time(monkeypatch):
+    import threading
+    import time
+
+    from annotamate.server import security
+
+    state = {"now": 0, "max": 0}
+    guard = threading.Lock()
+
+    class SlowHasher:
+        def verify(self, _hash, _password):
+            with guard:
+                state["now"] += 1
+                state["max"] = max(state["max"], state["now"])
+            time.sleep(0.05)
+            with guard:
+                state["now"] -= 1
+
+        def check_needs_rehash(self, _hash):
+            return False
+
+    monkeypatch.setattr(security, "hasher", SlowHasher())
+    threads = [threading.Thread(target=security.verify_password, args=("h", "pw")) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert 1 < state["max"] <= security.HASH_SLOTS
+
+
+
+def test_address_wide_limit_applies_to_public_addresses_only():
+    from annotamate.server.security import LoginRateLimiter
+
+    limiter = LoginRateLimiter(max_failures=10, window=600, max_ip_failures=3)
+    for address in ("127.0.0.1", "10.0.0.7", "172.17.0.1", "192.168.1.20", "fd00::1"):
+        for n in range(5):
+            limiter.failure(address, f"user{n}")
+        # a proxy or NAT gateway seen as one private address must not lock everybody out ...
+        assert limiter.retry_after(address, "someone-else") == 0, address
+        # ... while each account keeps its own limit
+        for _ in range(10):
+            limiter.failure(address, "victim")
+        assert limiter.retry_after(address, "victim") > 0
+    off = LoginRateLimiter(max_failures=10, window=600, max_ip_failures=0)
+    for n in range(50):
+        off.failure("1.2.3.4", f"user{n}")
+    assert off.retry_after("1.2.3.4", "someone-else") == 0
+
+
+def test_login_ip_limit_comes_from_the_settings(tmp_path, root):
+    from annotamate.server import Settings, create_app
+
+    app = create_app(Settings(data_dir=tmp_path / "d", roots=[str(root)], login_ip_limit=7))
+    assert app.state.ctx.limiter.max_ip_failures == 7
+
+
+def test_proxied_requests_need_the_setup_token_even_from_loopback(app):
+    from fastapi.testclient import TestClient
+
+    local = TestClient(app, client=("127.0.0.1", 50000))
+    for header in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"):
+        headers = {**CSRF, header: "203.0.113.9"}
+        assert local.get("/api/auth/state", headers=headers).json()["setup_token_required"] is True, header
+        refused = local.post("/api/auth/setup", json=_setup_body(), headers=headers)
+        assert refused.status_code == 422, header
+    token = app.state.ctx.setup_token
+    ok = local.post("/api/auth/setup", json=_setup_body(setup_token=token),
+                    headers={**CSRF, "X-Forwarded-For": "203.0.113.9"})
+    assert ok.status_code == 200

@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from annotamate.server.context import AppContext
 from annotamate.server.errors import ApiError
-from annotamate.server.models import Image, User
+from annotamate.server.models import Image, User, UserSession, utcnow
 from annotamate.server.realtime import Connection
 from annotamate.server.security import SESSION_COOKIE
 from annotamate.server.services import serialize
@@ -49,6 +49,18 @@ def _authenticate(ctx: AppContext, token: str | None) -> tuple[int, int, dict[st
         return user.id, user_session.id, serialize.brief(user), user.is_admin
 
 
+def _session_alive(ctx: AppContext, session_id: int, days: int) -> bool:
+    """The connection's session still exists, has not expired and belongs to an active user (and slides on)."""
+    with ctx.db.session() as session:
+        user_session = session.get(UserSession, session_id)
+        user = session.get(User, user_session.user_id) if user_session is not None else None
+        if user_session is None or user is None or not user.is_active or user_session.expires_at <= utcnow():
+            return False
+        if touch_session(user_session, user, days):
+            session.commit()
+        return True
+
+
 def _access(session: Session, user_id: int, project_id: int) -> ProjectAccess | None:
     user = session.get(User, user_id)
     if user is None or not user.is_active:
@@ -76,7 +88,7 @@ def _lock_rights(ctx: AppContext, user_id: int, image_id: int) -> LockRights | N
     """Current rights of the user on the image (checked on every request, roles can change)."""
     with ctx.db.session() as session:
         image = session.get(Image, image_id)
-        if image is None:
+        if image is None or image.missing:
             return None
         access = _access(session, user_id, image.project_id)
         if access is None:
@@ -88,7 +100,9 @@ def _lock_rights(ctx: AppContext, user_id: int, image_id: int) -> LockRights | N
 def _image_filename(ctx: AppContext, project_id: int, image_id: int) -> str | None:
     with ctx.db.session() as session:
         image = session.get(Image, image_id)
-        return image.filename if image is not None and image.project_id == project_id else None
+        if image is None or image.project_id != project_id or image.missing:
+            return None
+        return image.filename
 
 
 def _int(value: Any) -> int | None:
@@ -99,6 +113,10 @@ async def _handle(ctx: AppContext, conn: Connection, message: dict[str, Any]) ->
     hub = ctx.hub
     kind = message.get("type")
     if kind == "ping":
+        if not await run_in_threadpool(_session_alive, ctx, conn.session_id, ctx.settings.session_days):
+            hub.send(conn, {"type": "error", "code": "unauthenticated", "detail": "Your session has expired."})
+            hub.close_sessions({conn.session_id})
+            return
         hub.renew(conn)
         hub.send(conn, {"type": "pong"})
     elif kind == "subscribe":

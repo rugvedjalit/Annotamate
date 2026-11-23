@@ -14,6 +14,8 @@ import webbrowser
 from collections.abc import Sequence
 from typing import Any
 
+from pydantic import ValidationError
+
 from annotamate import __version__
 
 
@@ -79,6 +81,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
               f"{settings.port}{settings.base_url})")
     if needs_setup:
         print("  No accounts yet: the first visit asks you to create the administrator.")
+        token = app.state.ctx.setup_token
+        if token:
+            print(f"  Setup token (needed unless you open the page on this machine): {token}")
     if not _is_loopback(settings.host) and not settings.secure_cookies:
         print("\n  WARNING: listening on a non-loopback address without --secure-cookies. Session cookies\n"
               "  travel in clear text over plain HTTP. Put Annotamate behind HTTPS (see deploy/) and pass\n"
@@ -263,3 +268,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
         return 130
+    except ValidationError as exc:  # an invalid setting (for example a bad base URL) stops the server at start-up
+        for err in exc.errors():
+            print(f"Invalid setting {'.'.join(map(str, err['loc'])) or '?'}: {err['msg']}", file=sys.stderr)
+        return 2

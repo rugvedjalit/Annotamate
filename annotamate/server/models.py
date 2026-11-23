@@ -18,6 +18,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import (
+    false as sa_false,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 NAMING_CONVENTION = {
@@ -120,12 +123,17 @@ class Image(Base):
         Index("ix_images_project_status", "project_id", "status"),
         Index("ix_images_project_assignee", "project_id", "assignee_id"),
         Index("ix_images_project_updated", "project_id", "updated_at"),
+        Index("ix_images_project_label_key", "project_id", "label_key"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     rel_path: Mapped[str] = mapped_column(Text)
     filename: Mapped[str] = mapped_column(String(255))
+    #: Casefolded path without extension: images with the same key share one label file.
+    label_key: Mapped[str] = mapped_column(Text, default="", server_default="")
+    #: The file disappeared from disk; kept (soft-deleted) so comments, revisions and status survive.
+    missing: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
     sort_index: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16), default="todo")
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
@@ -140,6 +148,21 @@ class Image(Base):
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     comment_count: Mapped[int] = mapped_column(Integer, default=0)
     open_comment_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PendingRename(Base):
+    """A VOC/COCO class rename whose label-file rewrite has not finished (resumed at start-up).
+
+    Until it is cleared, label files may still hold ``old_name``; readers map it onto the renamed class.
+    """
+
+    __tablename__ = "pending_renames"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    old_name: Mapped[str] = mapped_column(String(100))
+    new_name: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class ImageClassCount(Base):

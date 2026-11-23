@@ -13,8 +13,8 @@ from sqlalchemy.orm import Session
 from annotamate.core.classes import write_classes
 from annotamate.core.formats import ParseResult, parse_label, uses_class_index
 from annotamate.core.fsutil import OutsideRootError
-from annotamate.server.models import ProjectClass
-from annotamate.server.services.paths import ProjectPaths
+from annotamate.server.models import Image, PendingRename, Project, ProjectClass
+from annotamate.server.services.paths import RESERVED_YOLO_KEY, ProjectPaths, label_key
 
 
 def label_version(data: bytes) -> str:
@@ -34,6 +34,8 @@ class ClassTable:
 
     fmt: str
     classes: list[ProjectClass]
+    #: Old name -> current name of renames whose label-file rewrite is still pending (VOC/COCO only).
+    aliases: dict[str, str] = field(default_factory=dict)
     by_id: dict[int, ProjectClass] = field(init=False)
     by_name: dict[str, ProjectClass] = field(init=False)
 
@@ -61,7 +63,10 @@ class ClassTable:
             except ValueError:
                 return None
             return self.classes[index] if 0 <= index < len(self.classes) else None
-        return self.by_name.get(label)
+        cls = self.by_name.get(label)
+        if cls is None and label in self.aliases:
+            cls = self.by_name.get(self.aliases[label])
+        return cls
 
     def counts(self, result: ParseResult) -> tuple[dict[int, int], int]:
         """Boxes per class id, plus the number of boxes with unknown labels."""
@@ -76,9 +81,25 @@ class ClassTable:
         return per_class, unknown
 
 
+def pending_aliases(session: Session, project_id: int) -> dict[str, str]:
+    """``old name -> current name`` for the renames whose files have not all been rewritten yet.
+
+    Chains collapse (a -> b, then b -> c gives a -> c and b -> c); a name renamed back maps to nothing.
+    """
+    aliases: dict[str, str] = {}
+    for old, new in session.execute(select(PendingRename.old_name, PendingRename.new_name)
+                                    .where(PendingRename.project_id == project_id).order_by(PendingRename.id)):
+        for key, value in list(aliases.items()):
+            if value == old:
+                aliases[key] = new
+        aliases[old] = new
+    return {k: v for k, v in aliases.items() if k != v}
+
+
 def load_class_table(session: Session, project_id: int, fmt: str) -> ClassTable:
     rows = list(session.scalars(select(ProjectClass).where(ProjectClass.project_id == project_id)))
-    return ClassTable(fmt, rows)
+    aliases = {} if uses_class_index(fmt) else pending_aliases(session, project_id)
+    return ClassTable(fmt, rows, aliases)
 
 
 @dataclass
@@ -98,14 +119,36 @@ class LabelFile:
         return label_version(self.data) if self.data is not None else None
 
 
+def label_block(session: Session, project: Project, image: Image) -> str | None:
+    """Why this image cannot have its own label file (shared with an earlier image, or the reserved name)."""
+    key = image.label_key or label_key(image.rel_path)
+    if project.label_format == "yolo" and key == RESERVED_YOLO_KEY:
+        return ("The name 'classes' is reserved for the class list (classes.txt), so this image cannot be "
+                "annotated. Rename the image file to annotate it.")
+    owner = session.execute(
+        select(Image.id, Image.rel_path).where(Image.project_id == project.id, Image.label_key == key,
+                                               Image.missing.is_(False))
+        .order_by(Image.sort_index, Image.id).limit(1)
+    ).first()
+    if owner is not None and owner.id != image.id:
+        return (f"This image shares its label file with {owner.rel_path}, which owns it. Rename one of the images "
+                "to give each its own labels.")
+    return None
+
+
 def read_label_file(paths: ProjectPaths, rel_path: str, width: float | None = None,
-                    height: float | None = None) -> LabelFile:
-    """Read and parse an image's label file. Problems become ``readonly_reason`` rather than errors."""
+                    height: float | None = None, *, blocked: str | None = None) -> LabelFile:
+    """Read and parse an image's label file. Problems become ``readonly_reason`` rather than errors.
+
+    ``blocked`` (see :func:`label_block`) makes the image read-only with an empty document.
+    """
     fmt = paths.project.label_format
     try:
         path = paths.label_file(rel_path)
     except OutsideRootError:
         return LabelFile(None, None, None, ParseResult(), "The label file resolves outside the label folder.")
+    if blocked:
+        return LabelFile(path, None, None, ParseResult(), blocked)
     try:
         with open(path, "rb") as fh:
             mtime = os.fstat(fh.fileno()).st_mtime
@@ -122,7 +165,10 @@ def read_label_file(paths: ProjectPaths, rel_path: str, width: float | None = No
 
 def sync_classes_file(paths: ProjectPaths, table: ClassTable, *, only_if_missing: bool = False) -> None:
     """Write ``classes.txt`` in the label folder so it matches the class list."""
-    target = paths.classes_file()
+    try:
+        target = paths.classes_file()
+    except OutsideRootError:
+        raise OSError("classes.txt resolves outside the label folder") from None
     if only_if_missing and os.path.exists(target):
         return
     write_classes(target, table.names)

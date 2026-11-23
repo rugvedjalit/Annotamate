@@ -1,16 +1,17 @@
 """Setup, sign-in/out and the current user's profile and settings."""
 
 import json
+import secrets
 from typing import Any
 
 from fastapi import APIRouter, Body, Request, Response
 
 from annotamate.server.config import Settings
 from annotamate.server.deps import DB, Ctx, CurrentUser, optional_user
-from annotamate.server.errors import ApiError, bad_request
+from annotamate.server.errors import ApiError, bad_request, validation_error
 from annotamate.server.models import UserSession
 from annotamate.server.schemas import AuthState, LoginIn, MePatch, PasswordChange, SetupIn, User
-from annotamate.server.security import SESSION_COOKIE, hash_password, verify_password
+from annotamate.server.security import SESSION_COOKIE, hash_password, is_local_request, verify_password
 from annotamate.server.services import serialize
 from annotamate.server.services.users import (
     create_session,
@@ -45,18 +46,30 @@ def _client(request: Request) -> tuple[str, str | None]:
 @router.get("/auth/state", response_model=AuthState)
 def auth_state(request: Request, ctx: Ctx, db: DB) -> dict:
     user = optional_user(request, ctx, db)
-    return {"setup_required": user_count(db) == 0, "user": serialize.user_out(user) if user else None}
+    required = user_count(db) == 0
+    # Requests made on the server itself need no token; anything relayed by a proxy or tunnel does.
+    local = is_local_request(_client(request)[0], request.headers)
+    token_required = required and ctx.setup_token is not None and not local
+    return {"setup_required": required, "setup_token_required": token_required,
+            "user": serialize.user_out(user) if user else None}
 
 
 @router.post("/auth/setup", response_model=User)
 def setup(body: SetupIn, request: Request, response: Response, ctx: Ctx, db: DB) -> dict:
-    if user_count(db) > 0:
-        raise ApiError(409, "setup_done", "Setup has already been completed.")
-    user = create_user(db, username=body.username, display_name=body.display_name, password=body.password,
-                       is_admin=True)
     ip, agent = _client(request)
-    token = create_session(db, user, days=ctx.settings.session_days, ip=ip, user_agent=agent)
-    db.commit()
+    with ctx.setup_lock:  # check and create as one step: concurrent requests cannot both become administrator
+        if user_count(db) > 0:
+            raise ApiError(409, "setup_done", "Setup has already been completed.")
+        if ctx.setup_token is not None and not is_local_request(ip, request.headers) and not (
+                body.setup_token and secrets.compare_digest(body.setup_token.strip(), ctx.setup_token)):
+            raise validation_error(["body", "setup_token"],
+                                   "The setup token is missing or wrong. It is printed in the server log "
+                                   "and in the console when the server starts.")
+        user = create_user(db, username=body.username, display_name=body.display_name, password=body.password,
+                           is_admin=True)
+        token = create_session(db, user, days=ctx.settings.session_days, ip=ip, user_agent=agent)
+        db.commit()
+        ctx.setup_token = None
     set_session_cookie(response, ctx.settings, token)
     return serialize.user_out(user)
 

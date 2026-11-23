@@ -28,6 +28,7 @@ from annotamate.server.services.indexing import replace_class_counts
 from annotamate.server.services.labels import (
     ClassTable,
     LabelFile,
+    label_block,
     label_version,
     load_class_table,
     read_label_file,
@@ -65,18 +66,23 @@ def _box_out(table: ClassTable, box: Box, box_id: str) -> dict[str, Any]:
     }
 
 
-def build_doc(session: Session, paths: ProjectPaths, image: Image, label: LabelFile, image_error: str | None,
-              table: ClassTable) -> dict[str, Any]:
+def _box_ids(session: Session, image: Image, label: LabelFile) -> tuple[list[str], Revision | None]:
+    """The ids of the boxes read from ``label`` (what a GET hands out), and the revision they come from."""
     version = label.version
     latest = _latest_revision(session, image.id)
     current = latest if latest is not None and latest.version == version else None
     saved_ids = [b.get("id") for b in current.boxes] if current is not None else []
     if len(saved_ids) != len(label.parse.boxes):
         saved_ids = []
-    boxes = [
-        _box_out(table, box, saved_ids[i] if saved_ids else stable_box_id(image.id, version, i))
-        for i, box in enumerate(label.parse.boxes)
-    ]
+    return ([saved_ids[i] if saved_ids else stable_box_id(image.id, version, i)
+             for i in range(len(label.parse.boxes))], current)
+
+
+def build_doc(session: Session, paths: ProjectPaths, image: Image, label: LabelFile, image_error: str | None,
+              table: ClassTable) -> dict[str, Any]:
+    version = label.version
+    ids, current = _box_ids(session, image, label)
+    boxes = [_box_out(table, box, ids[i]) for i, box in enumerate(label.parse.boxes)]
     readonly = label.readonly_reason
     if readonly is None and image_error is not None:
         readonly = f"The image cannot be read ({image_error}), so its labels cannot be edited."
@@ -96,7 +102,8 @@ def annotation_doc(ctx: AppContext, session: Session, access: ProjectAccess, ima
     paths = ProjectPaths(ctx.settings, access.project)
     paths.check()
     info, error = probe_image(paths, image)
-    label = read_label_file(paths, image.rel_path, info.width if info else None, info.height if info else None)
+    label = read_label_file(paths, image.rel_path, info.width if info else None, info.height if info else None,
+                            blocked=label_block(session, access.project, image))
     table = load_class_table(session, access.project.id, access.project.label_format)
     return build_doc(session, paths, image, label, error, table)
 
@@ -146,7 +153,8 @@ def save_boxes(ctx: AppContext, session: Session, access: ProjectAccess, image: 
     with ctx.label_locks(project.id):
         session.refresh(image)
         info, error = probe_image(paths, image)
-        label = read_label_file(paths, image.rel_path, info.width if info else None, info.height if info else None)
+        label = read_label_file(paths, image.rel_path, info.width if info else None, info.height if info else None,
+                                blocked=label_block(session, project, image))
         if label.readonly_reason:
             raise conflict("readonly", label.readonly_reason)
         if info is None or label.path is None:
@@ -170,8 +178,12 @@ def save_boxes(ctx: AppContext, session: Session, access: ProjectAccess, image: 
         context = ImageContext(width=info.width, height=info.height, depth=info.depth, filename=image.filename,
                                folder=posixpath.basename(folder) if folder else os.path.basename(paths.image_root),
                                path=image_path)
+        # Boxes that came from the file keep the fields this tool does not model (VOC pose, COCO attributes...).
+        origin_of = {box_id: n for n, box_id in enumerate(_box_ids(session, image, label)[0])}
+        origins = [origin_of.get(meta["id"]) for _, meta in written]
         try:
-            data = serialize_label(project.label_format, [b for b, _ in written], context, table.names)
+            data = serialize_label(project.label_format, [b for b, _ in written], context, table.names,
+                                   original=label.data, origins=origins)
         except LabelFormatError as exc:
             raise validation_error(["body", "boxes"], str(exc)) from None
         try:

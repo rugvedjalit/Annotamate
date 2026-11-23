@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -20,11 +21,22 @@ def default_data_dir() -> Path:
     return Path(base) / "annotamate"
 
 
+_BASE_URL_CHARS = re.compile(r"^/[A-Za-z0-9._~\-/]*$")
+
+
 def normalize_base_url(value: str) -> str:
-    """``""`` -> ``"/"``, ``"x"`` / ``"/x"`` -> ``"/x/"``."""
+    """``""`` -> ``"/"``, ``"x"`` / ``"/x"`` -> ``"/x/"``.
+
+    Only unreserved URL characters are accepted (``A-Z a-z 0-9 . _ ~ -`` and ``/``); anything else, and
+    ``.`` / ``..`` path segments, raise ``ValueError`` so a bad value stops the server at start-up.
+    """
     value = (value or "/").strip()
     parts = [p for p in value.split("/") if p]
-    return "/" + "".join(f"{p}/" for p in parts)
+    normalized = "/" + "".join(f"{p}/" for p in parts)
+    if not _BASE_URL_CHARS.match(normalized) or any(p in (".", "..") for p in parts):
+        raise ValueError("base_url may only contain letters, digits and . _ ~ - separated by /, "
+                         f"for example /annotamate/ (got {value!r})")
+    return normalized
 
 
 class Settings(BaseSettings):
@@ -39,6 +51,15 @@ class Settings(BaseSettings):
     secure_cookies: bool = False
     session_days: int = Field(14, ge=1, le=3650)
     max_upload_mb: int = Field(50, ge=1)
+    #: Largest request body for everything except uploads (JSON, forms), in MB.
+    max_body_mb: int = Field(2, ge=1)
+    #: Largest whole upload request (all files together), in MB. ``max_upload_mb`` still limits each file.
+    max_upload_request_mb: int = Field(1024, ge=1)
+    #: Images with more pixels than this are refused (decompression-bomb protection), in megapixels.
+    max_image_megapixels: int = Field(150, ge=1)
+    #: Failed sign-ins allowed per public client address in 10 minutes, across all usernames (0 = no limit).
+    #: Loopback and private addresses only get the per-account limit (see the deployment guide).
+    login_ip_limit: int = Field(30, ge=0)
     log_level: str = "info"
     #: Folder holding the built SPA. Defaults to the ``static`` folder shipped inside the package.
     static_dir: Path | None = None
@@ -89,8 +110,21 @@ class Settings(BaseSettings):
         return self.static_dir or Path(__file__).resolve().parent / "static"
 
     @property
+    def journal_dir(self) -> Path:
+        """Where in-flight multi-file label rewrites are journalled (rolled back at start-up)."""
+        return self.data_dir / "journal"
+
+    @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def max_body_bytes(self) -> int:
+        return self.max_body_mb * 1024 * 1024
+
+    @property
+    def max_upload_request_bytes(self) -> int:
+        return self.max_upload_request_mb * 1024 * 1024
 
     @property
     def api_prefix(self) -> str:

@@ -19,6 +19,7 @@ from annotamate.server.schemas import (
     ProjectCreate,
     ProjectPatch,
     ProjectSummary,
+    PruneResult,
     RescanResult,
     Stats,
     UploadResult,
@@ -29,6 +30,7 @@ from annotamate.server.schemas import (
 from annotamate.server.services import projects as svc
 from annotamate.server.services import serialize
 from annotamate.server.services.access import load_access
+from annotamate.server.services.classes import has_pending_renames, schedule_rename
 from annotamate.server.services.export import Exporter, select_items
 from annotamate.server.services.indexing import index_project
 from annotamate.server.services.labels import load_class_table
@@ -75,11 +77,19 @@ def delete_project(access: Access, ctx: Ctx, db: DB) -> Response:
 
 
 @router.post("/projects/{pid}/rescan", status_code=202, response_model=RescanResult)
-def rescan(access: Access, ctx: Ctx) -> dict:
+def rescan(access: Access, ctx: Ctx, db: DB) -> dict:
     access.require_manage()
     # A rescan requested while one is waiting is merged into it; either way a fresh scan will run.
     started = index_project(ctx, access.project.id, record_activity=True) or ctx.is_indexing(access.project.id)
+    if has_pending_renames(db, access.project.id):  # also retry a class rename that could not finish
+        schedule_rename(ctx, access.project.id)
     return {"started": started}
+
+
+@router.post("/projects/{pid}/prune-missing", response_model=PruneResult)
+def prune_missing(access: Access, ctx: Ctx, db: DB) -> dict:
+    """Permanently remove the images whose files disappeared (managers only)."""
+    return {"removed": svc.prune_missing(ctx, db, access)}
 
 
 @router.get("/projects/{pid}/stats", response_model=Stats)
@@ -152,7 +162,7 @@ def export(access: Access, ctx: Ctx, db: DB, format: Literal["yolo", "voc", "coc
     paths.check()
     table = load_class_table(db, project.id, project.label_format)
     items = select_items(db, project, scope)
-    exporter = Exporter(paths, table, fmt, items, include_images)
+    exporter = Exporter(paths, table, fmt, items, include_images, ctx.label_locks(project.id))
     filename = f"{_slug(project.name)}-{fmt}.zip"
     return StreamingResponse(exporter.stream(), media_type="application/zip",
                              headers={"Content-Disposition": f'attachment; filename="{filename}"',
