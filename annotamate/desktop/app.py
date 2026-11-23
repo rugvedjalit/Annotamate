@@ -718,7 +718,7 @@ class UltimateAnnotator(ctk.CTk):
         except: self.geometry("1400x900")
         
         # --- PATHS ---
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the annotamate package
         self.assets_dir = os.path.join(self.base_dir, "assets")
         self.icon_path = None
 
