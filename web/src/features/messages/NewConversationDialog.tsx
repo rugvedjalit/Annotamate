@@ -2,7 +2,6 @@ import { useNavigate } from 'react-router'
 import { Command } from 'cmdk'
 import { Search, UserRoundX } from 'lucide-react'
 import { useUsers } from '@/hooks/queries'
-import { relativeTime } from '@/lib/format'
 import { Dialog, DialogContent } from '@/components/ui/Dialog'
 import { Avatar } from '@/components/ui/Avatar'
 import { ErrorState, SkeletonRows } from '@/components/ui/Feedback'
@@ -17,7 +16,7 @@ interface NewConversationDialogProps {
 export function NewConversationDialog({ open, onOpenChange, meId }: NewConversationDialogProps) {
   const navigate = useNavigate()
   const users = useUsers(false, open)
-  const people = (users.data ?? []).filter((u) => u.id !== meId && u.is_active)
+  const people = (users.data ?? []).filter((u) => u.id !== meId)
 
   function pick(id: number) {
     onOpenChange(false)
@@ -60,7 +59,7 @@ export function NewConversationDialog({ open, onOpenChange, meId }: NewConversat
                       <div className="truncate font-mono text-2xs text-dim">@{u.username}</div>
                     </div>
                     <span className="shrink-0 text-2xs text-dim">
-                      {u.online ? 'Online' : u.last_seen_at ? `Seen ${relativeTime(u.last_seen_at)}` : ''}
+                      {u.online ? 'Online' : ''}
                     </span>
                   </Command.Item>
                 ))}

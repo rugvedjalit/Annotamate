@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { generatePassword, safeNext, suggestUsername, validatePassword, validateUsername } from './validation'
+import { generatePassword, safeNext, suggestUsername, validatePassword, validateSetupToken, validateUsername } from './validation'
 
 describe('validateUsername', () => {
   it('accepts 3–32 chars of [a-z0-9_.-]', () => {
@@ -60,5 +60,12 @@ describe('safeNext', () => {
     expect(safeNext('javascript:alert(1)')).toBe('/')
     expect(safeNext('/login?next=/x')).toBe('/')
     expect(safeNext('/setup')).toBe('/')
+  })
+})
+
+describe('validateSetupToken', () => {
+  it('requires a non-blank token', () => {
+    expect(validateSetupToken('  ')).not.toBeNull()
+    expect(validateSetupToken('abc123')).toBeNull()
   })
 })

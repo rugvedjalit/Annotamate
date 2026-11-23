@@ -8,6 +8,7 @@ import {
   getNotifications,
   getProject,
   getProjects,
+  getAdminUsers,
   getUsers,
 } from '@/lib/endpoints'
 
@@ -46,6 +47,14 @@ export function useUsers(includeInactive = false, enabled = true) {
     queryFn: ({ signal }) => getUsers(includeInactive, { signal }),
     staleTime: 30_000,
     enabled,
+  })
+}
+
+export function useAdminUsers(includeInactive = false) {
+  return useQuery({
+    queryKey: qk.adminUsers(includeInactive),
+    queryFn: ({ signal }) => getAdminUsers(includeInactive, { signal }),
+    staleTime: 30_000,
   })
 }
 

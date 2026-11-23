@@ -14,6 +14,10 @@ export function validatePassword(v: string): string | null {
   return null
 }
 
+export function validateSetupToken(v: string): string | null {
+  return v.trim() ? null : 'Enter the setup token from the server log.'
+}
+
 /** Suggest a username from a display name ("Alice Kim" → "alice.kim"). */
 export function suggestUsername(displayName: string): string {
   return displayName

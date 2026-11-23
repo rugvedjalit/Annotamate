@@ -21,7 +21,7 @@ import {
   upsertConversation,
   upsertImageItem,
 } from '@/lib/cacheUpdates'
-import type { Conversation, Notification, UserWithPresence } from '@/lib/types'
+import type { Conversation, Notification, UserListItem } from '@/lib/types'
 import { playChime } from '@/lib/sound'
 import { realtime, useRealtime } from '@/stores/realtime'
 import { useSession } from '@/stores/session'
@@ -66,7 +66,7 @@ const TOAST_TYPES = new Set<Notification['type']>([
 function findUserBrief(qc: QueryClient, userId: number) {
   const conv = qc.getQueryData<Conversation[]>(qk.conversations)?.find((c) => c.user.id === userId)
   if (conv) return conv.user
-  for (const [, users] of qc.getQueriesData<UserWithPresence[]>({ queryKey: qk.usersAll })) {
+  for (const [, users] of qc.getQueriesData<UserListItem[]>({ queryKey: qk.usersAll })) {
     const u = users?.find((x) => x.id === userId)
     if (u) return u
   }

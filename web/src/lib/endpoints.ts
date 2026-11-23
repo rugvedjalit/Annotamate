@@ -46,6 +46,7 @@ import type {
   UpdateUserBody,
   UploadResult,
   User,
+  UserListItem,
   UserWithPresence,
 } from './types'
 import { apiUrl } from './config'
@@ -74,6 +75,9 @@ export const putMySettings = (body: Record<string, unknown>) => http.put<Record<
 
 // ---------- Users ----------
 export const getUsers = (includeInactive = false, o?: Opts) =>
+  http.get<UserListItem[]>('users', { ...o, query: { include_inactive: includeInactive || undefined } })
+/** Administrators only: the server returns the full account shape to them. */
+export const getAdminUsers = (includeInactive = false, o?: Opts) =>
   http.get<UserWithPresence[]>('users', { ...o, query: { include_inactive: includeInactive || undefined } })
 export const createUser = (body: CreateUserBody) => http.post<User>('users', body)
 export const updateUser = (id: number, body: UpdateUserBody) => http.patch<User>(`users/${id}`, body)
@@ -91,6 +95,7 @@ export const createProject = (body: CreateProjectBody) => http.post<Project>('pr
 export const getProject = (pid: number, o?: Opts) => http.get<Project>(`projects/${pid}`, o)
 export const updateProject = (pid: number, body: UpdateProjectBody) => http.patch<Project>(`projects/${pid}`, body)
 export const deleteProject = (pid: number) => http.delete(`projects/${pid}`)
+export const pruneMissingImages = (pid: number) => http.post<{ removed: number }>(`projects/${pid}/prune-missing`)
 export const rescanProject = (pid: number) => http.post<{ started: boolean }>(`projects/${pid}/rescan`)
 /** Stats with 'daily' bucketed in the browser's calendar (UTC offset in minutes, east positive). */
 export const getProjectStats = (pid: number, o?: Opts) =>

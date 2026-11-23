@@ -9,6 +9,7 @@ export const qk = {
   authState: ['auth', 'state'] as const,
   settings: ['me', 'settings'] as const,
   users: (includeInactive = false) => ['users', { includeInactive }] as const,
+  adminUsers: (includeInactive = false) => ['users', 'admin', { includeInactive }] as const,
   usersAll: ['users'] as const,
   fsRoots: ['fs', 'roots'] as const,
   fsBrowse: (path: string) => ['fs', 'browse', path] as const,

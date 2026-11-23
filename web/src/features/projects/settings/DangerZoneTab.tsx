@@ -1,9 +1,9 @@
 import { useId, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
-import { Archive, ArchiveRestore, Trash2 } from 'lucide-react'
+import { Archive, ArchiveRestore, FileX2, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
-import { deleteProject } from '@/lib/endpoints'
+import { deleteProject, pruneMissingImages } from '@/lib/endpoints'
 import { errorMessage } from '@/lib/api'
 import { qk } from '@/lib/queryKeys'
 import type { Project } from '@/lib/types'
@@ -21,6 +21,7 @@ export function DangerZoneTab({ project }: { project: Project }) {
   const [confirmArchive, setConfirmArchive] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [typed, setTyped] = useState('')
+  const [confirmPrune, setConfirmPrune] = useState(false)
 
   async function remove() {
     try {
@@ -35,8 +36,40 @@ export function DangerZoneTab({ project }: { project: Project }) {
     toast.success(`Deleted “${project.name}”`, { description: 'Images and label files on disk were not touched.' })
   }
 
+  async function prune() {
+    try {
+      const { removed } = await pruneMissingImages(project.id)
+      toast.success(`Removed ${removed} missing ${removed === 1 ? 'image' : 'images'} from the project`)
+    } catch (err) {
+      toast.error('Could not remove the missing images', { description: errorMessage(err) })
+      throw err
+    }
+    void qc.invalidateQueries({ queryKey: qk.project(project.id) })
+    void qc.invalidateQueries({ queryKey: qk.projectsAll })
+  }
+
   return (
     <div className="flex flex-col gap-5">
+      {project.missing_count > 0 && project.permissions.can_manage && (
+        <SettingsCard
+          tone="danger"
+          title="Missing images"
+          description="Files that were indexed earlier but are no longer in the image folder."
+          footer={
+            <Button variant="danger" onClick={() => setConfirmPrune(true)}>
+              <FileX2 />
+              Remove {project.missing_count} missing {project.missing_count === 1 ? 'image' : 'images'}
+            </Button>
+          }
+        >
+          <p className="text-sm text-muted">
+            {project.missing_count} {project.missing_count === 1 ? 'image is' : 'images are'} hidden from lists, counts and
+            exports while the file is gone. If a file comes back, a rescan restores the image with its comments and history.
+            Removing them deletes that history permanently.
+          </p>
+        </SettingsCard>
+      )}
+
       <SettingsCard
         title={project.archived ? 'Restore project' : 'Archive project'}
         description={
@@ -86,6 +119,15 @@ export function DangerZoneTab({ project }: { project: Project }) {
         </SettingsCard>
       )}
 
+      <ConfirmDialog
+        open={confirmPrune}
+        onOpenChange={setConfirmPrune}
+        danger
+        title="Remove missing images?"
+        description={`${project.missing_count} images whose files are gone will be removed with their comments, revisions and status. This cannot be undone. Files on disk are not touched.`}
+        confirmLabel="Remove"
+        onConfirm={prune}
+      />
       <ConfirmDialog
         open={confirmArchive}
         onOpenChange={setConfirmArchive}

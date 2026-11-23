@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import type { UserBrief } from '@/lib/types'
 import { realtime, useRealtime } from '@/stores/realtime'
 import { useSession } from '@/stores/session'
+import { reactToLockExpired, reactToLockState } from './lockLogic'
 
 export type LockStatus =
   | 'disabled' // the user cannot edit this image anyway
@@ -47,8 +48,12 @@ export function useImageLock(imageId: number, wanted: boolean): ImageLock {
   useEffect(() => {
     if (!wanted) return
     const me = () => useSession.getState().user?.id
-    const set = (status: LockStatus, holder: UserBrief | null = null) =>
+    const set = (status: LockStatus, holder: UserBrief | null = null) => {
+      // Keep the ref current right away: messages arriving in the same tick (revoked, then the new holder's
+      // lock.state) must see the status the previous one set, not the last rendered one.
+      if (stateRef.current.imageId === imageId) stateRef.current = { imageId, status, holder }
       setState((s) => (s.imageId === imageId ? { imageId, status, holder } : s))
+    }
 
     const offs = [
       realtime.on('lock.granted', (m) => {
@@ -74,19 +79,21 @@ export function useImageLock(imageId: number, wanted: boolean): ImageLock {
       }),
       realtime.on('lock.state', (m) => {
         if (m.image_id !== imageId) return
-        if (m.holder === null) {
-          const s = stateRef.current
-          if (s.imageId === imageId && (s.status === 'denied' || s.status === 'revoked')) {
-            // The holder left: ask for the lock again.
-            realtime.acquireLock(imageId)
-            set('acquiring')
-          }
-        } else if (m.holder.id !== me()) {
-          setState((s) =>
-            s.imageId === imageId && (s.status === 'acquiring' || s.status === 'unavailable')
-              ? { imageId, status: 'denied', holder: m.holder }
-              : s,
-          )
+        const reaction = reactToLockState(stateRef.current.status, m.holder, me())
+        if (stateRef.current.imageId !== imageId) return
+        if (reaction.kind === 'reacquire') {
+          realtime.acquireLock(imageId)
+          set('acquiring')
+        } else if (reaction.kind === 'denied') {
+          set('denied', reaction.holder)
+        }
+      }),
+      // The server swept our lock for inactivity: ask again; if someone else got it meanwhile we end up read-only.
+      realtime.on('lock.expired', (m) => {
+        if (m.image_id !== imageId) return
+        if (reactToLockExpired(stateRef.current.status).kind === 'reacquire') {
+          realtime.acquireLock(imageId)
+          set('acquiring')
         }
       }),
     ]

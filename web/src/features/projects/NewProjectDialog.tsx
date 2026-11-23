@@ -122,7 +122,7 @@ export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) 
   const candidates = useMemo(() => {
     const q = memberQuery.trim().toLowerCase()
     return (users.data ?? [])
-      .filter((u) => u.id !== me?.id && u.is_active)
+      .filter((u) => u.id !== me?.id)
       .filter((u) => !q || u.display_name.toLowerCase().includes(q) || u.username.includes(q))
   }, [users.data, memberQuery, me?.id])
 

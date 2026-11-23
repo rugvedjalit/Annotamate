@@ -195,4 +195,27 @@ describe('useAnnotationDoc', () => {
     expect(onLocked).toHaveBeenCalledWith(holder)
     expect(result.current.state.save).toBe('error')
   })
+
+  it('a save finishing after the workspace unmounted still updates the history cache', async () => {
+    let finish: (r: SaveAnnotationResult) => void = () => undefined
+    saveAnnotation.mockReturnValueOnce(new Promise<SaveAnnotationResult>((resolve) => (finish = resolve)))
+    const { result, unmount } = setup()
+    await waitFor(() => expect(result.current.ready).toBe(true))
+    act(() => result.current.commit([...result.current.boxes, { id: 'b', classId: 1, rawLabel: null, x1: 1, y1: 1, x2: 5, y2: 5 }]))
+    let pending: Promise<boolean> = Promise.resolve(false)
+    act(() => {
+      pending = result.current.save()
+    })
+    await waitFor(() => expect(saveAnnotation).toHaveBeenCalledTimes(1))
+    unmount()
+    expect(docHistoryCache.get('1:5')?.save).toBe('saving')
+    await act(async () => {
+      finish({ version: 'v2', updated_at: '2026-11-23T10:00:00Z', box_count: 2, image, boxes: [] })
+      await pending
+    })
+    const cached = docHistoryCache.get('1:5')
+    expect(cached?.save).toBe('saved')
+    expect(cached?.baseVersion).toBe('v2')
+    expect(cached?.dirty).toBe(false)
+  })
 })

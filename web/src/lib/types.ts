@@ -29,7 +29,11 @@ export interface User extends UserBrief {
   last_seen_at: string | null
 }
 
+/** Admin view of an account (what `GET /users` returns to administrators). */
 export type UserWithPresence = User & { online: boolean }
+
+/** What every signed-in user sees in the people lists (pickers, DMs): no email, no admin flag. */
+export type UserListItem = UserBrief & { online: boolean }
 
 export interface ProjectSettings {
   require_review: boolean
@@ -69,6 +73,8 @@ export interface ProjectSummary {
   unread_chat: number
   archived: boolean
   indexing: boolean
+  /** Images whose file disappeared from disk (hidden everywhere until the file returns or they are removed). */
+  missing_count: number
   created_at: string
   updated_at: string
   /** Up to 5 members for the project card (managers first, then by name). */
@@ -255,6 +261,8 @@ export interface Meta {
 
 export interface AuthState {
   setup_required: boolean
+  /** First-run setup needs the token printed in the server log (the client is not on the server itself). */
+  setup_token_required?: boolean
   user: User | null
 }
 
@@ -262,6 +270,7 @@ export interface SetupBody {
   username: string
   display_name: string
   password: string
+  setup_token?: string
 }
 
 export interface LoginBody {
@@ -488,6 +497,7 @@ export interface ServerMessageMap {
   'lock.granted': { type: 'lock.granted'; image_id: number }
   'lock.denied': { type: 'lock.denied'; image_id: number; holder: UserBrief }
   'lock.revoked': { type: 'lock.revoked'; image_id: number; by: UserBrief }
+  'lock.expired': { type: 'lock.expired'; image_id: number }
   'lock.state': { type: 'lock.state'; project_id: number; image_id: number; holder: UserBrief | null }
   'image.updated': {
     type: 'image.updated'

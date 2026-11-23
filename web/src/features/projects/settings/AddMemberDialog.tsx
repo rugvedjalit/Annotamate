@@ -34,7 +34,7 @@ export function AddMemberDialog({ projectId, members, onOpenChange }: AddMemberD
     const memberIds = new Set(members.map((m) => m.user.id))
     const q = query.trim().toLowerCase()
     return (users.data ?? [])
-      .filter((u) => u.is_active && !memberIds.has(u.id))
+      .filter((u) => !memberIds.has(u.id))
       .filter((u) => !q || u.display_name.toLowerCase().includes(q) || u.username.includes(q))
   }, [users.data, members, query])
   const pickedUser = users.data?.find((u) => u.id === picked)
@@ -109,7 +109,6 @@ export function AddMemberDialog({ projectId, members, onOpenChange }: AddMemberD
                     <span className="block truncate text-base text-fg">{u.display_name}</span>
                     <span className="block truncate font-mono text-xs text-dim">@{u.username}</span>
                   </span>
-                  {u.is_admin && <span className="text-xs text-muted">Admin</span>}
                 </button>
               ))
             )}

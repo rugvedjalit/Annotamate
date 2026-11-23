@@ -15,7 +15,7 @@ import { Input } from '@/components/ui/Input'
 import { LoadingBlock } from '@/components/ui/Feedback'
 import { AuthLayout } from './AuthLayout'
 import { PasswordInput } from './PasswordInput'
-import { suggestUsername, validatePassword, validateUsername } from './validation'
+import { suggestUsername, validatePassword, validateSetupToken, validateUsername } from './validation'
 
 export function SetupPage() {
   const auth = useAuthState()
@@ -27,6 +27,7 @@ export function SetupPage() {
   const [usernameEdited, setUsernameEdited] = useState(false)
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
+  const [setupToken, setSetupToken] = useState('')
   const [touched, setTouched] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
@@ -35,7 +36,9 @@ export function SetupPage() {
   if (auth.isPending) return <LoadingBlock className="h-full" />
   if (auth.data && !auth.data.setup_required) return <Navigate to={auth.data.user ? '/' : '/login'} replace />
 
+  const tokenRequired = auth.data?.setup_token_required === true
   const errors = {
+    setup_token: tokenRequired ? (validateSetupToken(setupToken) ?? fieldErrors.setup_token ?? null) : null,
     display_name: !displayName.trim() ? 'Enter your name.' : null,
     username: validateUsername(username) ?? fieldErrors.username ?? null,
     password: validatePassword(password) ?? fieldErrors.password ?? null,
@@ -50,7 +53,12 @@ export function SetupPage() {
     setBusy(true)
     setError(null)
     try {
-      const user = await setupAdmin({ username, display_name: displayName.trim(), password })
+      const user = await setupAdmin({
+        username,
+        display_name: displayName.trim(),
+        password,
+        ...(tokenRequired ? { setup_token: setupToken.trim() } : {}),
+      })
       setUser(user)
       qc.setQueryData<AuthState>(qk.authState, { setup_required: false, user })
       toast.success('Administrator account created', { description: 'Next, create your first project.' })
@@ -83,11 +91,34 @@ export function SetupPage() {
             {error}
           </div>
         )}
+        {tokenRequired && (
+          <Field
+            label="Setup token"
+            htmlFor="setup-token"
+            hint="Printed in the server log, e.g. “docker compose logs annotamate”, and in the console when you run `annotamate serve`."
+            error={show('setup_token')}
+          >
+            <Input
+              id="setup-token"
+              size="lg"
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              value={setupToken}
+              className="font-mono"
+              onChange={(e) => {
+                setFieldErrors((f) => ({ ...f, setup_token: '' }))
+                setSetupToken(e.target.value)
+              }}
+              aria-invalid={!!show('setup_token')}
+            />
+          </Field>
+        )}
         <Field label="Your name" htmlFor="setup-name" error={show('display_name')}>
           <Input
             id="setup-name"
             size="lg"
-            autoFocus
+            autoFocus={!tokenRequired}
             autoComplete="name"
             value={displayName}
             onChange={(e) => {

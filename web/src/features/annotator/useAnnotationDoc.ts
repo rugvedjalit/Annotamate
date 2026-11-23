@@ -57,6 +57,8 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
   const retryAttempt = useRef(0)
   const [loadNonce, setLoadNonce] = useState(0)
   const skipStash = useRef(false)
+  /** The document this hook instance currently displays (null once it unmounted or moved on). */
+  const activeKey = useRef<string | null>(null)
 
   useEffect(() => {
     optsRef.current = options
@@ -69,10 +71,13 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
     setState(next)
   }, [])
 
-  /** Apply to the live state if it is still this document, else to its cached copy. */
+  /**
+   * Apply to the live state if this instance still displays the document, else to its cached copy. An
+   * unmounted workspace keeps its last state in the cache, so a save that finishes later still lands there.
+   */
   const applyFor = useCallback(
     (docKey: string, action: DocAction) => {
-      if (stateRef.current.key === docKey) apply(action)
+      if (activeKey.current === docKey && stateRef.current.key === docKey) apply(action)
       else docHistoryCache.update(docKey, (s) => docReducer(s, action))
     },
     [apply],
@@ -80,6 +85,7 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
 
   // ------------------------------------------------------------------ load / restore
   useEffect(() => {
+    activeKey.current = key
     const cached = docHistoryCache.get(key)
     if (cached && cached.status === 'ready') {
       apply({ type: 'restore', state: cached })
@@ -116,6 +122,7 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
 
     return () => {
       cancelled = true
+      activeKey.current = null
       const s = stateRef.current
       if (!skipStash.current && s.key === key && s.status === 'ready') docHistoryCache.put(key, s)
       skipStash.current = false
@@ -213,7 +220,7 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
 
   // Automatic retry with backoff for network/server errors (autosave mode).
   useEffect(() => {
-    if (!options.autosave || !options.canSave || state.save !== 'error' || state.key !== key) return
+    if (!options.autosave || !options.canSave || state.save !== 'error' || state.key !== key || state.readonlyReason) return
     const attempt = retryAttempt.current
     if (attempt >= RETRY_DELAYS_MS.length) return
     const t = setTimeout(() => {
@@ -221,7 +228,7 @@ export function useAnnotationDoc(projectId: number, imageId: number, options: Do
       void save()
     }, RETRY_DELAYS_MS[attempt])
     return () => clearTimeout(t)
-  }, [state.save, state.key, state.saveError, key, options.autosave, options.canSave, save])
+  }, [state.save, state.key, state.saveError, state.readonlyReason, key, options.autosave, options.canSave, save])
 
   // Warn before closing the tab only while there is unsaved work.
   const unsaved = state.key === key && (state.dirty || state.save === 'saving')

@@ -37,7 +37,8 @@ export function MessagesPage() {
     if (fromUsers) return fromUsers
     return conversations.data?.find((c) => c.user.id === userId)?.user ?? null
   }, [userId, users.data, conversations.data])
-  const lastSeenAt = users.data?.find((u) => u.id === userId)?.last_seen_at ?? null
+  // The people list no longer carries last-seen times for non-admins.
+  const lastSeenAt = null
   const resolving = userId !== null && !selectedUser && (users.isPending || conversations.isPending)
 
   return (

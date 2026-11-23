@@ -16,7 +16,7 @@ import {
 import type { UserWithPresence } from '@/lib/types'
 import { formatDate, formatDateTime, relativeTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { useUsers } from '@/hooks/queries'
+import { useAdminUsers } from '@/hooks/queries'
 import { useMe } from '@/stores/session'
 import { useIsOnline, useRealtime } from '@/stores/realtime'
 import { generatePassword } from '@/features/auth/validation'
@@ -50,7 +50,7 @@ type Confirm =
 export function UsersPage() {
   const me = useMe()
   const [showInactive, setShowInactive] = useState(false)
-  const users = useUsers(showInactive)
+  const users = useAdminUsers(showInactive)
   const [search, setSearch] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [editing, setEditing] = useState<UserWithPresence | null>(null)
