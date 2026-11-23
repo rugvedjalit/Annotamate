@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, including ones stacked on other feature branches.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 # Least privilege: every job only needs to read the repository.
