@@ -56,7 +56,7 @@ SECURITY_HEADERS = {
     "x-frame-options": "DENY",
     "cross-origin-opener-policy": "same-origin",
     "cross-origin-resource-policy": "same-origin",
-    "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+    "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
 }
 #: Sent with ``secure_cookies`` (the app is served over HTTPS): browsers then refuse plain HTTP for a year.
 HSTS = "max-age=31536000"
