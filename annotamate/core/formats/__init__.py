@@ -42,14 +42,20 @@ def parse_label(fmt: str, data: bytes, width: float | None = None, height: float
     raise ValueError(f"unknown label format {fmt!r}")
 
 
-def serialize_label(fmt: str, boxes: list[Box], image: ImageContext, class_names: list[str]) -> bytes:
-    """Serialise boxes for ``fmt``. ``class_names`` is the project's class order (used by COCO categories)."""
+def serialize_label(fmt: str, boxes: list[Box], image: ImageContext, class_names: list[str], *,
+                    original: bytes | None = None, origins: list[int | None] | None = None) -> bytes:
+    """Serialise boxes for ``fmt``. ``class_names`` is the project's class order (used by COCO categories).
+
+    VOC and COCO patch ``original`` (the file's current bytes) when given: ``origins[i]`` is the index, among
+    the boxes parsed from ``original``, that box ``i`` stems from (``None`` for a new box); fields the tool
+    does not model are kept for those boxes and for the document itself. YOLO has nothing to preserve.
+    """
     if fmt == "yolo":
         return yolo.dump(boxes, image).encode("utf-8")
     if fmt == "voc":
-        return voc.dump(boxes, image)
+        return voc.dump(boxes, image, original=original, origins=origins)
     if fmt == "coco":
-        return coco.dump(boxes, image, class_names)
+        return coco.dump(boxes, image, class_names, original=original, origins=origins)
     raise ValueError(f"unknown label format {fmt!r}")
 
 

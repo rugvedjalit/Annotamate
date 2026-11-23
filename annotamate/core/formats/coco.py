@@ -6,6 +6,7 @@ Each file looks like ``{"images": [one image], "annotations": [...], "categories
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from typing import Any
@@ -74,8 +75,86 @@ def _categories(boxes: list[Box], class_names: list[str]) -> tuple[list[dict[str
     return categories, ids
 
 
-def dump(boxes: list[Box], image: ImageContext, class_names: list[str]) -> bytes:
-    """Serialise boxes; category ids are ``index + 1`` in ``class_names``."""
+def _original_document(original: bytes | None) -> dict[str, Any] | None:
+    """The parsed original file when it can be patched (one image, plain boxes, one annotation per box)."""
+    if original is None:
+        return None
+    try:
+        doc = _load(original)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    parsed = parse(original)
+    annotations = doc.get("annotations") or []
+    if (parsed.readonly_reason or not isinstance(annotations, list) or len(annotations) != len(parsed.boxes)
+            or not all(isinstance(a, dict) for a in annotations)):
+        return None
+    return doc
+
+
+def _unchanged(box: Box, before: Box) -> bool:
+    return all(abs(a - b) < 0.0005 for a, b in ((box.x1, before.x1), (box.y1, before.y1),
+                                                  (box.x2, before.x2), (box.y2, before.y2)))
+
+
+def _patch(doc: dict[str, Any], boxes: list[Box], image: ImageContext, class_names: list[str],
+           origins: list[int | None]) -> dict[str, Any]:
+    """Update the original document: unmapped fields, ids and document-level extras are kept."""
+    old_annotations: list[dict[str, Any]] = doc.get("annotations") or []
+    old_boxes = parse(json.dumps(doc).encode("utf-8")).boxes
+    categories = [dict(c) for c in doc.get("categories") or [] if isinstance(c, dict) and "id" in c]
+    ids = {str(c.get("name", c["id"])): c["id"] for c in categories}
+    next_category = max((c["id"] for c in categories if isinstance(c["id"], int)), default=0) + 1
+    for name in [*class_names, *(b.label for b in boxes)]:
+        if name not in ids:
+            ids[name] = next_category
+            categories.append({"id": next_category, "name": name, "supercategory": "none"})
+            next_category += 1
+    images = doc.get("images")
+    first = dict(images[0]) if isinstance(images, list) and images and isinstance(images[0], dict) else {"id": 1}
+    first.update(width=image.width, height=image.height, file_name=image.filename)
+    image_id = first.get("id", 1)
+    used = {a["id"] for a in old_annotations if isinstance(a.get("id"), int)}
+    next_id = max(used, default=0) + 1
+    annotations: list[dict[str, Any]] = []
+    for i, box in enumerate(boxes):
+        b = clamp(box, image.width, image.height) if image.width > 0 and image.height > 0 else box
+        if b.width <= 0 or b.height <= 0:
+            continue
+        origin = origins[i] if i < len(origins) else None
+        if origin is not None and 0 <= origin < len(old_annotations):
+            ann = copy.deepcopy(old_annotations[origin])
+            before = old_boxes[origin]
+            if not _unchanged(b, before):
+                ann["bbox"] = [_round(b.x1), _round(b.y1), _round(b.width), _round(b.height)]
+                ann["area"] = _round(b.width * b.height)
+            if box.label != before.label:
+                ann["category_id"] = ids[box.label]
+        else:
+            ann = {"id": next_id, "image_id": image_id, "category_id": ids[box.label], "segmentation": [],
+                   "area": _round(b.width * b.height),
+                   "bbox": [_round(b.x1), _round(b.y1), _round(b.width), _round(b.height)], "iscrowd": 0}
+            next_id += 1
+        annotations.append(ann)
+    out = dict(doc)
+    out["images"] = [first, *(images[1:] if isinstance(images, list) else [])]
+    out["annotations"] = annotations
+    out["categories"] = categories
+    return out
+
+
+def dump(boxes: list[Box], image: ImageContext, class_names: list[str], *, original: bytes | None = None,
+         origins: list[int | None] | None = None) -> bytes:
+    """Serialise boxes; category ids are ``index + 1`` in ``class_names``.
+
+    With ``original`` (the file's current bytes) the document is patched instead of rebuilt: box ``i``
+    that stems from original annotation ``origins[i]`` keeps its other fields (``attributes``, ``iscrowd``,
+    ``score``, ids...), and document-level extras (``info``, ``licenses``...) and category ids are kept.
+    New boxes are written in the standard shape.
+    """
+    base = _original_document(original)
+    if base is not None:
+        patched = _patch(base, boxes, image, class_names, origins or [])
+        return (json.dumps(patched, indent=4, ensure_ascii=False) + "\n").encode("utf-8")
     categories, ids = _categories(boxes, class_names)
     annotations = []
     for box in boxes:

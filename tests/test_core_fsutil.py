@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -301,3 +302,152 @@ def test_create_unique_without_extension(tmp_path: Path):
     path, fd = create_unique(str(tmp_path), "README")
     os.close(fd)
     assert os.path.basename(path) == "README-1"
+
+
+def hidden_leftovers(folder: Path) -> list[str]:
+    return sorted(p.name for p in folder.iterdir() if p.name.endswith((".tmp", ".bak")))
+
+
+def fail_replace_on(monkeypatch: pytest.MonkeyPatch, bad_name: str, *, also_restore: bool = False) -> None:
+    """Make ``fsutil._replace`` fail when it would put new content on ``bad_name`` (or restore it)."""
+    real = fsutil._replace
+
+    def flaky(src: str, dst: str) -> None:
+        if os.path.basename(dst) == bad_name and (also_restore or src.endswith(".tmp")):
+            raise PermissionError(13, "file is in use", dst)
+        real(src, dst)
+
+    monkeypatch.setattr(fsutil, "_replace", flaky)
+
+
+def test_atomic_write_many_rolls_back_when_a_replace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    paths = [tmp_path / f"{n}.txt" for n in range(4)]
+    for p in paths:
+        p.write_text("old")
+    fail_replace_on(monkeypatch, "2.txt")
+    journals = tmp_path / "journal"
+    with pytest.raises(PermissionError):
+        atomic_write_many([(str(p), b"new") for p in paths], journal_dir=str(journals))
+    assert [p.read_text() for p in paths] == ["old"] * 4
+    assert hidden_leftovers(tmp_path) == []
+    assert not list(journals.iterdir())
+
+
+def test_atomic_write_many_reports_files_that_cannot_be_restored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    paths = [tmp_path / f"{n}.txt" for n in range(3)]
+    for p in paths:
+        p.write_text("old")
+    real = fsutil._replace
+
+    def flaky(src: str, dst: str) -> None:
+        name = os.path.basename(dst)
+        if name == "2.txt" and src.endswith(".tmp"):
+            raise PermissionError(13, "in use", dst)
+        if name == "0.txt" and src.endswith(".bak"):
+            raise PermissionError(13, "in use", dst)
+        real(src, dst)
+
+    monkeypatch.setattr(fsutil, "_replace", flaky)
+    journals = tmp_path / "journal"
+    with pytest.raises(fsutil.MigrationIncompleteError) as info:
+        atomic_write_many([(str(p), b"new") for p in paths], journal_dir=str(journals))
+    assert [os.path.basename(f) for f in info.value.files] == ["0.txt"]
+    assert paths[0].read_text() == "new"  # still holds the new content ...
+    assert paths[1].read_text() == "old"  # ... while the restorable files are back
+    assert any(p.name.endswith(".bak") for p in tmp_path.iterdir())  # ... and its backup is kept
+    assert list(journals.iterdir())
+    monkeypatch.undo()
+    assert len(fsutil.recover_journals(str(journals))) == 1  # a later start-up can still restore it
+    assert paths[0].read_text() == "old"
+    assert hidden_leftovers(tmp_path) == []
+
+
+def test_atomic_write_many_preflight_rejects_read_only_files(tmp_path: Path):
+    paths = [tmp_path / "a.txt", tmp_path / "b.txt"]
+    for p in paths:
+        p.write_text("old")
+    os.chmod(paths[1], stat.S_IREAD)
+    try:
+        with pytest.raises(PermissionError):
+            atomic_write_many([(str(p), b"new") for p in paths])
+        assert [p.read_text() for p in paths] == ["old", "old"]
+        assert hidden_leftovers(tmp_path) == []
+    finally:
+        os.chmod(paths[1], stat.S_IWRITE | stat.S_IREAD)
+
+
+def test_recover_journals_restores_after_a_crash(tmp_path: Path):
+    paths = [tmp_path / f"{n}.txt" for n in range(3)]
+    for p in paths:
+        p.write_text("old")
+    # State after a crash in phase 2: two files already replaced, the journal and all leftovers on disk.
+    for p in paths[:2]:
+        p.write_text("new")
+    journals = _crash_journal(tmp_path, paths)
+    restored = fsutil.recover_journals(str(journals))
+    assert sorted(restored) == sorted(str(p) for p in paths[:2])  # the third was never replaced
+    assert [p.read_text() for p in paths] == ["old"] * 3
+    assert hidden_leftovers(tmp_path) == []
+    assert not list(journals.iterdir())
+    assert fsutil.recover_journals(str(journals)) == []
+
+
+def _crash_journal(tmp_path: Path, paths: list[Path], *, old: bytes = b"old", new: bytes = b"new") -> Path:
+    """Leftovers of a run that wrote ``new`` over ``old`` and crashed: backups, temporaries and the journal."""
+    import hashlib
+
+    entries = []
+    for p in paths:
+        bak = tmp_path / f".{p.name}.deadbeef.bak"
+        bak.write_bytes(old)
+        tmp = tmp_path / f".{p.name}.deadbeef.tmp"
+        tmp.write_bytes(new)
+        entries.append({"path": str(p), "tmp": str(tmp), "bak": str(bak),
+                        "old": hashlib.sha256(old).hexdigest(), "new": hashlib.sha256(new).hexdigest()})
+    journals = tmp_path / "journal"
+    journals.mkdir()
+    (journals / "label-rewrite-crash.json").write_text(json.dumps({"files": entries}))
+    return journals
+
+
+def test_recovery_leaves_files_saved_after_the_crash_alone(tmp_path: Path):
+    target = tmp_path / "a.txt"
+    journals = _crash_journal(tmp_path, [target])
+    target.write_text("saved later")  # neither the old nor the rewritten content
+    assert fsutil.recover_journals(str(journals)) == []
+    assert target.read_text() == "saved later"
+    assert [p.name for p in tmp_path.glob(".a.txt.*.bak")]  # the old content is kept for inspection
+    assert not list(journals.iterdir())
+
+
+def test_recovery_does_not_restore_a_damaged_backup(tmp_path: Path):
+    target = tmp_path / "a.txt"
+    journals = _crash_journal(tmp_path, [target])
+    target.write_text("new")
+    next(tmp_path.glob(".a.txt.*.bak")).write_text("")  # truncated by a power loss
+    assert fsutil.recover_journals(str(journals)) == []
+    assert target.read_text() == "new"
+
+
+def test_backups_and_journal_record_content_hashes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import hashlib
+
+    target = tmp_path / "a.txt"
+    target.write_bytes(b"old")
+    journals = tmp_path / "journal"
+    seen: list[dict] = []
+    real_replace = fsutil._replace
+
+    def spy(src: str, dst: str) -> None:
+        if src.endswith(".tmp") and not seen:
+            journal = next(journals.iterdir())
+            seen.extend(json.loads(journal.read_text())["files"])
+            bak = seen[0]["bak"]
+            assert Path(bak).read_bytes() == b"old"
+        real_replace(src, dst)
+
+    monkeypatch.setattr(fsutil, "_replace", spy)
+    fsutil.atomic_write_many([(str(target), b"new")], journal_dir=str(journals))
+    assert seen[0]["old"] == hashlib.sha256(b"old").hexdigest()
+    assert seen[0]["new"] == hashlib.sha256(b"new").hexdigest()
+    assert target.read_bytes() == b"new" and not list(journals.iterdir())

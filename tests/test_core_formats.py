@@ -262,7 +262,7 @@ class TestVoc:
         assert root.findtext("size/height") == "20"
         assert root.findtext("filename") == "x.png"
         assert root.findtext("folder") == "folder"
-        assert root.findtext("path") == "/p/x.png"
+        assert root.findtext("path") == "x.png"  # the image name, never a server path
         assert data.startswith(b"<?xml")
 
     def test_half_up_rounding(self):
@@ -527,3 +527,102 @@ def test_sanitize_drops_small_and_non_finite():
 def test_box_size():
     b = Box(1, 2, 4, 8, "a")
     assert (b.width, b.height) == (3, 6)
+
+
+# ------------------------------------------------------------------------------ patching keeps extras
+
+RICH_VOC = b"""<?xml version="1.0"?>
+<annotation>
+  <folder>old</folder><filename>x.jpg</filename><path>/data/x.jpg</path>
+  <source><database>MyDb</database><annotation>PASCAL</annotation></source>
+  <owner><name>someone</name></owner>
+  <size><width>100</width><height>50</height><depth>3</depth><note>kept</note></size>
+  <segmented>0</segmented>
+  <object><name>cat</name><pose>Left</pose><truncated>0</truncated><difficult>0</difficult><occluded>1</occluded>
+    <custom flag="y">hello</custom>
+    <bndbox><xmin>10</xmin><ymin>10</ymin><xmax>30</xmax><ymax>30</ymax></bndbox></object>
+  <object><name>dog</name><pose>Rear</pose><bndbox><xmin>40.5</xmin><ymin>5</ymin><xmax>60</xmax><ymax>25</ymax></bndbox></object>
+</annotation>
+"""
+
+
+class TestPatchingKeepsExtras:
+    CTX = ImageContext(100, 50, 3, "x.jpg", "ds", "/abs/x.jpg")
+
+    def test_voc_roundtrip_keeps_unmodelled_fields(self):
+        parsed = voc.parse(RICH_VOC)
+        assert parsed.readonly_reason is None and len(parsed.boxes) == 2
+        # the dog box is untouched, the cat box moves and becomes a bird; one new box is added
+        boxes = [Box(11, 12, 31, 32, "bird", truncated=True), Box(40.5, 5, 60, 25, "dog"), Box(70, 10, 90, 40, "cat")]
+        out = voc.dump(boxes, self.CTX, original=RICH_VOC, origins=[0, 1, None])
+        root = ET.fromstring(out)
+        assert root.findtext("source/database") == "MyDb" and root.findtext("owner/name") == "someone"
+        assert root.findtext("path") == "x.jpg" and root.findtext("size/note") == "kept"  # no server paths
+        first, second, third = root.findall("object")
+        assert first.findtext("name") == "bird" and first.findtext("pose") == "Left"
+        assert first.findtext("occluded") == "1" and first.findtext("custom") == "hello"
+        assert first.find("custom").get("flag") == "y" and first.findtext("truncated") == "1"
+        assert [first.findtext(f"bndbox/{t}") for t in ("xmin", "ymin", "xmax", "ymax")] == ["11", "12", "31", "32"]
+        assert second.findtext("pose") == "Rear" and second.findtext("bndbox/xmin") == "40.5"  # untouched text
+        assert third.findtext("name") == "cat" and third.findtext("pose") == "Unspecified"
+        assert voc.parse(out).boxes[1] == Box(40.5, 5, 60, 25, "dog")
+
+    def test_voc_deleting_a_box_drops_only_that_object(self):
+        out = voc.dump([Box(40.5, 5, 60, 25, "dog")], self.CTX, original=RICH_VOC, origins=[1])
+        root = ET.fromstring(out)
+        assert [o.findtext("name") for o in root.findall("object")] == ["dog"]
+        assert root.findtext("source/database") == "MyDb"
+
+    def test_voc_polygons_or_garbage_fall_back_to_a_fresh_document(self):
+        out = voc.dump([Box(1, 1, 9, 9, "a")], self.CTX, original=b"not xml", origins=[0])
+        assert ET.fromstring(out).findtext("path") == "x.jpg"
+
+    RICH_COCO = json.dumps({
+        "info": {"year": 2024, "description": "mine"}, "licenses": [{"id": 1, "name": "CC"}],
+        "images": [{"id": 77, "width": 100, "height": 50, "file_name": "old.jpg", "license": 1}],
+        "annotations": [
+            {"id": 501, "image_id": 77, "category_id": 9, "bbox": [10, 10, 20, 20], "area": 400, "iscrowd": 1,
+             "segmentation": [], "attributes": {"occluded": True}, "score": 0.87},
+            {"id": 502, "image_id": 77, "category_id": 4, "bbox": [40, 5, 20, 20], "area": 400, "iscrowd": 0,
+             "segmentation": [], "score": 0.5}],
+        "categories": [{"id": 4, "name": "dog", "supercategory": "animal"},
+                       {"id": 9, "name": "cat", "supercategory": "animal"}],
+    }).encode()
+
+    def test_coco_roundtrip_keeps_unmodelled_fields_and_ids(self):
+        parsed = coco.parse(self.RICH_COCO)
+        assert parsed.readonly_reason is None
+        boxes = [Box(12, 10, 32, 30, "cat"), Box(40, 5, 60, 25, "dog"), Box(70, 10, 90, 40, "bird")]
+        out = json.loads(coco.dump(boxes, self.CTX, ["cat", "dog", "bird"], original=self.RICH_COCO,
+                                   origins=[0, 1, None]))
+        assert out["info"] == {"year": 2024, "description": "mine"} and out["licenses"] == [{"id": 1, "name": "CC"}]
+        assert out["images"][0]["id"] == 77 and out["images"][0]["license"] == 1
+        assert out["images"][0]["file_name"] == "x.jpg"
+        first, second, third = out["annotations"]
+        assert first["id"] == 501 and first["iscrowd"] == 1 and first["score"] == 0.87
+        assert first["attributes"] == {"occluded": True} and first["bbox"] == [12, 10, 20, 20]
+        assert first["category_id"] == 9  # same class: category id untouched
+        assert second["bbox"] == [40, 5, 20, 20] and second["score"] == 0.5 and second["id"] == 502
+        assert third["id"] == 503 and third["image_id"] == 77 and third["iscrowd"] == 0
+        cats = {c["name"]: c for c in out["categories"]}
+        assert cats["dog"]["id"] == 4 and cats["dog"]["supercategory"] == "animal"
+        assert third["category_id"] == cats["bird"]["id"] not in (4, 9)
+
+    def test_coco_class_change_uses_the_category_id_of_the_new_class(self):
+        out = json.loads(coco.dump([Box(10, 10, 30, 30, "dog")], self.CTX, ["cat", "dog"],
+                                   original=self.RICH_COCO, origins=[0]))
+        assert out["annotations"][0]["category_id"] == 4 and out["annotations"][0]["attributes"] == {"occluded": True}
+
+
+
+def test_voc_patch_replaces_an_absolute_path_with_the_file_name():
+    from annotamate.core.formats import voc
+
+    original = (b"<annotation><folder>imgs</folder><filename>a.jpg</filename>"
+                b"<path>/srv/secret/datasets/imgs/a.jpg</path><size><width>100</width><height>100</height>"
+                b"<depth>3</depth></size><object><name>car</name><bndbox><xmin>1</xmin><ymin>1</ymin>"
+                b"<xmax>9</xmax><ymax>9</ymax></bndbox></object></annotation>")
+    boxes = voc.parse(original).boxes
+    image = ImageContext(width=100, height=100, depth=3, filename="a.jpg", folder="imgs", path="/srv/x/a.jpg")
+    out = voc.dump(boxes, image, original=original).decode()
+    assert "/srv/secret" not in out and "<path>a.jpg</path>" in out

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import xml.etree.ElementTree as ET
 
@@ -85,34 +86,116 @@ def _sub(parent: ET.Element, tag: str, text: str) -> ET.Element:
     return element
 
 
-def dump(boxes: list[Box], image: ImageContext) -> bytes:
-    """Serialise boxes the way the desktop app does, with the real image depth and rounded pixels."""
-    root = ET.Element("annotation")
-    _sub(root, "folder", image.folder)
-    _sub(root, "filename", image.filename)
-    _sub(root, "path", image.path)
-    source = ET.SubElement(root, "source")
-    _sub(source, "database", "Unknown")
-    size = ET.SubElement(root, "size")
-    _sub(size, "width", str(image.width))
-    _sub(size, "height", str(image.height))
-    _sub(size, "depth", str(image.depth))
-    _sub(root, "segmented", "0")
-    for box in boxes:
+def _set(parent: ET.Element, tag: str, text: str) -> ET.Element:
+    """Set the text of the child ``tag``, creating it when missing."""
+    element = parent.find(tag)
+    if element is None:
+        element = ET.SubElement(parent, tag)
+    element.text = text
+    return element
+
+
+def _original_document(original: bytes | None) -> tuple[ET.Element, list[ET.Element], list[Box]] | None:
+    """The parsed original file when it can be patched: ``(root, object elements, parsed boxes)``."""
+    if original is None:
+        return None
+    try:
+        root = _fromstring(original)
+    except ET.ParseError:
+        return None
+    parsed = parse(original)
+    objects = root.findall("object")
+    if root.tag != "annotation" or parsed.readonly_reason or len(objects) != len(parsed.boxes):
+        return None
+    return root, objects, parsed.boxes
+
+
+def _set_flag(obj: ET.Element, tag: str, value: bool) -> None:
+    child = obj.find(tag)
+    if child is None:
+        if value:
+            _sub(obj, tag, "1")
+    elif _flag(obj, tag) != value:
+        child.text = "1" if value else "0"
+
+
+def _patch_object(obj: ET.Element, box: Box, pixels: tuple[int, int, int, int], before: Box) -> None:
+    """Update an original ``<object>`` in place; everything the tool does not model stays untouched."""
+    _set(obj, "name", box.label)
+    _set_flag(obj, "truncated", box.truncated)
+    _set_flag(obj, "difficult", box.difficult)
+    bndbox = obj.find("bndbox")
+    if bndbox is None:  # cannot happen for a parsed object
+        bndbox = ET.SubElement(obj, "bndbox")
+    if pixels != tuple(to_pixel(v) for v in (before.x1, before.y1, before.x2, before.y2)):
+        for tag, value in zip(("xmin", "ymin", "xmax", "ymax"), pixels, strict=True):
+            _set(bndbox, tag, str(value))
+
+
+def dump(boxes: list[Box], image: ImageContext, *, original: bytes | None = None,
+         origins: list[int | None] | None = None) -> bytes:
+    """Serialise boxes the way the desktop app does, with the real image depth and rounded pixels.
+
+    With ``original`` (the file's current bytes) the document is patched instead of rebuilt: box ``i``
+    that stems from original object ``origins[i]`` keeps that object's other fields (``pose``,
+    ``occluded``, custom elements...), and elements outside the objects (``source``, ``owner``...) are kept.
+    New boxes are written in the standard shape.
+    """
+    base = _original_document(original)
+    if base is not None:
+        root, old_objects, old_boxes = base
+        insert_at = list(root).index(old_objects[0]) if old_objects else len(root)
+        for element in old_objects:
+            root.remove(element)
+        if root.find("folder") is None:
+            _sub(root, "folder", image.folder)
+        _set(root, "filename", image.filename)
+        if root.find("path") is not None:  # never keep an absolute path from older tools or versions
+            _set(root, "path", image.filename)
+        size = root.find("size")
+        if size is None:
+            size = ET.SubElement(root, "size")
+        _set(size, "width", str(image.width))
+        _set(size, "height", str(image.height))
+        _set(size, "depth", str(image.depth))
+    else:
+        old_objects, old_boxes = [], []
+        root = ET.Element("annotation")
+        _sub(root, "folder", image.folder)
+        _sub(root, "filename", image.filename)
+        _sub(root, "path", image.filename)
+        source = ET.SubElement(root, "source")
+        _sub(source, "database", "Unknown")
+        size = ET.SubElement(root, "size")
+        _sub(size, "width", str(image.width))
+        _sub(size, "height", str(image.height))
+        _sub(size, "depth", str(image.depth))
+        _sub(root, "segmented", "0")
+        insert_at = len(root)
+    objects: list[ET.Element] = []
+    for i, box in enumerate(boxes):
         b = clamp(box, image.width, image.height) if image.width > 0 and image.height > 0 else box
         x1, y1, x2, y2 = (to_pixel(v) for v in (b.x1, b.y1, b.x2, b.y2))
         if x2 <= x1 or y2 <= y1:
             continue
-        obj = ET.SubElement(root, "object")
-        _sub(obj, "name", box.label)
-        _sub(obj, "pose", "Unspecified")
-        _sub(obj, "truncated", "1" if box.truncated else "0")
-        _sub(obj, "difficult", "1" if box.difficult else "0")
-        bndbox = ET.SubElement(obj, "bndbox")
-        _sub(bndbox, "xmin", str(x1))
-        _sub(bndbox, "ymin", str(y1))
-        _sub(bndbox, "xmax", str(x2))
-        _sub(bndbox, "ymax", str(y2))
+        origin = origins[i] if origins is not None and i < len(origins) else None
+        if origin is not None and 0 <= origin < len(old_objects):
+            obj = copy.deepcopy(old_objects[origin])
+            _patch_object(obj, box, (x1, y1, x2, y2), old_boxes[origin])
+        else:
+            obj = ET.Element("object")
+            _sub(obj, "name", box.label)
+            _sub(obj, "pose", "Unspecified")
+            _sub(obj, "truncated", "1" if box.truncated else "0")
+            _sub(obj, "difficult", "1" if box.difficult else "0")
+            bndbox = ET.SubElement(obj, "bndbox")
+            _sub(bndbox, "xmin", str(x1))
+            _sub(bndbox, "ymin", str(y1))
+            _sub(bndbox, "xmax", str(x2))
+            _sub(bndbox, "ymax", str(y2))
+        objects.append(obj)
+    for offset, obj in enumerate(objects):
+        root.insert(insert_at + offset, obj)
     ET.indent(root, space="   ")
     return ET.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
 

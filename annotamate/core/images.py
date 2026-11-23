@@ -27,6 +27,30 @@ _DEPTHS = {"1": 1, "L": 1, "P": 3, "I": 1, "I;16": 1, "I;16B": 1, "I;16L": 1, "F
 _SIXTEEN_BIT = {"I", "I;16", "I;16B", "I;16L", "F"}
 
 
+#: Largest image (in pixels) that is probed or decoded; bigger files are refused before any pixel is decoded.
+DEFAULT_MAX_MEGAPIXELS = 150
+DEFAULT_DECODE_SLOTS = 3
+_max_pixels = DEFAULT_MAX_MEGAPIXELS * 1_000_000
+_decode_slots = threading.BoundedSemaphore(DEFAULT_DECODE_SLOTS)
+Image.MAX_IMAGE_PIXELS = None  # Pillow's own bomb check is replaced by the explicit budget below
+
+
+def configure(*, max_megapixels: int = DEFAULT_MAX_MEGAPIXELS, decode_slots: int = DEFAULT_DECODE_SLOTS) -> None:
+    """Set the pixel budget and how many full decodes may run at the same time (process-wide)."""
+    global _max_pixels, _decode_slots
+    _max_pixels = max_megapixels * 1_000_000
+    _decode_slots = threading.BoundedSemaphore(max(1, decode_slots))
+
+
+def budget_error(size: tuple[int, int]) -> str | None:
+    """A user-facing message when an image of ``size`` exceeds the pixel budget, else ``None``."""
+    width, height = size
+    if width * height > _max_pixels:
+        return (f"Image is too large ({width} x {height} pixels, {width * height / 1e6:.0f} megapixels; "
+                f"the limit is {_max_pixels // 1_000_000} megapixels)")
+    return None
+
+
 class ImageError(Exception):
     """The file is missing or cannot be decoded. ``str(exc)`` is safe to show to users."""
 
@@ -62,11 +86,16 @@ def _open(path: str) -> Image.Image:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-            return Image.open(path)
+            img = Image.open(path)
     except FileNotFoundError:
         raise ImageError("File not found") from None
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError, SyntaxError):
         raise ImageError("Cannot decode image") from None
+    too_big = budget_error(img.size)
+    if too_big:
+        img.close()
+        raise ImageError(too_big)
+    return img
 
 
 def probe(path: str, exif_mode: str = "apply") -> ImageInfo:
@@ -104,19 +133,20 @@ def _flatten_for(img: Image.Image, target: str) -> Image.Image:
 
 
 def _load(path: str, exif_mode: str, draft: tuple[int, int] | None = None) -> Image.Image:
-    img = _open(path)
-    try:
-        if draft and img.format == "JPEG":
-            img.draft("RGB", draft)
-        img.load()
-        if exif_mode == "apply":
-            ImageOps.exif_transpose(img, in_place=True)  # keeps img.format and img.info
-        return img
-    except ImageError:
-        raise
-    except Exception:
-        img.close()
-        raise ImageError("Cannot decode image") from None
+    with _decode_slots:  # a full decode can need hundreds of MB: only a few at a time
+        img = _open(path)
+        try:
+            if draft and img.format == "JPEG":
+                img.draft("RGB", draft)
+            img.load()
+            if exif_mode == "apply":
+                ImageOps.exif_transpose(img, in_place=True)  # keeps img.format and img.info
+            return img
+        except ImageError:
+            raise
+        except Exception:
+            img.close()
+            raise ImageError("Cannot decode image") from None
 
 
 def reencode(path: str, exif_mode: str) -> tuple[bytes, str]:
@@ -174,6 +204,7 @@ class DiskCache:
         self._writes = 0
         self._last_prune = 0.0
         self._lock = threading.Lock()
+        self._producing: dict[str, tuple[threading.Lock, int]] = {}
 
     @staticmethod
     def source_key(path: str, *parts: object) -> str:
@@ -190,9 +221,23 @@ class DiskCache:
         target = self.path_for(key, ext)
         if os.path.exists(target):
             return target
-        data = produce()
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        atomic_write(target, data)
+        with self._lock:  # one producer per key: concurrent requests wait for it instead of decoding again
+            lock, users = self._producing.get(key) or (threading.Lock(), 0)
+            self._producing[key] = (lock, users + 1)
+        try:
+            with lock:
+                if os.path.exists(target):
+                    return target
+                data = produce()
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                atomic_write(target, data)
+        finally:
+            with self._lock:
+                lock, users = self._producing[key]
+                if users <= 1:
+                    del self._producing[key]
+                else:
+                    self._producing[key] = (lock, users - 1)
         self._maybe_prune()
         return target
 
