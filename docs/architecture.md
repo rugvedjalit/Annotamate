@@ -52,8 +52,25 @@ docs/                             architecture, API, guides
 
 * **One process.** `annotamate serve` runs Uvicorn with a single worker. Realtime state (presence, edit
   locks) lives in memory in that process. (Multiple workers are not supported; document this.)
-* **Database.** SQLite by default (`<data-dir>/annotamate.db`, WAL mode, foreign keys on). `ANNOTAMATE_DATABASE_URL`
-  may point at PostgreSQL. Alembic migrations run automatically at start-up.
+* **Threads.** Request handlers are plain functions that run on a small pool of worker threads
+  (`ANNOTAMATE_WORKER_THREADS`, default 4): Python runs one thread at a time, so many threads only add switching.
+  With 20 simultaneous clients the image list answered 12.9 requests/s on 40 threads and 70.2 on 4. Because the
+  pool is small, nothing slow may run on it:
+  * full image decodes (thumbnails, re-encoded images) run on an image pool of three threads; the request thread
+    only does the database lookup and the cache check;
+  * uploads (checking and writing up to a thousand files) run on an upload pool of two threads;
+  * indexing, class renames and class delete/merge are background jobs (two job threads), reported over the
+    WebSocket;
+  * exports are streamed, one file per step.
+* **Database.** SQLite by default (`<data-dir>/annotamate.db`, WAL mode, foreign keys on, 64 MB page cache,
+  memory-mapped reads, temporary tables in memory; the connection pool holds one connection per worker thread
+  plus four). `PRAGMA optimize` refreshes the query planner's statistics after every indexing job and at
+  shutdown. `ANNOTAMATE_DATABASE_URL` may point at PostgreSQL. Alembic migrations run automatically at start-up.
+* **Counts are cached briefly.** Per-project status counts, assignment counts and statistics are asked for by
+  every open page after every change. They come from an in-memory cache (`AppContext.aggregates`): a change in
+  the project marks them stale (hooked into the realtime events, so a client reads its own writes), simultaneous
+  requests share one computation, and without a change a value is reused for at most 2 seconds. Lists and image
+  details are always read from the database.
 * **Data dir.** `--data-dir` / `ANNOTAMATE_DATA_DIR`. Default: `%LOCALAPPDATA%\Annotamate` on Windows,
   `$XDG_DATA_HOME/annotamate` or `~/.local/share/annotamate` elsewhere. Holds the DB and `cache/`
   (thumbnails, re-encoded images).
@@ -78,6 +95,7 @@ docs/                             architecture, API, guides
 | Max whole upload request (MB) | | `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` | `1024` |
 | Max request body, other routes (MB) | | `ANNOTAMATE_MAX_BODY_MB` | `2` |
 | Max image size (megapixels) | | `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` | `150` |
+| Worker threads (request handlers) | | `ANNOTAMATE_WORKER_THREADS` | `4` (1–64) |
 | Open browser | `--open/--no-open` | | `--open` only for bare `annotamate` |
 | Log level | `--log-level` | `ANNOTAMATE_LOG_LEVEL` | `info` |
 
@@ -188,17 +206,33 @@ reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-mi
 * **Uploaded file names** drop invisible formatting characters and avoid every Windows device name (`CON`, `COM¹`,
   `CONIN$`, `con .png`...).
 * **Atomic writes.** Write to a temp file in the same folder, `fsync`, `os.replace`.
-* **Multi-file rewrites** (class delete/merge, `core.fsutil.atomic_write_many`) are all-or-nothing: pre-flight
-  writability check of every target (including the Windows read-only attribute), all new contents written and
-  `fsync`-ed as temp files, an `fsync`-ed backup copy of every original next to it, a journal in
-  `<data-dir>/journal/` (with the SHA-256 of each old and new content) written before the first replace and
-  removed after the last, rollback of already replaced files if one replace fails
-  (temp and backup files are always cleaned up). If the rollback itself fails the API answers
-  `500 migration_incomplete` with the affected files, keeping their backups and the journal. At start-up, before
-  serving, any leftover journal is rolled back: a target is restored only if it still holds exactly the content
-  that run wrote and its backup matches the recorded hash; a target never replaced keeps its content, and one
-  changed since (a later save) is left alone with its backup kept for inspection. Temporaries are deleted.
-  Class delete/merge refuses (`400`, nothing changed) when an existing label file cannot be read.
+* **Multi-file rewrites** (class delete/merge, `core.fsutil.StagedRewrite`) are all-or-nothing and run as a
+  background job (`services.classes.ClassDeleteJob`), never inside a request:
+  1. *Stage*, in batches of 500 files: pre-flight writability check of every target (including the Windows
+     read-only attribute), a journal for the batch in `<data-dir>/journal/` (temp and backup names, SHA-256 of each
+     old and new content), then every new content written and `fsync`-ed as a temp file next to its target. The
+     originals are untouched, so reads keep working; only the journal names are held in memory.
+  2. *Replace*: each target is replaced by its temp file. The original stays next to it as a backup: a hard link,
+     so it is neither copied nor `fsync`-ed again (where hard links do not exist it is moved aside instead).
+  3. *Store*: the database change is committed in one transaction, then a `.committed` marker is written and the
+     backups and journals are removed.
+
+  A failure at any step before the commit restores every replaced file and removes what the run created. If the
+  rollback itself fails, the job reports `migration_incomplete` with the affected file names and keeps their
+  backups and journals. At start-up, before serving, leftover journals are rolled back: a target is restored
+  only if it still holds exactly the content that run wrote and its backup matches the recorded hash; a target
+  never replaced keeps its content, and one changed since (a later save) is left alone with its backup kept for
+  inspection. Temporaries are deleted. A run whose marker exists had finished and is only cleaned up.
+  For a class delete/merge the database transaction is the commit point: its journals record the project and
+  class, and start-up recovery (which runs after the database migrations) keeps the new files when the class is
+  gone from the database and rolls them back when it still exists. `classes.txt` of every affected project is
+  then rewritten from the database, so files, class list and database never disagree after a crash.
+  The job fails (nothing changed) when an existing label file cannot be read.
+* **Editing is paused during a class delete/merge.** The job does not hold the project's label lock while it
+  works (requests would queue behind it); the project is flagged as migrating instead
+  (`Project.class_migration`). The flag is set and cleared under the label lock, and every writer checks it under
+  that lock: annotation saves, class changes, uploads, exports, pruning and project deletion answer
+  `409 migrating` at once. Indexing and class-rename jobs wait for the migration to end.
 * **Preserving unmodelled fields.** VOC and COCO saves patch the file's current document instead of rebuilding it.
   Saved boxes are mapped to the original objects/annotations through the deterministic box ids the reader hands
   out (position in the file), so each mapped element keeps its extra fields (VOC `pose`, `occluded`, custom
@@ -276,7 +310,8 @@ reappears. A manager can purge them for good (`POST /api/projects/{pid}/prune-mi
   `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for the upload route, plus `ANNOTAMATE_MAX_UPLOAD_MB` per file.
 * Images: a pixel budget (`ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`, default 150) is enforced when an image is probed,
   uploaded or fully decoded (over-budget images report an `error` and are skipped by uploads); at most three full
-  decodes run at once and concurrent requests for the same thumbnail/re-encoded image decode it only once.
+  decodes run at once, on their own thread pool, so a page of large uncached images cannot occupy the threads
+  that serve other requests, and concurrent requests for the same thumbnail/re-encoded image decode it only once.
 * `base_url` is validated at start-up (`^/[A-Za-z0-9._~\-/]*$`, no `.`/`..` segments, normalised to a trailing
   slash) and HTML-escaped where it is injected into the page.
 * Edit locks: one per WebSocket connection and at most three per user; on every `ping` the session is re-validated

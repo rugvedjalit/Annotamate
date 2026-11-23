@@ -29,7 +29,8 @@ web/src/
     utils.ts                  cn() (clsx + tailwind-merge), misc
   stores/
     session.ts                current user, setup state
-    realtime.ts               online users, project presence, image locks, typing indicators
+    realtime.ts               online users, project presence, image locks, indexing and class-migration progress,
+                              typing indicators
     ui.ts                     theme, panel sizes/visibility, chat drawer open, command palette open
   components/
     ui/                       design-system primitives (Button, IconButton, Input, Textarea, Select, Switch, Checkbox,
@@ -167,6 +168,9 @@ Class palette (20 colours, used when a class is created without a colour):
    permitted, Esc discards the new box (no history entry left behind).
 8. **Realtime cache updates.** WS events update TanStack Query caches (`setQueryData` / `invalidateQueries`): file list rows,
    project stats, chat, comments, notifications, DMs (`dm.read` → "Seen" receipts, conversation and bell badges).
+   Invalidations caused by bursty events (saves, bulk changes, class and member updates) are collected and applied
+   once per 5 s window (`app/throttledInvalidator.ts`), and only queries that are on screen are refetched
+   (`refetchType: 'active'`); the others are marked stale and load when they are next used.
    Reconnects resubscribe and refetch active queries. Composers (chat, DM) clear on send and restore the draft if
    sending fails. Notifications about a thread (comment, rejection, mention on an image) open the annotator on the
    Comments tab.
@@ -177,6 +181,29 @@ Class palette (20 colours, used when a class is created without a colour):
     the label text (the required asterisk is decorative, the control gets `aria-required`); switch rows are labelled by
     their title and described by their description. Tooltips never intercept clicks and open on focus only for
     keyboard focus (not when a menu returns focus to its trigger).
+
+11. **Class delete / merge.** `DELETE …/classes/{id}` answers `202 {started}` and the label files are rewritten by a
+    background job. `DeleteClassDialog` then shows "Removing class… N%" / "Merging class… N%" with a progress bar; it
+    can be closed, the job continues. Progress comes from `classes.migration` events (`app/classMigrationEvents.ts`:
+    realtime store `classMigration[projectId]`, and `class_migration` patched into the cached project and project
+    list). The result toast (`Deleted class “x”` / `Merged “x” into “y”`, "N label files rewritten.", or `Could not
+    delete the class` with the server's `error`) is shown by the realtime bridge for a change started in this tab
+    (`classMigrationStarted` in the store), so it appears with the dialog closed too. A refusal with `code: 'in_use'`
+    (synchronous `409`, or in the final event when the label files disagree with the index) shows the "still used
+    in N images" warning inside the open dialog and switches the strategy. If no event arrives (connection lost),
+    the dialog polls the project every 2 s until `class_migration` is `null` again; the class still being listed
+    then means failure. On the final event the project, stats, image lists, neighbours, activity and every
+    annotation document of the project are invalidated. A reconnect drops the live progress, the refetched project
+    is the truth.
+12. **Read-only during a class change.** While `class_migration` is set (project query or realtime store,
+    `useClassMigration`): the project pages show a non-blocking banner "Class change in progress – editing is
+    paused" (with the percentage when known); the annotator is read-only through the normal mechanism
+    (`ReadOnlyInfo.kind = 'migrating'`, banner in `LockBanner`, `canSave: false` so neither autosave nor its retries
+    fire; the edit lock is kept); adding/renaming classes, upload and export are disabled, and the submit button of
+    the delete dialog is disabled with a hint. Unsaved boxes stay in memory and are saved when the change ends (a
+    label file rewritten meanwhile gives the usual conflict dialog); a clean document is reloaded. A `409 migrating`
+    on save (the client did not know yet) is not a conflict: toast with the server's `detail`, boxes stay dirty, the
+    project is refetched, and saving resumes afterwards.
 
 ### Default shortcuts (all rebindable in Account → Keyboard shortcuts; stored in user settings)
 

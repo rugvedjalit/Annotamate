@@ -31,16 +31,16 @@ interface ApiError {
 | 403 | `forbidden`, `csrf` | Role does not allow it (also: `force: true` on a save by someone who is neither reviewer+ nor the lock holder; any annotation, review, class, assignment, bulk or upload change in an **archived** project, which is read-only until a manager restores it); missing CSRF header | |
 | 404 | `not_found` | Unknown id or not a member of the project (also unknown `/api/...` paths) | |
 | 409 | `conflict` | Annotation `base_version` ≠ current version | `current: AnnotationDoc` |
-| 409 | `in_use` | Deleting a class (`strategy=forbid`) that labels still use | `images: number` (images using it) |
+| 409 | `in_use` | Deleting a class (`strategy=forbid`) that labels still use, according to the image index | `images: number` (images using it) |
+| 409 | `migrating` | A class delete/merge is rewriting the project's label files (`Project.class_migration` is set): saving or restoring annotations, adding, renaming or deleting classes, uploads, exports, pruning missing images, changing the label folder and deleting the project are refused until it has finished. Reads keep working | |
 | 409 | `readonly`, `exists`, `setup_done` | Read-only label file (also: the image shares its label file with an earlier image, or is the reserved YOLO name `classes`); duplicate; setup already done | |
 | 413 | `too_large` | Request body over its limit: 2 MB for ordinary routes (`ANNOTAMATE_MAX_BODY_MB`), 64 KB for `PUT /api/me/settings`, `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` (1024) for the upload route, `ANNOTAMATE_MAX_UPLOAD_MB` (50) per uploaded file. Checked against `Content-Length` and again while the body streams in | |
 | 422 | `validation_error` | Body/query validation failed | `errors: {loc: string[], msg: string}[]` |
 | 423 | `locked` | Another user holds the image's edit lock | `holder: UserBrief` |
 | 429 | `rate_limited` | Too many failed sign-ins in 10 minutes: 10 per address and user name; 30 per public address in total (`ANNOTAMATE_LOGIN_IP_LIMIT`; IPv6 counted per /64; 10 times as many for loopback and private addresses); 100 per user name from all addresses together. Attempts are counted before the password is checked; a correct password takes its attempt back | `retry_after: number` (seconds, also in `Retry-After`) |
 | 500 | `write_failed` | The label file could not be written (disk full, permissions); nothing was changed | |
-| 500 | `migration_incomplete` | A class delete/merge failed half-way and restoring the original label files failed too | `files: string[]` (paths whose content may be wrong; their `.bak` backups are kept next to them) |
 | 500 | `internal_error` | Unexpected server error | |
-| 503 | `busy` | More than 16 password-hashing requests (sign-in, setup, password changes, account creation) at once; retry after `Retry-After` seconds | |
+| 503 | `busy` | More than 16 password-hashing requests (sign-in, setup, password changes, account creation) at once; retry after `Retry-After` seconds. Also a class delete requested while the server is shutting down | |
 
 Pagination:
 
@@ -114,6 +114,7 @@ interface ProjectSummary {
   unread_chat: number
   archived: boolean
   indexing: boolean
+  class_migration: ClassMigration | null  // set while a class delete/merge rewrites the label files (editing is paused)
   created_at: string
   updated_at: string
   members_preview: UserBrief[] // up to 5 members for project cards: managers, reviewers, annotators, viewers, by name
@@ -236,9 +237,17 @@ interface Notification {
   read_at: string | null
 }
 
+type ClassMigration = {
+  kind: 'delete' | 'merge'    // merge: the boxes move to another class
+  class_name: string          // the class being removed
+  done: number                // progress: files read, then files replaced (0/0 until the job has listed them)
+  total: number
+}
+
 type ActivityType =
   | 'annotation_saved' | 'status_changed' | 'assigned' | 'flagged' | 'comment_added'
-  | 'class_added' | 'class_updated' | 'class_deleted' | 'member_added' | 'member_updated' | 'member_removed'
+  | 'class_added' | 'class_updated' | 'class_deleted' | 'class_delete_failed'
+  | 'member_added' | 'member_updated' | 'member_removed'
   | 'images_uploaded' | 'project_created' | 'project_updated' | 'rescanned' | 'revision_restored'
 
 interface Activity {
@@ -267,7 +276,8 @@ Clients must tolerate missing keys (older entries) and ignore unknown ones.
 | `comment_added` | ✓ | `{comment_id: number, preview: string}` |
 | `class_added` | – | `{class_id, name, color}` |
 | `class_updated` | – | `{class_id, name /* current */, old_name? /* when renamed */, color? /* when recoloured */}` |
-| `class_deleted` | – | `{class_id, name, strategy: 'forbid'\|'delete_boxes'\|'merge', merge_into?: number, merge_into_name?: string, rewritten_files: number}` |
+| `class_deleted` | – | `{class_id, name, strategy: 'forbid'\|'delete_boxes'\|'merge', merge_into?: number, merge_into_name?: string, rewritten_files: number}` (written when the background job has finished) |
+| `class_delete_failed` | – | `{class_id, name, strategy, merge_into?: number, merge_into_name?: string, error: string, code: string, images?: number, files?: string[]}`: the job stopped and the class is still there (same `error`, `code` and extras as the final `classes.migration` event) |
 | `member_added` | – | `{member: UserBrief, role: Role}` |
 | `member_updated` | – | `{member: UserBrief, role: Role, previous_role: Role}` |
 | `member_removed` | – | `{member: UserBrief, role: Role}` |
@@ -329,9 +339,16 @@ Username rules: 3–32 chars, `[a-z0-9_.-]`, stored lowercase, unique. Password 
 | `DELETE /api/projects/{pid}` | admin | | `204` (DB rows only; files on disk untouched) |
 | `POST /api/projects/{pid}/rescan` | manager | | `202 {started: true}`; progress over WS (`project.indexing`). Adds new images (a new image with a label file starts as `done`); never changes the status of existing images; images whose file is gone get `missing` (hidden from lists, neighbours, counts, stats, exports, bulk actions and filters; comments, revisions and status are kept) and are restored when the file returns |
 | `POST /api/projects/{pid}/prune-missing` | manager | | `{removed: number}`: permanently deletes the missing images (with their comments and revisions) |
-| `GET /api/projects/{pid}/stats` | member | `?tz_offset=` (viewer's UTC offset in minutes, east positive, −840…840; default 0): `daily` covers the last 30 days of the viewer's calendar | `{status_counts: StatusCounts, images_total, boxes_total, class_counts: {class_id: number, boxes: number, images: number}[], per_user: {user: UserBrief, saves: number, boxes: number, submitted: number, approved: number, rejected: number, reviewed: number}[], daily: {date: "YYYY-MM-DD", saves: number, done: number}[] /* last 30 days */}` |
+| `GET /api/projects/{pid}/stats` | member | `?tz_offset=` (viewer's UTC offset in minutes, east positive, −840…840; default 0): `daily` covers the last 30 days of the viewer's calendar. Computed once per change of the project however many clients ask (see "Counts and statistics" below) | `{status_counts: StatusCounts, images_total, boxes_total, class_counts: {class_id: number, boxes: number, images: number}[], per_user: {user: UserBrief, saves: number, boxes: number, submitted: number, approved: number, rejected: number, reviewed: number}[], daily: {date: "YYYY-MM-DD", saves: number, done: number}[] /* last 30 days */}` |
 | `POST /api/projects/{pid}/upload` | manager | multipart `files[]` (the field name `files` is accepted too; ≤ 1000 files per request), optional `subdir` (relative folder; only for projects with `settings.recursive`, else `400`) | `{added: ImageItem[], skipped: {filename, reason}[]}` |
 | `GET /api/projects/{pid}/export` | manager | `?format=yolo\|voc\|coco&scope=all\|done&include_images=false` | `application/zip` download. YOLO: `labels/*.txt`, `classes.txt`, `data.yaml`. VOC: `Annotations/*.xml`. COCO: single `annotations.json` (dataset-level, ids 1-based). With images: `images/...` |
+
+**Counts and statistics.** `status_counts`, `image_count`, `missing_count`, `my_assigned_todo`, the members'
+`assigned_count`/`done_count` and `GET .../stats` come from a short-lived cache per project: a change in the
+project (anything that sends `image.updated`, `images.bulk_updated`, `classes.updated`, `members.updated` or
+`project.updated`) makes the next request compute them again, so a client always reads its own writes; without
+a change a value is reused for up to 2 seconds, and simultaneous requests share one computation. Image lists,
+image details and annotations are never cached.
 
 ### Members
 
@@ -349,9 +366,32 @@ Username rules: 3–32 chars, `[a-z0-9_.-]`, stored lowercase, unique. Password 
 | `GET /api/projects/{pid}/classes` | member | | `ProjectClass[]` |
 | `POST /api/projects/{pid}/classes` | manager, or annotator+ if `annotators_can_add_classes` | `{name, color?}` | `ProjectClass` (`409 exists`) |
 | `PATCH /api/projects/{pid}/classes/{cid}` | manager | `{name?, color?}` | `ProjectClass` (VOC/COCO renames rewrite label files in the background) |
-| `DELETE /api/projects/{pid}/classes/{cid}` | manager | `?strategy=forbid\|delete_boxes\|merge&merge_into={cid}` | `200 {rewritten_files: number}`; `forbid` (default) → `409 in_use` with `{images: number}` when any label uses it |
+| `DELETE /api/projects/{pid}/classes/{cid}` | manager | `?strategy=forbid\|delete_boxes\|merge&merge_into={cid}` | `202 {started: true}`: the request is checked and the label files are rewritten by a background job (below). Refused at once: `forbid` (default) → `409 in_use` with `{images: number}` when the image index knows a label that uses the class; `400` (no or wrong `merge_into`); `404`; `409 conflict` while the project is being indexed, a rename is still being applied or label counts are being refreshed; `409 migrating` while another class job runs |
 
 Class changes keep `classes.txt` in sync and broadcast `classes.updated`.
+
+**Deleting or merging a class is a background job.** Every label file has to be read and most have to be
+rewritten (YOLO files store class positions, so the classes after the deleted one move up), which takes
+minutes in a large project. The `DELETE` request therefore only starts the job:
+
+1. From the `202` until the job ends, `Project.class_migration` is `{kind, class_name, done, total}` and every
+   write to the project's labels and classes answers `409 migrating` at once (see the error table). Reads keep
+   working: the original files stay in place until all new contents have been written next to them.
+2. Progress is sent to the project's subscribers as `classes.migration` events: one when the job starts
+   (`done: 0, total: 0`), then at most every 0.5 s, then exactly one with `finished: true`.
+3. On success the class is removed and the counts are updated in one transaction (activity entry
+   `class_deleted` with `rewritten_files`), `classes.updated` and `images.bulk_updated` are sent, and the final
+   event carries `rewritten_files`.
+4. On failure every label file is restored, the class stays, and the final event carries `error` (a message
+   for the user) and `code`: `in_use` (+ `images`; a `forbid` delete found the class in label files that the
+   index did not know about), `bad_request` (a label file could not be read or written), `not_found`,
+   `interrupted` (the server is shutting down), `error`, or `migration_incomplete` (+ `files`: names of the
+   label files that could not be restored; their original content is kept in hidden `.bak` files next to them
+   and the next start finishes the rollback). An activity entry `class_delete_failed` records it (not for
+   `interrupted`).
+
+A client that misses the final event (reconnect) sees `class_migration: null` again in `GET /api/projects/{pid}`;
+whether the class is still listed tells the outcome.
 
 ### Images
 
@@ -485,6 +525,10 @@ Connection lifecycle and close codes:
 { type: 'classes.updated', project_id: number, classes: ProjectClass[] }
 { type: 'project.updated', project_id: number }
 { type: 'project.indexing', project_id: number, done: number, total: number, finished: boolean }
+{ type: 'classes.migration', project_id: number, kind: 'delete' | 'merge', class_name: string, done: number, total: number,
+  finished: boolean,
+  rewritten_files?: number,                                        // final event of a successful job
+  error?: string, code?: string, images?: number, files?: string[] }  // final event of a failed job (see Classes)
 { type: 'members.updated', project_id: number }
 
 { type: 'chat.message', message: ChatMessage }

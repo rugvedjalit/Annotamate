@@ -7,6 +7,39 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+Staying responsive with many users and projects of a lakh of images (first part of
+`docs/run-anywhere-plan.md`, section 7):
+
+- Requests are answered by 4 worker threads instead of 40 (`ANNOTAMATE_WORKER_THREADS`). With 20
+  simultaneous users the image list went from 12.9 to about 70 requests per second on the reference
+  machine. Image decoding (thumbnails, re-encoded images) and uploads moved to their own small thread
+  pools, so a page of large uncached images or a big upload no longer delays other requests.
+- Deleting or merging a class no longer blocks the server: it is a background job with progress, and
+  rewriting the label files is faster (the original of each file is kept as a hard link instead of a
+  second synced copy; files are staged in batches of 500, so memory stays flat).
+- Project counts and statistics are computed once per change of a project, however many pages are open,
+  and reused for up to 2 seconds otherwise. The web client refetches them at most every 5 seconds
+  (was 1.5) and only for the page that is showing them.
+- New database indexes: status and assignee filters and the per-project counts read an index instead
+  of scanning the project; deleting a project or removing missing images no longer scans the activity,
+  notification and chat tables. SQLite uses a 64 MB page cache, memory-mapped reads and in-memory
+  temporary tables, and refreshes the query planner's statistics after indexing and at shutdown.
+
+### Changed
+
+- **API:** `DELETE /api/projects/{id}/classes/{cid}` answers `202 {started: true}` and the work
+  continues in the background (it used to answer `200 {rewritten_files}` when done). Progress and the
+  result arrive as `classes.migration` WebSocket events; `Project.class_migration` is set while the job
+  runs, and saves, class changes, uploads, exports, pruning and project deletion answer
+  `409 migrating` until it has finished. A failed job leaves every label file as it was and adds a
+  `class_delete_failed` activity entry. "Only if unused" still answers `409 in_use` at once when the
+  image index knows the class is used; label files edited outside Annotamate are checked by the job.
+- The class delete dialog shows the progress and can be closed while the job runs; the project pages
+  and the editor show "Class change in progress – editing is paused" and are read-only meanwhile.
+- The database is upgraded automatically at start-up (migration `0003`: indexes only).
+
 ### Security
 
 Findings of a full security audit (authentication, authorization, file handling, client and realtime):
@@ -110,6 +143,9 @@ Findings of a full security audit (authentication, authorization, file handling,
 - `setup_token_required` in `GET /api/auth/state`; the setup page asks for the token when needed.
 - Settings `ANNOTAMATE_MAX_BODY_MB`, `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB`,
   `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS`, `ANNOTAMATE_LOGIN_IP_LIMIT`.
+- Setting `ANNOTAMATE_WORKER_THREADS` (default 4): the number of threads that answer requests.
+- `class_migration` on projects, the `classes.migration` WebSocket event and the `class_delete_failed`
+  activity entry (see Changed).
 - Returning to an image whose save finished after leaving it no longer stalls autosave or reports a
   conflict with the user's own save.
 

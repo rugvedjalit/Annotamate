@@ -475,12 +475,19 @@ Flags override environment variables.
 | Maximum whole upload request (MB) | | `ANNOTAMATE_MAX_UPLOAD_REQUEST_MB` | `1024` |
 | Maximum request body, other routes (MB) | | `ANNOTAMATE_MAX_BODY_MB` | `2` |
 | Largest image accepted (megapixels) | | `ANNOTAMATE_MAX_IMAGE_MEGAPIXELS` | `150` |
+| Worker threads for requests (1–64) | | `ANNOTAMATE_WORKER_THREADS` | `4` |
 | Failed sign-ins per public address in 10 minutes (0 = no limit) | | `ANNOTAMATE_LOGIN_IP_LIMIT` | `30` |
 | Open the browser | `--open` / `--no-open` | | off for `serve`, on for bare `annotamate` |
 | Log level | `--log-level` | `ANNOTAMATE_LOG_LEVEL` | `info` |
 
 Notes:
 
+- `ANNOTAMATE_WORKER_THREADS` is the number of threads that answer requests. The default of 4 is
+  right for almost every installation, from one user to a few hundred: Python runs one thread at a
+  time, so more threads make a busy server slower, not faster (with 20 simultaneous users the image
+  list answered 13 requests per second on 40 threads and 70 on 4). Slow work does not use these
+  threads: image decoding, uploads, indexing and class changes have their own. Raise the value only
+  if the server uses PostgreSQL on another machine and requests spend their time waiting for it.
 - Values are case-insensitive for the log level (`debug`, `info`, `warning`, `error`, `critical`)
   and booleans accept `true` or `false`.
 - `FORWARDED_ALLOW_IPS` is read by uvicorn, not by Annotamate; see

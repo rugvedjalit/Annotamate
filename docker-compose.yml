@@ -55,6 +55,8 @@ services:
       # ANNOTAMATE_MAX_UPLOAD_REQUEST_MB: "1024"
       # ANNOTAMATE_MAX_BODY_MB: "2"
       # ANNOTAMATE_MAX_IMAGE_MEGAPIXELS: "150"
+      # Threads that answer requests; more than a few makes a busy server slower.
+      # ANNOTAMATE_WORKER_THREADS: "4"
       # ANNOTAMATE_LOGIN_IP_LIMIT: "30"
       # ANNOTAMATE_LOG_LEVEL: info
       # Behind the Caddy service below, trust its X-Forwarded-For header so that the

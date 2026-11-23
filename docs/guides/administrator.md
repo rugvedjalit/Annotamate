@@ -263,7 +263,7 @@ projects, where it is the number written into the label files and the line in `c
 | Add a class | managers and reviewers; annotators if allowed | Appended at the end; `classes.txt` is updated. No label file changes. |
 | Recolour | managers | Nothing on disk. Colours are stored in the database only. |
 | Rename | managers | `classes.txt` is updated. YOLO: no label file changes, because label files contain numbers. VOC and COCO: every label file that uses the class is rewritten with the new name, as a background job (refused while the project is being indexed). The rename is recorded until every file is done, so a restart resumes it; meanwhile files that still carry the old name are read as the renamed class and saves write the new name. |
-| Delete or merge | managers | Affected label files and `classes.txt` are rewritten before the request returns. See below. |
+| Delete or merge | managers | Affected label files and `classes.txt` are rewritten by a background job; editing in the project is paused until it has finished. See below. |
 
 Colours are assigned from a 20-colour palette when a class is created and can be changed at any time.
 
@@ -288,18 +288,34 @@ What is rewritten:
 - **Pascal VOC and COCO.** Boxes of the deleted class get the target's name, or are removed. COCO
   category ids are renumbered to follow the class order. `classes.txt` is rewritten as well.
 
-The new file contents are prepared first and then replaced together. Before anything is touched the
-server checks that every file (and its folder) is writable, including the Windows read-only
-attribute, and it keeps a backup of each original next to it. If one file cannot be replaced, the
-files that were already replaced are restored and nothing is changed; the temporary and backup files
-are removed. A journal in the data folder makes the same rollback happen at the next start if the
-server crashes in the middle; it restores only files that still hold the content of the interrupted rewrite,
-so later saves are never overwritten. In the very unlikely case that restoring fails too, the server answers
-`migration_incomplete` with the list of affected files and leaves the hidden `.bak` backups next to
-them so you can restore them by hand. The dialog shows how many boxes and images use the class before you
-confirm, and afterwards how many label files were rewritten. The delete is refused while the project
-is being indexed. Saves in the project wait while it runs, and everyone who has the project open
-sees the new class list immediately.
+**The rewrite runs in the background.** The dialog shows how many boxes and images use the class
+before you confirm. After you confirm it shows the progress ("Removing class… 40%"); you can close
+it and keep working elsewhere, and a message tells you when the job has finished and how many
+label files were rewritten. In a project with a lakh of images this takes a few minutes.
+
+**Editing is paused meanwhile.** While the job runs, everyone who has the project open sees the
+banner "Class change in progress – editing is paused". Annotations cannot be saved, classes cannot
+be added, renamed or deleted, and uploads, exports and removing missing images are refused. Browsing
+images, reading labels, comments and chat keep working. Unsaved boxes in an open editor are kept:
+when the job has finished the editor saves them, or asks which version to keep if the job changed
+that image's label file. Everyone sees the new class list as soon as the job ends.
+
+**All or nothing.** The new file contents are prepared first, next to the originals, and then
+replaced together. Before anything is touched the server checks that every file (and its folder)
+is writable, including the Windows read-only attribute, and it keeps each original next to its
+file as a hidden backup until the end. If one file cannot be read or replaced, the files that were
+already replaced are restored and nothing is changed; the temporary and backup files are removed,
+the class stays, and the message (and the project's activity) says which file stopped it. A
+journal in the data folder makes the same rollback happen at the next start if the server crashes
+or is stopped in the middle; it restores only files that still hold the content of the interrupted
+rewrite, so later saves are never overwritten. In the very unlikely case that restoring fails too,
+the job reports `migration_incomplete` with the names of the affected files and leaves the hidden
+`.bak` backups next to them so you can restore them by hand.
+
+"Only if unused" is checked twice: at once against the image index, and again by the job against
+the label files themselves (files edited outside Annotamate may use the class without the index
+knowing; a rescan brings the index up to date). The delete is refused while the project is being
+indexed or while another class change is running.
 
 The revision history is not rewritten. If someone later restores an old revision that contained
 boxes of a deleted class, those boxes come back as unknown labels in VOC and COCO projects, and are
