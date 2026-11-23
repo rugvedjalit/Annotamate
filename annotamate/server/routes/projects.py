@@ -6,7 +6,6 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
-from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from annotamate.server.deps import DB, Access, AdminUser, Ctx, CurrentUser
@@ -93,29 +92,29 @@ def prune_missing(access: Access, ctx: Ctx, db: DB) -> dict:
 
 
 @router.get("/projects/{pid}/stats", response_model=Stats)
-def stats(access: Access, db: DB, tz_offset: Annotated[int, Query(ge=-14 * 60, le=14 * 60)] = 0) -> dict:
+def stats(access: Access, ctx: Ctx, db: DB, tz_offset: Annotated[int, Query(ge=-14 * 60, le=14 * 60)] = 0) -> dict:
     """``tz_offset``: the viewer's UTC offset in minutes (east positive), so "daily" follows their calendar."""
-    return project_stats(db, access.project.id, tz_offset)
+    return project_stats(ctx, db, access.project.id, tz_offset)
 
 
 # ------------------------------------------------------------------------------------------- members
 
 
 @router.get("/projects/{pid}/members", response_model=list[Member])
-def list_members(access: Access, db: DB) -> list[dict]:
-    return svc.members_out(db, access.project.id)
+def list_members(access: Access, ctx: Ctx, db: DB) -> list[dict]:
+    return svc.members_out(ctx, db, access.project.id)
 
 
 @router.post("/projects/{pid}/members", response_model=Member)
-def add_member(body: MemberIn, access: Access, db: DB) -> dict:
-    member = svc.add_member(db, access, body.user_id, body.role)
+def add_member(body: MemberIn, access: Access, ctx: Ctx, db: DB) -> dict:
+    member = svc.add_member(ctx, db, access, body.user_id, body.role)
     db.commit()
     return member
 
 
 @router.patch("/projects/{pid}/members/{uid}", response_model=Member)
 def update_member(uid: int, body: MemberPatch, access: Access, ctx: Ctx, db: DB) -> dict:
-    member = svc.update_member(db, access, uid, body.role)
+    member = svc.update_member(ctx, db, access, uid, body.role)
     db.commit()
     target = db.get(User, uid)
     if body.role == "viewer" and target is not None and not target.is_admin:
@@ -136,6 +135,7 @@ def remove_member(uid: int, access: Access, ctx: Ctx, db: DB) -> Response:
 async def upload(request: Request, access: Access, ctx: Ctx, db: DB) -> dict:
     access.require_manage()
     access.require_writable()
+    ctx.refuse_while_migrating(access.project.id)
     form = await request.form(max_files=MAX_UPLOAD_FILES, max_fields=50)
     try:
         uploads = [f for f in [*form.getlist("files[]"), *form.getlist("files")] if isinstance(f, UploadFile)]
@@ -143,8 +143,9 @@ async def upload(request: Request, access: Access, ctx: Ctx, db: DB) -> dict:
             raise bad_request("No files were uploaded (use the multipart field 'files[]').")
         subdir = form.get("subdir")
         incoming = [IncomingFile(f.filename or "", f.size or 0, f.file) for f in uploads]
-        return await run_in_threadpool(save_uploads, ctx, db, access, incoming,
-                                       subdir if isinstance(subdir, str) else None)
+        # On the upload pool: checking and writing many files takes seconds, too long for a request thread.
+        return await ctx.run_upload(save_uploads, ctx, db, access, incoming,
+                                    subdir if isinstance(subdir, str) else None)
     finally:
         await form.close()
 
@@ -158,12 +159,13 @@ def export(access: Access, ctx: Ctx, db: DB, format: Literal["yolo", "voc", "coc
            scope: Literal["all", "done"] = "all", include_images: bool = False) -> StreamingResponse:
     access.require_manage()
     project = access.project
+    ctx.refuse_while_migrating(project.id)
     fmt = format or project.label_format
     paths = ProjectPaths(ctx.settings, project)
     paths.check()
     table = load_class_table(db, project.id, project.label_format)
     items = select_items(db, project, scope)
-    exporter = Exporter(paths, table, fmt, items, include_images, ctx.label_locks(project.id))
+    exporter = Exporter(paths, table, fmt, items, include_images, ctx.read_guard(project.id))
     filename = f"{_slug(project.name)}-{fmt}.zip"
     return StreamingResponse(exporter.stream(), media_type="application/zip",
                              headers={"Content-Disposition": f'attachment; filename="{filename}"',

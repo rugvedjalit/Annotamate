@@ -121,7 +121,7 @@ def test_class_permissions(team, role, admin):
     assert (rename.status_code == 200) == allowed(role, "manager")
     if add.status_code == 200:
         delete = user.delete(f"/api/projects/{pid}/classes/{add.json()['id']}")
-        assert (delete.status_code == 200) == allowed(role, "manager")
+        assert (delete.status_code == 202) == allowed(role, "manager")
 
 
 def test_annotators_can_add_classes_setting(team, admin):

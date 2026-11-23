@@ -5,6 +5,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from annotamate.core.images import DiskCache, ImageError, make_thumbnail, probe, reencode
 from annotamate.server.deps import DB, Access, Ctx
@@ -83,40 +84,71 @@ def neighbors(iid: int, access: Access, db: DB, flt: Filter) -> dict:
     return svc.neighbors(db, access, image, flt)
 
 
+def _image_error(exc: Exception) -> Exception:
+    return not_found(str(exc) if isinstance(exc, ImageError) else "File not found")
+
+
+# The two routes below are coroutines: the quick part (database, file header, cache lookup) runs on a request
+# thread like every other handler, a full decode on the image pool. Decoding a large image takes up to a
+# second; on the request threads a page of uncached thumbnails would stall every other request.
+
+
 @router.get("/projects/{pid}/images/{iid}/file")
-def image_file(iid: int, access: Access, ctx: Ctx, db: DB, v: str | None = None) -> FileResponse:
-    image = svc.get_image(db, access.project.id, iid)
-    paths = ProjectPaths(ctx.settings, access.project)
-    paths.check()
-    path = paths.image_file(image.rel_path)
+async def image_file(iid: int, access: Access, ctx: Ctx, db: DB, v: str | None = None) -> FileResponse:
     mode = access.project.exif_mode
-    try:
-        info = probe(path, mode)
-        headers = {"Cache-Control": IMMUTABLE if v else "private, no-cache"}
-        if not info.needs_reencode:
-            return FileResponse(path, media_type=info.media_type, headers=headers)
-        ext, media = (".jpg", "image/jpeg") if info.format in ("JPEG", "MPO") else (".png", "image/png")
-        cached = ctx.renders.get_or_create(DiskCache.source_key(path, "render", mode), ext,
-                                           lambda: reencode(path, mode)[0])
-    except (ImageError, OSError) as exc:
-        raise not_found(str(exc) if isinstance(exc, ImageError) else "File not found") from None
+    headers = {"Cache-Control": IMMUTABLE if v else "private, no-cache"}
+
+    def prepare() -> tuple[str, str, str, str | None, str | None]:
+        """``(path, media type, cache key, extension, cached file)``; without a key the file is served as it is."""
+        image = svc.get_image(db, access.project.id, iid)
+        paths = ProjectPaths(ctx.settings, access.project)
+        paths.check()
+        path = paths.image_file(image.rel_path)
+        try:
+            info = probe(path, mode)
+            if not info.needs_reencode:
+                return path, info.media_type, "", None, None
+            ext, media = (".jpg", "image/jpeg") if info.format in ("JPEG", "MPO") else (".png", "image/png")
+            key = DiskCache.source_key(path, "render", mode)
+        except (ImageError, OSError) as exc:
+            raise _image_error(exc) from None
+        return path, media, key, ext, ctx.renders.lookup(key, ext)
+
+    path, media, key, ext, cached = await run_in_threadpool(prepare)
+    if ext is None:
+        return FileResponse(path, media_type=media, headers=headers)
+    if cached is None:
+        try:
+            cached = await ctx.run_decode(ctx.renders.get_or_create, key, ext, lambda: reencode(path, mode)[0])
+        except (ImageError, OSError) as exc:
+            raise _image_error(exc) from None
     return FileResponse(cached, media_type=media, headers=headers)
 
 
 @router.get("/projects/{pid}/images/{iid}/thumb")
-def thumbnail(iid: int, access: Access, ctx: Ctx, db: DB, size: Annotated[int, Query(ge=64, le=512)] = 256,
-              v: str | None = None) -> FileResponse:
+async def thumbnail(iid: int, access: Access, ctx: Ctx, db: DB, size: Annotated[int, Query(ge=64, le=512)] = 256,
+                    v: str | None = None) -> FileResponse:
     size = next(allowed for allowed in THUMB_SIZES if allowed >= size)  # few sizes: bounded decodes and cache files
-    image = svc.get_image(db, access.project.id, iid)
-    paths = ProjectPaths(ctx.settings, access.project)
-    paths.check()
-    path = paths.image_file(image.rel_path)
     mode = access.project.exif_mode
-    try:
-        cached = ctx.thumbs.get_or_create(DiskCache.source_key(path, "thumb", size, mode), ".webp",
+
+    def prepare() -> tuple[str, str, str | None]:
+        image = svc.get_image(db, access.project.id, iid)
+        paths = ProjectPaths(ctx.settings, access.project)
+        paths.check()
+        path = paths.image_file(image.rel_path)
+        try:
+            key = DiskCache.source_key(path, "thumb", size, mode)
+        except OSError as exc:
+            raise _image_error(exc) from None
+        return path, key, ctx.thumbs.lookup(key, ".webp")
+
+    path, key, cached = await run_in_threadpool(prepare)
+    if cached is None:
+        try:
+            cached = await ctx.run_decode(ctx.thumbs.get_or_create, key, ".webp",
                                           lambda: make_thumbnail(path, size, mode))
-    except (ImageError, OSError) as exc:
-        raise not_found(str(exc) if isinstance(exc, ImageError) else "File not found") from None
+        except (ImageError, OSError) as exc:
+            raise _image_error(exc) from None
     return FileResponse(cached, media_type="image/webp",
                         headers={"Cache-Control": IMMUTABLE if v else "private, max-age=3600"})
 

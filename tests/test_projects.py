@@ -160,7 +160,9 @@ def test_project_list_and_summary(admin, make_user, create_project, dataset, roo
     summary = summaries[0]
     assert set(summary) == {"id", "name", "description", "label_format", "image_count", "missing_count",
                             "status_counts", "member_count", "my_role", "my_assigned_todo", "unread_chat",
-                            "archived", "indexing", "created_at", "updated_at", "members_preview"}
+                            "archived", "indexing", "class_migration", "created_at", "updated_at",
+                            "members_preview"}
+    assert summary["class_migration"] is None
     assert summary["my_role"] == "annotator" and summary["member_count"] == 2
     # Card avatars without one /members request per card: managers first, then by name.
     assert [u["username"] for u in summary["members_preview"]] == ["admin", "bob"]

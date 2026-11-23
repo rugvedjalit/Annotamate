@@ -154,6 +154,15 @@ class Permissions(Model):
     can_delete: bool
 
 
+class ClassMigration(Model):
+    """A class delete/merge that is rewriting the label files (editing is paused meanwhile)."""
+
+    kind: Literal["delete", "merge"]
+    class_name: str
+    done: int
+    total: int
+
+
 class ProjectSummary(Model):
     id: int
     name: str
@@ -169,6 +178,7 @@ class ProjectSummary(Model):
     unread_chat: int
     archived: bool
     indexing: bool
+    class_migration: ClassMigration | None = None
     created_at: str
     updated_at: str
     members_preview: list[UserBrief]
@@ -457,8 +467,10 @@ class PruneResult(Model):
     removed: int
 
 
-class ClassDeleteResult(Model):
-    rewritten_files: int
+class ClassDeleteStarted(Model):
+    """The delete was accepted; the label files are rewritten by a background job."""
+
+    started: bool
 
 
 class FsRoot(Model):

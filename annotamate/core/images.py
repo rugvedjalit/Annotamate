@@ -217,6 +217,11 @@ class DiskCache:
     def path_for(self, key: str, ext: str) -> str:
         return os.path.join(self.directory, key[:2], f"{key}{ext}")
 
+    def lookup(self, key: str, ext: str) -> str | None:
+        """Path of the cached entry, or ``None`` when it has to be produced first."""
+        target = self.path_for(key, ext)
+        return target if os.path.exists(target) else None
+
     def get_or_create(self, key: str, ext: str, produce: Callable[[], bytes]) -> str:
         """Path of the cached entry, producing and storing it first when missing."""
         target = self.path_for(key, ext)

@@ -147,10 +147,12 @@ def save_boxes(ctx: AppContext, session: Session, access: ProjectAccess, image: 
     if holder is not None and holder[0] != user.id:
         raise ApiError(423, "locked", f"{holder[1]['display_name']} is editing this image.", holder=holder[1])
     holds_lock = holder is not None
+    ctx.refuse_while_migrating(project.id)  # before waiting for the lock ...
     paths = ProjectPaths(ctx.settings, project)
     paths.check()
 
     with ctx.label_locks(project.id):
+        ctx.refuse_while_migrating(project.id)  # ... and again once nothing else can start one
         session.refresh(image)
         info, error = probe_image(paths, image)
         label = read_label_file(paths, image.rel_path, info.width if info else None, info.height if info else None,

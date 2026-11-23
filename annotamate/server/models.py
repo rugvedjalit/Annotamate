@@ -120,8 +120,9 @@ class Image(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "rel_path"),
         Index("ix_images_project_sort", "project_id", "sort_index"),
-        Index("ix_images_project_status", "project_id", "status"),
-        Index("ix_images_project_assignee", "project_id", "assignee_id"),
+        # Visible images of a project by status / by assignee, in list order (filters and per-project counts).
+        Index("ix_images_project_missing_status_sort", "project_id", "missing", "status", "sort_index"),
+        Index("ix_images_project_missing_assignee_sort", "project_id", "missing", "assignee_id", "sort_index"),
         Index("ix_images_project_updated", "project_id", "updated_at"),
         Index("ix_images_project_label_key", "project_id", "label_key"),
     )
@@ -214,7 +215,10 @@ class Comment(Base):
 
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
-    __table_args__ = (Index("ix_chat_messages_project_id_id", "project_id", "id"),)
+    __table_args__ = (
+        Index("ix_chat_messages_project_id_id", "project_id", "id"),
+        Index("ix_chat_messages_image_id", "image_id"),  # deleting an image clears its references
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
@@ -257,6 +261,7 @@ class Notification(Base):
     __table_args__ = (
         Index("ix_notifications_user_id_id", "user_id", "id"),
         Index("ix_notifications_user_read", "user_id", "read_at"),
+        Index("ix_notifications_image_id", "image_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -277,6 +282,7 @@ class Activity(Base):
         Index("ix_activity_project_user", "project_id", "user_id", "id"),
         Index("ix_activity_project_image", "project_id", "image_id", "id"),
         Index("ix_activity_project_type", "project_id", "type", "created_at"),
+        Index("ix_activity_image_id", "image_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

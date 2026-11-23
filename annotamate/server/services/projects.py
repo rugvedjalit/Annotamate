@@ -57,26 +57,51 @@ def _resolve_label_dir(ctx: AppContext, label_dir: str | None, image_dir: str) -
 # ------------------------------------------------------------------------------------------- summaries
 
 
+def image_counts(ctx: AppContext, session: Session, project_id: int) -> tuple[dict[str, int], int]:
+    """``(images per status, missing images)`` of a project, from the aggregate cache."""
+
+    def compute() -> tuple[dict[str, int], int]:
+        counts = dict.fromkeys(STATUSES, 0)
+        missing = 0
+        # One pass over the (project_id, missing, status, ...) index; no table row is read.
+        for is_missing, status, n in session.execute(
+            select(Image.missing, Image.status, func.count()).where(Image.project_id == project_id)
+            .group_by(Image.missing, Image.status)
+        ):
+            if is_missing:
+                missing += n
+            else:
+                counts[status] = n
+        return counts, missing
+
+    return ctx.aggregates.get(project_id, "counts", compute)
+
+
+def _assigned_todo(ctx: AppContext, session: Session, project_id: int, user_id: int) -> int:
+    """Images assigned to the user that are not done yet (cached like the other counts)."""
+
+    def compute() -> int:
+        return session.scalar(select(func.count()).select_from(Image).where(
+            Image.project_id == project_id, Image.missing.is_(False), Image.assignee_id == user_id,
+            Image.status != "done")) or 0
+
+    return ctx.aggregates.get(project_id, ("assigned", user_id), compute)
+
+
 def summaries(ctx: AppContext, session: Session, projects: list[Project], user: User) -> list[dict[str, Any]]:
     ids = [p.id for p in projects]
     if not ids:
         return []
-    live = Image.missing.is_(False)
-    missing = dict(session.execute(select(Image.project_id, func.count()).where(
-        Image.project_id.in_(ids), Image.missing.is_(True)).group_by(Image.project_id)).all())
-    counts: dict[int, dict[str, int]] = {pid: dict.fromkeys(STATUSES, 0) for pid in ids}
-    for pid, status, n in session.execute(
-        select(Image.project_id, Image.status, func.count()).where(Image.project_id.in_(ids), live)
-        .group_by(Image.project_id, Image.status)
-    ):
-        counts[pid][status] = n
+    counts: dict[int, dict[str, int]] = {}
+    missing: dict[int, int] = {}
+    assigned: dict[int, int] = {}
+    for pid in ids:
+        counts[pid], missing[pid] = image_counts(ctx, session, pid)
+        assigned[pid] = _assigned_todo(ctx, session, pid, user.id)
     members = dict(session.execute(select(ProjectMember.project_id, func.count()).where(
         ProjectMember.project_id.in_(ids)).group_by(ProjectMember.project_id)).all())
     roles = dict(session.execute(select(ProjectMember.project_id, ProjectMember.role).where(
         ProjectMember.project_id.in_(ids), ProjectMember.user_id == user.id)).all())
-    assigned = dict(session.execute(select(Image.project_id, func.count()).where(
-        Image.project_id.in_(ids), live, Image.assignee_id == user.id, Image.status != "done")
-        .group_by(Image.project_id)).all())
     unread = dict(session.execute(
         select(ChatMessage.project_id, func.count())
         .outerjoin(ChatRead, and_(ChatRead.project_id == ChatMessage.project_id, ChatRead.user_id == user.id))
@@ -92,13 +117,14 @@ def summaries(ctx: AppContext, session: Session, projects: list[Project], user: 
             "label_format": p.label_format,
             "image_count": sum(counts[p.id].values()),
             "missing_count": missing.get(p.id, 0),
-            "status_counts": counts[p.id],
+            "status_counts": dict(counts[p.id]),
             "member_count": members.get(p.id, 0),
             "my_role": roles.get(p.id),
             "my_assigned_todo": assigned.get(p.id, 0),
             "unread_chat": unread.get(p.id, 0),
             "archived": p.archived,
             "indexing": ctx.is_indexing(p.id),
+            "class_migration": migration.out() if (migration := ctx.migrations.get(p.id)) is not None else None,
             "created_at": serialize.iso(p.created_at),
             "updated_at": serialize.iso(p.updated_at),
             "members_preview": previews.get(p.id, []),
@@ -127,20 +153,29 @@ def _member_previews(session: Session, project_ids: list[int]) -> dict[int, list
     }
 
 
-def members_out(session: Session, project_id: int, user_ids: list[int] | None = None) -> list[dict[str, Any]]:
+def _work_counts(ctx: AppContext, session: Session, project_id: int) -> tuple[dict[int, int], dict[int, int]]:
+    """``(images assigned, images finished)`` per user id for a project, from the aggregate cache."""
+
+    def compute() -> tuple[dict[int, int], dict[int, int]]:
+        live = Image.missing.is_(False)
+        assigned = dict(session.execute(select(Image.assignee_id, func.count()).where(
+            Image.project_id == project_id, live, Image.assignee_id.is_not(None)).group_by(Image.assignee_id)).all())
+        done = dict(session.execute(select(Image.done_by_id, func.count()).where(
+            Image.project_id == project_id, live, Image.done_by_id.is_not(None),
+            Image.status.in_(("done", "review"))).group_by(Image.done_by_id)).all())
+        return assigned, done
+
+    return ctx.aggregates.get(project_id, "work", compute)
+
+
+def members_out(ctx: AppContext, session: Session, project_id: int,
+                user_ids: list[int] | None = None) -> list[dict[str, Any]]:
     query = (select(ProjectMember, User).join(User, User.id == ProjectMember.user_id)
              .where(ProjectMember.project_id == project_id))
     if user_ids is not None:
         query = query.where(ProjectMember.user_id.in_(user_ids))
     rows = session.execute(query).all()
-    ids = [m.user_id for m, _ in rows]
-    live = Image.missing.is_(False)
-    assigned = dict(session.execute(select(Image.assignee_id, func.count()).where(
-        Image.project_id == project_id, live, Image.assignee_id.in_(ids)).group_by(Image.assignee_id)).all()) \
-        if ids else {}
-    done = dict(session.execute(select(Image.done_by_id, func.count()).where(
-        Image.project_id == project_id, live, Image.done_by_id.in_(ids), Image.status.in_(("done", "review")))
-        .group_by(Image.done_by_id)).all()) if ids else {}
+    assigned, done = _work_counts(ctx, session, project_id) if rows else ({}, {})
     out = [
         {"user": serialize.brief(u), "role": m.role, "joined_at": serialize.iso(m.joined_at),
          "assigned_count": assigned.get(u.id, 0), "done_count": done.get(u.id, 0),
@@ -161,7 +196,7 @@ def detail(ctx: AppContext, session: Session, access: ProjectAccess) -> dict[str
         "label_dir": (project.label_dir if manager else "") if project.label_dir else None,
         "settings": project_settings(project),
         "classes": [serialize.class_out(c) for c in table.classes],
-        "members": members_out(session, project.id),
+        "members": members_out(ctx, session, project.id),
         "permissions": access.permissions(),
     })
     return out
@@ -227,6 +262,7 @@ def prune_missing(ctx: AppContext, session: Session, access: ProjectAccess) -> i
     access.require_manage()
     project = access.project
     with ctx.label_locks(project.id):
+        ctx.refuse_while_migrating(project.id)
         removed = session.execute(delete(Image).where(Image.project_id == project.id, Image.missing.is_(True))
                                   .execution_options(synchronize_session=False)).rowcount or 0
         if removed:
@@ -257,6 +293,7 @@ def update_project(ctx: AppContext, session: Session, access: ProjectAccess, bod
             raise forbidden("Only administrators can change the label folder.")
         label_dir = _resolve_label_dir(ctx, body.label_dir, project.image_dir)
         if label_dir != project.label_dir:
+            ctx.refuse_while_migrating(project.id)
             project.label_dir = label_dir
             changed.append("label_dir")
             reindex = True
@@ -283,9 +320,11 @@ def delete_project(ctx: AppContext, session: Session, access: ProjectAccess) -> 
         raise forbidden("Only administrators can delete projects.")
     project_id = access.project.id
     with ctx.label_locks(project_id):
+        ctx.refuse_while_migrating(project_id)
         session.delete(access.project)
         emit(session, ("project", project_id), {"type": "project.updated", "project_id": project_id})
         session.commit()
+    ctx.aggregates.forget(project_id)
     ctx.hub.close_project(project_id)
 
 
@@ -307,7 +346,8 @@ def _manager_count(session: Session, project_id: int) -> int:
                                  User.is_active.is_(True))) or 0
 
 
-def add_member(session: Session, access: ProjectAccess, user_id: int, role: str) -> dict[str, Any]:
+def add_member(ctx: AppContext, session: Session, access: ProjectAccess, user_id: int,
+               role: str) -> dict[str, Any]:
     access.require_manage()
     project = access.project
     user = session.get(User, user_id)
@@ -323,15 +363,16 @@ def add_member(session: Session, access: ProjectAccess, user_id: int, role: str)
                   f"{access.user.display_name} added you to {project.name} as {role}", actor=access.user,
                   project=project)
     emit(session, ("project", project.id), {"type": "members.updated", "project_id": project.id})
-    return members_out(session, project.id, [user_id])[0]
+    return members_out(ctx, session, project.id, [user_id])[0]
 
 
-def update_member(session: Session, access: ProjectAccess, user_id: int, role: str) -> dict[str, Any]:
+def update_member(ctx: AppContext, session: Session, access: ProjectAccess, user_id: int,
+                  role: str) -> dict[str, Any]:
     access.require_manage()
     project = access.project
     member = _member(session, project.id, user_id)
     if member.role == role:
-        return members_out(session, project.id, [user_id])[0]
+        return members_out(ctx, session, project.id, [user_id])[0]
     if member.role == "manager" and _manager_count(session, project.id) <= 1:
         raise bad_request("A project needs at least one manager.")
     previous, member.role = member.role, role
@@ -341,7 +382,7 @@ def update_member(session: Session, access: ProjectAccess, user_id: int, role: s
                   data={"member": serialize.brief(user), "role": role, "previous_role": previous})
     emit(session, ("project", project.id), {"type": "members.updated", "project_id": project.id})
     session.flush()
-    return members_out(session, project.id, [user_id])[0]
+    return members_out(ctx, session, project.id, [user_id])[0]
 
 
 def remove_member(ctx: AppContext, session: Session, access: ProjectAccess, user_id: int) -> None:

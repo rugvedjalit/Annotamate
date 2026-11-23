@@ -8,7 +8,7 @@ import pytest
 
 from annotamate.server.services import classes as class_service
 from annotamate.server.services.access import load_access
-from conftest import images_of, make_image, wait_idle
+from conftest import delete_class, images_of, make_image, wait_idle
 
 
 def _receive(ws, type_: str, limit: int = 20) -> dict:
@@ -28,17 +28,19 @@ def yolo(admin, create_project, root):
     return folder, project
 
 
-def test_class_delete_reads_files_not_cached_counts(admin, yolo):
+def test_class_delete_reads_files_not_cached_counts(admin, app, yolo):
     folder, project = yolo
     pid = project["id"]
     a = project["classes"][0]
     # labels written behind the server's back: the cached counts know nothing about them
     (folder / "i0.txt").write_text("0 0.5 0.5 0.1 0.1\n2 0.2 0.2 0.1 0.1\n")
-    forbid = admin.delete(f"/api/projects/{pid}/classes/{a['id']}")
-    assert forbid.status_code == 409 and forbid.json()["code"] == "in_use" and forbid.json()["images"] == 1
+    # the index says "unused", so the request is accepted; the job reads the files and refuses
+    forbid = delete_class(admin, app, pid, a["id"])
+    assert forbid["type"] == "class_delete_failed" and forbid["code"] == "in_use" and forbid["images"] == 1
     assert (folder / "i0.txt").read_text() == "0 0.5 0.5 0.1 0.1\n2 0.2 0.2 0.1 0.1\n"
-    deleted = admin.delete(f"/api/projects/{pid}/classes/{a['id']}", params={"strategy": "delete_boxes"})
-    assert deleted.json() == {"rewritten_files": 1}
+    assert [c["name"] for c in admin.get(f"/api/projects/{pid}/classes").json()] == ["a", "b", "c"]
+    deleted = delete_class(admin, app, pid, a["id"], strategy="delete_boxes")
+    assert deleted["type"] == "class_deleted" and deleted["rewritten_files"] == 1
     assert (folder / "i0.txt").read_text() == "1 0.2 0.2 0.1 0.1\n"  # "c" moved from index 2 to 1
     assert (folder / "classes.txt").read_text() == "b\nc\n"
 
@@ -57,7 +59,7 @@ def test_class_changes_refused_while_indexing(admin, app, yolo, root):
     finally:
         release.set()
     wait_idle(app)
-    assert admin.delete(f"/api/projects/{pid}/classes/{project['classes'][0]['id']}").status_code == 200
+    assert delete_class(admin, app, pid, project["classes"][0]["id"])["type"] == "class_deleted"
 
 
 def test_unreadable_or_empty_folder_never_wipes_the_index(admin, app, yolo, monkeypatch):

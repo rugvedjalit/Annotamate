@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 from annotamate.server.services.paths import CASE_INSENSITIVE_FS
-from conftest import box, images_of, make_image, wait_idle
+from conftest import box, delete_class, images_of, make_image, wait_idle
 
 
 def _ids(user, pid):
@@ -53,7 +53,7 @@ def test_images_sharing_a_stem_share_nothing_but_the_first_owns_the_file(admin, 
         assert other is None
 
 
-def test_yolo_image_named_classes_is_read_only_and_classes_txt_is_untouched(admin, create_project, root):
+def test_yolo_image_named_classes_is_read_only_and_classes_txt_is_untouched(admin, app, create_project, root):
     folder = root / "reserved"
     make_image(folder / "classes.jpg")
     make_image(folder / "x.jpg")
@@ -69,8 +69,7 @@ def test_yolo_image_named_classes_is_read_only_and_classes_txt_is_untouched(admi
     assert (folder / "classes.txt").read_text() == "cat\ndog\n"
     # a class migration must not treat classes.txt as an image label
     dog = project["classes"][1]
-    deleted = admin.delete(f"/api/projects/{pid}/classes/{dog['id']}", params={"strategy": "delete_boxes"})
-    assert deleted.status_code == 200
+    assert delete_class(admin, app, pid, dog["id"], strategy="delete_boxes")["type"] == "class_deleted"
     assert (folder / "classes.txt").read_text() == "cat\n"
 
 
@@ -406,7 +405,7 @@ def test_rename_keeps_pending_and_retries_when_a_file_cannot_be_read(admin, app,
     assert pid not in app.state.ctx.rename_retries
 
 
-def test_class_delete_refuses_when_a_label_file_cannot_be_read(admin, create_project, dataset, monkeypatch):
+def test_class_delete_refuses_when_a_label_file_cannot_be_read(admin, app, create_project, dataset, monkeypatch):
     from annotamate.server.services import classes as classes_service
 
     (dataset / "img1.txt").write_text("1 0.5 0.5 0.2 0.2\n")
@@ -415,8 +414,8 @@ def test_class_delete_refuses_when_a_label_file_cannot_be_read(admin, create_pro
     pid, cat = project["id"], project["classes"][0]
     real_read = classes_service._read
     monkeypatch.setattr(classes_service, "_read", lambda path: None if path.endswith("img2.txt") else real_read(path))
-    refused = admin.delete(f"/api/projects/{pid}/classes/{cat['id']}", params={"strategy": "delete_boxes"})
-    assert refused.status_code == 400 and "img2.txt" in refused.json()["detail"]
+    refused = delete_class(admin, app, pid, cat["id"], strategy="delete_boxes")
+    assert refused["type"] == "class_delete_failed" and "img2.txt" in refused["error"]
     # nothing changed: the class still exists and no file was renumbered
     assert [c["name"] for c in admin.get(f"/api/projects/{pid}").json()["classes"]] == ["cat", "dog"]
     assert (dataset / "img1.txt").read_text() == "1 0.5 0.5 0.2 0.2\n"

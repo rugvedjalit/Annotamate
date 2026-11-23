@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     static_dir: Path | None = None
     #: Upper bound for each on-disk cache (thumbnails, re-encoded images), in MB.
     cache_max_mb: int = Field(2048, ge=16)
+    #: Threads that run the request handlers. Few threads serve many users faster than many (they share one
+    #: interpreter lock); slow work (image decoding, uploads, label rewrites) runs on its own small pools.
+    worker_threads: int = Field(4, ge=1, le=64)
 
     @field_validator("roots", mode="before")
     @classmethod

@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
+from annotamate.server.context import AppContext
 from annotamate.server.models import Activity, Image, ImageClassCount, ProjectClass, ProjectMember, utcnow
 from annotamate.server.schemas import STATUSES
 from annotamate.server.services import serialize
@@ -15,8 +16,17 @@ from annotamate.server.services import serialize
 DAYS = 30
 
 
-def project_stats(session: Session, project_id: int, tz_offset_minutes: int = 0) -> dict[str, Any]:
-    """Aggregates for the overview. ``tz_offset_minutes`` (east of UTC) sets the viewer's calendar days."""
+def project_stats(ctx: AppContext, session: Session, project_id: int, tz_offset_minutes: int = 0) -> dict[str, Any]:
+    """Aggregates for the overview. ``tz_offset_minutes`` (east of UTC) sets the viewer's calendar days.
+
+    Every open overview asks for these after each change in the project, so the result comes from the
+    aggregate cache: computed once per change (at most every couple of seconds) however many clients ask.
+    """
+    return ctx.aggregates.get(project_id, ("stats", tz_offset_minutes),
+                              lambda: _project_stats(session, project_id, tz_offset_minutes))
+
+
+def _project_stats(session: Session, project_id: int, tz_offset_minutes: int) -> dict[str, Any]:
     live = Image.missing.is_(False)
     status_counts = dict.fromkeys(STATUSES, 0)
     for status, n in session.execute(select(Image.status, func.count()).where(Image.project_id == project_id, live)

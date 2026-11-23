@@ -104,6 +104,7 @@ def save_uploads(ctx: AppContext, session: Session, access: ProjectAccess, files
                  subdir: str | None) -> dict:
     access.require_manage()
     project = access.project
+    ctx.refuse_while_migrating(project.id)
     paths = ProjectPaths(ctx.settings, project)
     paths.check()
     limit = ctx.settings.max_upload_bytes
@@ -152,7 +153,7 @@ def save_uploads(ctx: AppContext, session: Session, access: ProjectAccess, files
 
     added: list[Image] = []
     if written:
-        with ctx.label_locks(project.id):
+        with ctx.quiet_label_lock(project.id):  # the files are written: index them after a class migration
             table = load_class_table(session, project.id, project.label_format)
             existing = dict(session.execute(select(Image.rel_path, Image.id).where(
                 Image.project_id == project.id, Image.rel_path.in_(written))).all())

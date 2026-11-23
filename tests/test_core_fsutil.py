@@ -439,7 +439,7 @@ def test_backups_and_journal_record_content_hashes(tmp_path: Path, monkeypatch: 
     real_replace = fsutil._replace
 
     def spy(src: str, dst: str) -> None:
-        if src.endswith(".tmp") and not seen:
+        if dst == str(target) and not seen:  # the new content is about to replace the target
             journal = next(journals.iterdir())
             seen.extend(json.loads(journal.read_text())["files"])
             bak = seen[0]["bak"]

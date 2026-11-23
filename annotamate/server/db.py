@@ -28,16 +28,23 @@ def _sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA cache_size=-65536")  # 64 MB page cache per connection (the default is 2 MB)
+        cursor.execute("PRAGMA mmap_size=268435456")  # read through the OS page cache, shared by all connections
+        cursor.execute("PRAGMA temp_store=MEMORY")
     finally:
         cursor.close()
 
 
-def make_engine(url: str) -> Engine:
+#: Connections kept open besides one per worker thread (background jobs, WebSocket handlers).
+SQLITE_POOL_EXTRA = 4
+
+
+def make_engine(url: str, worker_threads: int = 4) -> Engine:
     if url.startswith("sqlite"):
         engine = create_engine(
             url,
             connect_args={"check_same_thread": False, "timeout": 30},
-            pool_size=20,
+            pool_size=worker_threads + SQLITE_POOL_EXTRA,  # each open connection has its own page cache
             max_overflow=20,
             pool_pre_ping=False,
         )
@@ -64,8 +71,8 @@ def run_migrations(engine: Engine) -> None:
 class Database:
     """Owns the engine and the session factory; routes post-commit outbox items to ``publish``."""
 
-    def __init__(self, url: str) -> None:
-        self.engine = make_engine(url)
+    def __init__(self, url: str, worker_threads: int = 4) -> None:
+        self.engine = make_engine(url, worker_threads)
         self.session_factory = sessionmaker(self.engine, expire_on_commit=False)
         self.publish: Callable[[list[OutboxItem]], None] | None = None
         event.listen(self.session_factory, "after_commit", self._after_commit)
@@ -96,6 +103,21 @@ class Database:
             raise
         finally:
             session.close()
+
+    def optimize(self) -> None:
+        """Refresh the query planner's statistics (SQLite only; cheap, and never fatal).
+
+        Run after indexing and at shutdown: without statistics SQLite cannot tell a rare status or assignee
+        from a common one. ``analysis_limit`` bounds the work on large tables.
+        """
+        if self.engine.dialect.name != "sqlite":
+            return
+        try:
+            with self.engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA analysis_limit=1000")
+                connection.exec_driver_sql("PRAGMA optimize=0x10002")  # all tables, not only this connection's
+        except Exception:
+            log.warning("PRAGMA optimize failed", exc_info=True)
 
     def dispose(self) -> None:
         self.engine.dispose()

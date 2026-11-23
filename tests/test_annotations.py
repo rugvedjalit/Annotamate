@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import select
 
 from annotamate.server.models import Activity, utcnow
-from conftest import box, images_of, make_image
+from conftest import box, delete_class, images_of, make_image
 
 
 @pytest.fixture
@@ -257,13 +257,13 @@ def test_revisions_and_restore(setup, app):
     assert "revision_restored" in types
 
 
-def test_restore_after_class_deleted(setup, admin):
+def test_restore_after_class_deleted(setup, admin, app):
     project, _image, url, cat, dog, ann, _ = setup
     v1 = ann.put(f"{url}/annotation", json={"base_version": None,
                                             "boxes": [box(cat, 1, 1, 9, 9), box(dog, 2, 2, 8, 8)]}).json()
     v2 = ann.put(f"{url}/annotation", json={"base_version": v1["version"], "boxes": []}).json()
     first = ann.get(f"{url}/revisions").json()[-1]
-    assert admin.delete(f"/api/projects/{project['id']}/classes/{dog}").status_code == 200
+    assert delete_class(admin, app, project["id"], dog)["type"] == "class_deleted"
     detail = ann.get(f"{url}/revisions/{first['id']}").json()
     assert [b["class_id"] for b in detail["boxes"]] == [cat]  # YOLO: a deleted class cannot be restored by index
     restored = ann.post(f"{url}/revisions/{first['id']}/restore", json={"base_version": v2["version"]})

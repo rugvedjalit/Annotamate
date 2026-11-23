@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
 
+import anyio.to_thread
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from sqlalchemy import select
@@ -29,13 +30,15 @@ from annotamate.server.config import Settings
 from annotamate.server.context import AppContext, JobRunner
 from annotamate.server.db import Database
 from annotamate.server.deps import CurrentUser
-from annotamate.server.errors import error_body, install_error_handlers, not_found
+from annotamate.server.errors import ApiError, error_body, install_error_handlers, not_found
 from annotamate.server.models import Project, ProjectClass
 from annotamate.server.routes import api_router
 from annotamate.server.routes.auth import set_session_cookie
 from annotamate.server.security import CSRF_HEADER, new_setup_token
 from annotamate.server.services.classes import resume_renames
 from annotamate.server.services.indexing import index_project
+from annotamate.server.services.labels import load_class_table, sync_classes_file
+from annotamate.server.services.paths import ProjectPaths
 from annotamate.server.services.users import user_count
 
 log = logging.getLogger("annotamate.server")
@@ -375,15 +378,47 @@ def _resume_indexing(ctx: AppContext) -> None:
         index_project(ctx, project_id, discover_classes=project_id not in with_classes)
 
 
+def _recover_label_rewrites(settings: Settings, db: Database) -> None:
+    """Finish or undo label rewrites interrupted by a crash, deciding class changes by the database.
+
+    A class delete/merge commits in the database after its files are in place; whether that commit happened
+    decides whether the new files stay. ``classes.txt`` of every affected project is then rewritten from the
+    database, so the class list on disk always matches it.
+    """
+    projects: set[int] = set()
+
+    def committed(meta: dict[str, object] | None) -> bool:
+        if not meta or meta.get("kind") != "class_change":
+            return False
+        project_id, class_id = meta.get("project_id"), meta.get("class_id")
+        if isinstance(project_id, int):
+            projects.add(project_id)
+        with db.session() as session:
+            return not isinstance(class_id, int) or session.get(ProjectClass, class_id) is None
+
+    for restored in recover_journals(str(settings.journal_dir), committed):
+        log.warning("Rolled back an interrupted label rewrite: restored %s", restored)
+    for project_id in projects:
+        with db.session() as session:
+            project = session.get(Project, project_id)
+            if project is None:
+                continue
+            try:
+                paths = ProjectPaths(settings, project)
+                paths.check()
+                sync_classes_file(paths, load_class_table(session, project.id, project.label_format))
+            except (OSError, ApiError) as exc:
+                log.warning("Could not rewrite classes.txt of project %s after recovery: %s", project_id, exc)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the application. The database is migrated to the latest schema before this returns."""
     settings = settings or Settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    for restored in recover_journals(str(settings.journal_dir)):
-        log.warning("Rolled back an interrupted label rewrite: restored %s", restored)
     configure_images(max_megapixels=settings.max_image_megapixels)
-    db = Database(settings.db_url)
+    db = Database(settings.db_url, settings.worker_threads)
     db.migrate()
+    _recover_label_rewrites(settings, db)
     ctx = AppContext(settings, db)
     with db.session() as session:
         if user_count(session) == 0:
@@ -391,13 +426,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             log.warning("\n%s\n  FIRST-RUN SETUP TOKEN: %s\n  Enter it on the setup page to create the administrator "
                         "(not needed when you open the page on this machine).\n%s",
                         "=" * 72, ctx.setup_token, "=" * 72)
-    db.publish = lambda items: ctx.hub.publish(items)
+    db.publish = ctx.publish
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if ctx.jobs.stopping.is_set():
             ctx.jobs = JobRunner()
         loop = asyncio.get_running_loop()
+        # Request handlers are plain functions run on AnyIO's worker threads. The default of 40 threads is
+        # slower than a few for many simultaneous users (they all contend for the interpreter lock).
+        anyio.to_thread.current_default_thread_limiter().total_tokens = settings.worker_threads
         quiet_connection_resets(loop)
         ctx.hub.start(loop)
         await run_in_threadpool(_resume_indexing, ctx)
@@ -407,6 +445,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await ctx.hub.stop()
             await run_in_threadpool(ctx.jobs.shutdown)
+            await run_in_threadpool(ctx.close_pools)
+            await run_in_threadpool(ctx.db.optimize)
 
     app = FastAPI(
         title="Annotamate",

@@ -12,6 +12,7 @@ import re
 import secrets
 import time
 import unicodedata
+from collections.abc import Callable
 
 _WINDOWS = os.name == "nt"
 log = logging.getLogger("annotamate.fsutil")
@@ -190,105 +191,250 @@ def _file_digest(path: str) -> str | None:
         return None
 
 
-def _write_journal(journal_dir: str, entries: list[dict[str, str | None]]) -> str:
-    os.makedirs(journal_dir, exist_ok=True)
-    path = os.path.join(journal_dir, f"{JOURNAL_PREFIX}{secrets.token_hex(8)}.json")
-    atomic_write(path, json.dumps({"files": entries}))
-    return path
+COMMITTED_SUFFIX = ".committed"
 
 
-def atomic_write_many(items: list[tuple[str, bytes]], *, journal_dir: str | None = None) -> None:
-    """Replace several files all-or-nothing (as far as the file system allows).
+def _journal_run(name: str) -> str:
+    """The run a journal file belongs to (``label-rewrite-<run>-<batch>.json``; older journals are their own run)."""
+    return name[len(JOURNAL_PREFIX):-len(".json")].rsplit("-", 1)[0]
 
-    1. Pre-flight: every target (and its folder) must be writable, including the Windows read-only attribute.
-    2. Every new content is written and ``fsync``-ed to a temporary file, and every original to a backup
-       file, all in the target's own folder; the folders are ``fsync``-ed too.
-    3. When ``journal_dir`` is given, a journal naming the temporaries and backups, with the SHA-256 of the
-       old and the new content, is written next, so :func:`recover_journals` can undo a half-finished run
-       after a crash.
-    4. Targets are replaced one by one. If one replace fails, the ones already done are restored from
-       their backups; if that fails too, :class:`MigrationIncompleteError` lists the affected files and the
-       backups plus the journal stay in place (the next start finishes the rollback).
 
-    Temporaries and backups are always removed unless a rollback failed.
+def _swap_in(entry: dict[str, str | None]) -> None:
+    """Put one staged file in place, keeping the original as its backup.
+
+    The backup is a hard link to the original, so nothing is copied and the target never disappears; where
+    hard links are not available (FAT, some network shares) the original is moved aside instead.
     """
-    for path, _data in items:
-        _check_writable(path)
-    entries: list[dict[str, str | None]] = []
-    journal: str | None = None
-    keep: set[str] = set()  # paths whose backup must survive a failed rollback
+    path, tmp, bak = str(entry["path"]), str(entry["tmp"]), entry["bak"]
+    moved = False
+    if bak:
+        try:
+            os.link(path, bak)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            _replace(path, bak)
+            moved = True
     try:
+        _replace(tmp, path)
+    except BaseException:
+        if moved:
+            with contextlib.suppress(OSError):
+                _replace(str(bak), path)
+        raise
+
+
+class StagedRewrite:
+    """Replace many files all-or-nothing (as far as the file system allows), staged in batches.
+
+    1. :meth:`stage` (once per batch): every target and its folder must be writable (including the Windows
+       read-only attribute); a journal naming the batch's temporaries and backups, with the SHA-256 of the old
+       and the new content, is written to ``journal_dir``; then every new content is written and ``fsync``-ed
+       to a temporary file in the target's own folder. Nothing is replaced yet, so readers still see the
+       originals, and only the journal file names are kept in memory.
+    2. :meth:`commit`: targets are replaced one by one; each original stays next to it as a backup (a hard
+       link, so it is neither copied nor ``fsync``-ed again).
+    3. :meth:`finalize` after the caller has stored what depends on the new files: a ``.committed`` marker is
+       written (from then on a crash no longer rolls the run back), then backups, journals and the marker go.
+    4. :meth:`discard` instead, at any point before :meth:`finalize`: files already replaced are restored from
+       their backups and everything the run created is removed. Paths that could not be restored are returned;
+       their backups and journals stay in place, so the next start finishes the rollback
+       (:func:`recover_journals`).
+
+    Without ``journal_dir`` the batches are kept in memory and a crash is not recoverable.
+
+    ``meta`` is stored in every journal of the run. When the caller's own commit point is elsewhere (a database
+    transaction), :func:`recover_journals` hands it to a ``decide`` callback that says whether the interrupted
+    run had in fact been committed, so files and database can never disagree after a crash.
+    """
+
+    def __init__(self, journal_dir: str | None = None, meta: dict[str, object] | None = None) -> None:
+        self.journal_dir = journal_dir
+        self.meta = meta
+        self.run = secrets.token_hex(8)
+        self.staged = 0
+        #: One item per batch: the journal path, or the entries themselves when there is no journal folder.
+        self._batches: list[str | list[dict[str, str | None]]] = []
+        self._dirs: set[str] = set()
+        self._full = 0  # batches whose files have all been replaced
+        self._partial: list[dict[str, str | None]] = []  # replaced entries of the batch in flight
+        self._closed = False
+
+    @staticmethod
+    def _entries(batch: str | list[dict[str, str | None]]) -> list[dict[str, str | None]]:
+        if isinstance(batch, list):
+            return batch
+        with open(batch, encoding="utf-8") as fh:
+            return json.load(fh)["files"]
+
+    def stage(self, items: list[tuple[str, bytes]]) -> None:
+        """Write the new contents of one batch next to their targets (see the class description)."""
+        if not items:
+            return
+        for path, _data in items:
+            _check_writable(path)
+        entries: list[dict[str, str | None]] = []
         for path, data in items:
-            tmp = _sibling(path, "tmp")
-            entries.append({"path": path, "tmp": tmp, "bak": None, "old": None, "new": _digest(data)})
+            old = _file_digest(path)
+            entries.append({"path": path, "tmp": _sibling(path, "tmp"),
+                            "bak": _sibling(path, "bak") if old is not None else None, "old": old,
+                            "new": _digest(data)})
+        if self.journal_dir is not None:
+            os.makedirs(self.journal_dir, exist_ok=True)
+            journal = os.path.join(self.journal_dir, f"{JOURNAL_PREFIX}{self.run}-{len(self._batches):06d}.json")
+            atomic_write(journal, json.dumps({"files": entries, "meta": self.meta}))
+            self._batches.append(journal)
+        else:
+            self._batches.append(entries)
+        directories: set[str] = set()
+        for entry, (path, data) in zip(entries, items, strict=True):
+            tmp = str(entry["tmp"])
             _write_new(tmp, data)
-            try:
-                with open(path, "rb") as fh:
-                    original: bytes | None = fh.read()
-            except FileNotFoundError:
-                original = None
-            if original is not None:
+            if entry["bak"]:
                 with contextlib.suppress(OSError):
                     os.chmod(tmp, os.stat(path).st_mode & 0o7777)
-                bak = _sibling(path, "bak")
-                entries[-1]["bak"] = bak
-                _write_new(bak, original)
-                entries[-1]["old"] = _digest(original)
-        for directory in {os.path.dirname(os.path.abspath(path)) for path, _data in items}:
-            _fsync_dir(directory)  # temporaries and backups are on disk before the journal names them
-        if journal_dir is not None:
-            journal = _write_journal(journal_dir, entries)
-        replaced: list[dict[str, str | None]] = []
-        try:
-            for entry in entries:
-                _replace(str(entry["tmp"]), str(entry["path"]))
-                replaced.append(entry)
-        except BaseException as exc:
-            failed: list[str] = []
-            for entry in reversed(replaced):
+            directories.add(os.path.dirname(os.path.abspath(path)))
+        self._dirs |= directories
+        for directory in directories:
+            _fsync_dir(directory)  # the temporaries are on disk before anything is replaced
+        self.staged += len(entries)
+
+    def commit(self, progress: Callable[[int], None] | None = None) -> None:
+        """Replace every staged target. On an error call :meth:`discard` to restore what was replaced."""
+        done = 0
+        for batch in self._batches[self._full:]:
+            for entry in self._entries(batch):
+                _swap_in(entry)
+                self._partial.append(entry)
+                done += 1
+            self._full += 1
+            self._partial = []
+            if progress is not None:
+                progress(done)
+        for directory in self._dirs:
+            _fsync_dir(directory)
+
+    def finalize(self) -> None:
+        """The run is complete: drop backups and journals (a crash from here on keeps the new files)."""
+        if self._closed:
+            return
+        self._closed = True
+        marker: str | None = None
+        if self.journal_dir is not None and self._batches:
+            marker = os.path.join(self.journal_dir, f"{JOURNAL_PREFIX}{self.run}{COMMITTED_SUFFIX}")
+            try:
+                atomic_write(marker, b"")
+            except OSError as exc:  # the journals are removed below all the same
+                log.warning("Could not mark a label rewrite as finished: %s", exc)
+                marker = None
+        for batch in self._batches:
+            for entry in self._entries(batch):
+                _unlink(entry["bak"])
+            if isinstance(batch, str):
+                _unlink(batch)
+        _unlink(marker)
+        self._batches = []
+
+    def discard(self) -> list[str]:
+        """Undo the run; returns the paths that could not be restored (empty when everything is as before)."""
+        if self._closed:
+            return []
+        self._closed = True
+        failed: set[str] = set()
+
+        def restore(entries: list[dict[str, str | None]]) -> None:
+            for entry in reversed(entries):
                 try:
                     if entry["bak"]:
                         _replace(str(entry["bak"]), str(entry["path"]))
-                        entry["bak"] = None
                     else:  # the file did not exist before
                         os.unlink(str(entry["path"]))
                 except OSError:
-                    failed.append(str(entry["path"]))
-            if failed:
-                keep.update(failed)
-                raise MigrationIncompleteError(failed, exc) from exc
-            raise
-        if journal is not None:
-            _unlink(journal)
-            journal = None
-    finally:
-        for entry in entries:
-            _unlink(entry["tmp"])
-            if entry["path"] not in keep:
-                _unlink(entry["bak"])
-        if journal is not None and not keep:
-            _unlink(journal)
+                    failed.add(str(entry["path"]))
+
+        restore(self._partial)
+        for index in range(len(self._batches) - 1, -1, -1):
+            batch = self._batches[index]
+            try:
+                entries = self._entries(batch)
+            except (OSError, ValueError, KeyError):  # the journal is unreadable: leave it for the next start
+                log.error("Could not read %s while undoing a label rewrite", batch)
+                continue
+            if index < self._full:
+                restore(entries)
+            keep = False
+            for entry in entries:
+                _unlink(entry["tmp"])
+                if entry["path"] in failed:
+                    keep = True  # its backup must survive a failed rollback
+                else:
+                    _unlink(entry["bak"])
+            if isinstance(batch, str) and not keep:
+                _unlink(batch)
+        for directory in self._dirs:
+            _fsync_dir(directory)
+        self._batches = []
+        return sorted(failed)
 
 
-def recover_journals(journal_dir: str) -> list[str]:
+def atomic_write_many(items: list[tuple[str, bytes]], *, journal_dir: str | None = None) -> None:
+    """Replace several files all-or-nothing (one :class:`StagedRewrite` batch).
+
+    If one replace fails, the ones already done are restored from their backups; if that fails too,
+    :class:`MigrationIncompleteError` lists the affected files and their backups plus the journal stay in
+    place (the next start finishes the rollback). Temporaries and backups are removed otherwise.
+    """
+    rewrite = StagedRewrite(journal_dir)
+    try:
+        rewrite.stage(items)
+        rewrite.commit()
+    except BaseException as exc:
+        failed = rewrite.discard()
+        if failed:
+            raise MigrationIncompleteError(failed, exc) from exc
+        raise
+    rewrite.finalize()
+
+
+def recover_journals(journal_dir: str,
+                     decide: Callable[[dict[str, object] | None], bool] | None = None) -> list[str]:
     """Undo rewrites that were interrupted by a crash or a failed rollback; returns the restored files.
 
     A target is restored only when it still holds exactly the content that run wrote and its backup is
     intact (checked against the SHA-256 in the journal). A target that was never replaced keeps its
-    content; one changed since (a later save) is left alone and its backup kept for inspection. A journal
-    is removed once every file it names has been dealt with; after an I/O error it stays for the next start.
+    content; one changed since (a later save) is left alone and its backup kept for inspection. A run that
+    had finished (its ``.committed`` marker exists) is only cleaned up, and so is a run for which ``decide``
+    (called with the run's ``meta``) answers True: its commit point was reached elsewhere, so the new files
+    stay. A journal is removed once every file it names has been dealt with; after an I/O error it stays for
+    the next start.
     """
     restored: list[str] = []
     try:
-        names = sorted(n for n in os.listdir(journal_dir) if n.startswith(JOURNAL_PREFIX) and n.endswith(".json"))
+        listing = sorted(n for n in os.listdir(journal_dir) if n.startswith(JOURNAL_PREFIX))
     except OSError:
         return restored
-    for name in names:
+    markers = [n for n in listing if n.endswith(COMMITTED_SUFFIX)]
+    committed = {n[len(JOURNAL_PREFIX):-len(COMMITTED_SUFFIX)] for n in markers}
+    for name in (n for n in listing if n.endswith(".json")):
         journal = os.path.join(journal_dir, name)
         try:
             with open(journal, encoding="utf-8") as fh:
-                entries = json.load(fh)["files"]
-        except (OSError, ValueError, KeyError):
+                document = json.load(fh)
+            entries = document["files"]
+        except (OSError, ValueError, KeyError, TypeError):
+            _unlink(journal)
+            continue
+        run = _journal_run(name)
+        if run not in committed and decide is not None:
+            try:
+                if decide(document.get("meta")):
+                    committed.add(run)
+            except Exception:  # undecidable: roll back, the safe default for files the database never saw
+                log.warning("Could not decide the outcome of an interrupted label rewrite", exc_info=True)
+        if run in committed:  # the run completed: only its leftovers are removed
+            for entry in entries:
+                _unlink(entry.get("tmp"))
+                _unlink(entry.get("bak"))
             _unlink(journal)
             continue
         clean = True
@@ -301,6 +447,8 @@ def recover_journals(journal_dir: str) -> list[str]:
                 clean = False
         if clean:
             _unlink(journal)
+    for name in markers:
+        _unlink(os.path.join(journal_dir, name))
     return restored
 
 
@@ -309,6 +457,11 @@ def _recover_entry(entry: dict[str, str | None]) -> bool:
     path, bak = str(entry["path"]), entry.get("bak")
     _unlink(entry.get("tmp"))
     current = _file_digest(path)
+    if current is None and bak and entry.get("old") and _file_digest(bak) == entry.get("old"):
+        # Stopped between moving the original aside and putting the new file in place (no hard links there).
+        _replace(bak, path)
+        _fsync_dir(os.path.dirname(os.path.abspath(path)))
+        return True
     if current is None or current != entry.get("new"):
         # Never replaced (still the original) or changed since by a later save: leave the target alone.
         if current is not None and current == entry.get("old"):

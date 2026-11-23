@@ -153,6 +153,21 @@ def wait_idle(app) -> None:
     assert app.state.ctx.jobs.wait_idle(30), "background jobs did not finish"
 
 
+def delete_class(user: ApiUser, app, project_id: int, class_id: int, **params: Any) -> dict[str, Any]:
+    """Delete a class and wait for the background job; returns what the project's activity says about it.
+
+    ``{"type": "class_deleted", "rewritten_files": n, ...}`` on success, otherwise
+    ``{"type": "class_delete_failed", "error": "...", "code": "...", ...}`` (nothing was changed).
+    """
+    response = user.delete(f"/api/projects/{project_id}/classes/{class_id}", params=params or None)
+    assert response.status_code == 202 and response.json() == {"started": True}, response.text
+    wait_idle(app)
+    assert user.get(f"/api/projects/{project_id}").json()["class_migration"] is None
+    entry = user.get(f"/api/projects/{project_id}/activity").json()["items"][0]
+    assert entry["type"] in ("class_deleted", "class_delete_failed") and entry["data"]["class_id"] == class_id
+    return {"type": entry["type"], **entry["data"]}
+
+
 @pytest.fixture
 def create_project(app, admin: ApiUser):
     """Create a project as the admin and wait until indexing finished; returns the Project JSON."""

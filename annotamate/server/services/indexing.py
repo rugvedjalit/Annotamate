@@ -171,7 +171,7 @@ class Indexer:
         if not finished and now - self._last_progress < PROGRESS_INTERVAL and done not in (0, total):
             return
         self._last_progress = now
-        self.ctx.hub.send_project(self.project_id, {
+        self.ctx.send_project(self.project_id, {
             "type": "project.indexing", "project_id": self.project_id, "done": done, "total": total,
             "finished": finished,
         })
@@ -181,6 +181,8 @@ class Indexer:
             self._run()
         finally:
             self.ctx.progress.pop(self.project_id, None)
+        if not self.ctx.jobs.stopping.is_set():
+            self.ctx.db.optimize()  # the tables just changed a lot: refresh the planner's statistics
 
     def _scan(self, paths: ProjectPaths, recursive: bool) -> tuple[ScanResult, dict[str, ParsedLabel]] | None:
         """List the images and parse their label files (no locks held); None when interrupted."""
@@ -227,7 +229,9 @@ class Indexer:
                 return
             result, parsed = scanned
             total = len(result.paths)
-            with ctx.label_locks(self.project_id):
+            with ctx.quiet_label_lock(self.project_id):
+                if ctx.jobs.stopping.is_set():
+                    return
                 if ctx.class_epoch(self.project_id) != epoch:
                     continue  # classes were migrated while the files were read: read them again
                 with ctx.db.session() as session:
@@ -248,9 +252,9 @@ class Indexer:
         else:
             log.warning("Project %s: classes kept changing during indexing; try a rescan", self.project_id)
         self._progress(total, total, finished=True)
-        ctx.hub.send_project(self.project_id, {"type": "images.bulk_updated", "project_id": self.project_id,
-                                               "count": total})
-        ctx.hub.send_project(self.project_id, {"type": "project.updated", "project_id": self.project_id})
+        ctx.send_project(self.project_id, {"type": "images.bulk_updated", "project_id": self.project_id,
+                                           "count": total})
+        ctx.send_project(self.project_id, {"type": "project.updated", "project_id": self.project_id})
 
     def _discover(self, session: Session, project: Project, paths: ProjectPaths, rel_paths: list[str],
                   parsed: dict[str, ParsedLabel]) -> None:
@@ -379,9 +383,9 @@ def recount_images(ctx: AppContext, project_id: int, image_ids: list[int]) -> No
         if ctx.jobs.stopping.is_set():
             return
         chunk = image_ids[start:start + BATCH]
-        with ctx.label_locks(project_id), ctx.db.session() as session:
+        with ctx.quiet_label_lock(project_id), ctx.db.session() as session:
             project = session.get(Project, project_id)
-            if project is None:
+            if project is None or ctx.jobs.stopping.is_set():
                 return
             paths = ProjectPaths(ctx.settings, project)
             try:
@@ -395,8 +399,7 @@ def recount_images(ctx: AppContext, project_id: int, image_ids: list[int]) -> No
                 image.has_label, image.box_count, image.unknown_count = item.has_label, boxes, unknown
                 replace_class_counts(session, image.id, per_class)
             session.commit()
-    ctx.hub.send_project(project_id, {"type": "images.bulk_updated", "project_id": project_id,
-                                      "count": len(image_ids)})
+    ctx.send_project(project_id, {"type": "images.bulk_updated", "project_id": project_id, "count": len(image_ids)})
 
 
 def schedule_unknown_recount(ctx: AppContext, session: Session, project_id: int) -> None:

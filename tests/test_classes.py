@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import xml.etree.ElementTree as ET
 
-from conftest import images_of, make_image, wait_idle
+from conftest import delete_class, images_of, make_image, wait_idle
 
 
 def _yolo_project(create_project, root, names=("a", "b", "c")):
@@ -121,9 +121,7 @@ def test_delete_unused_class_shifts_yolo_indexes(admin, app, create_project, roo
     (folder / "i2.txt").write_text("2 0.3 0.3 0.1 0.1\n")
     admin.post(f"/api/projects/{pid}/rescan")
     wait_idle(app)
-    response = admin.delete(f"/api/projects/{pid}/classes/{unused['id']}")
-    assert response.status_code == 200
-    assert response.json()["rewritten_files"] == 3
+    assert delete_class(admin, app, pid, unused["id"])["rewritten_files"] == 3
     assert (folder / "i1.txt").read_text() == "0 0.5 0.5 0.1 0.1\n1 0.2 0.2 0.1 0.1\n"
     assert (folder / "i2.txt").read_text() == "1 0.3 0.3 0.1 0.1\n"
     assert (folder / "classes.txt").read_text() == "a\nb\nc\n"
@@ -131,12 +129,13 @@ def test_delete_unused_class_shifts_yolo_indexes(admin, app, create_project, roo
     assert [(c["name"], c["index"]) for c in classes] == [("a", 0), ("b", 1), ("c", 2)]
 
 
-def test_delete_boxes_strategy(admin, create_project, root):
+def test_delete_boxes_strategy(admin, app, create_project, root):
     folder, project = _yolo_project(create_project, root)
     pid = project["id"]
     _a, b, c = project["classes"]
     response = admin.delete(f"/api/projects/{pid}/classes/{b['id']}", params={"strategy": "delete_boxes"})
-    assert response.status_code == 200 and response.json()["rewritten_files"] == 3
+    assert response.status_code == 202 and response.json() == {"started": True}  # the rewrite runs as a job
+    wait_idle(app)
     assert (folder / "i1.txt").read_text() == "0 0.5 0.5 0.1 0.1\n1 0.2 0.2 0.1 0.1\n"
     # unknown index 9 and trailing whitespace on other lines are preserved
     assert (folder / "i2.txt").read_text() == "1 0.3 0.3 0.1 0.1 \n9 0.4 0.4 0.1 0.1\n"
@@ -148,7 +147,7 @@ def test_delete_boxes_strategy(admin, create_project, root):
     assert activity["type"] == "class_deleted" and activity["data"]["rewritten_files"] == 3
 
 
-def test_merge_strategy_yolo(admin, create_project, root):
+def test_merge_strategy_yolo(admin, app, create_project, root):
     folder, project = _yolo_project(create_project, root)
     pid = project["id"]
     a, b, c = project["classes"]
@@ -157,9 +156,7 @@ def test_merge_strategy_yolo(admin, create_project, root):
                         params={"strategy": "merge", "merge_into": a["id"]}).status_code == 400
     assert admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
                         params={"strategy": "merge", "merge_into": 999}).status_code == 404
-    response = admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
-                            params={"strategy": "merge", "merge_into": c["id"]})
-    assert response.status_code == 200
+    assert delete_class(admin, app, pid, a["id"], strategy="merge", merge_into=c["id"])["type"] == "class_deleted"
     assert (folder / "i1.txt").read_text() == "1 0.5 0.5 0.1 0.1\n1 0.2 0.2 0.1 0.1\n"
     assert (folder / "i2.txt").read_text() == "0 0.5 0.5 0.1 0.1\n1 0.3 0.3 0.1 0.1 \n9 0.4 0.4 0.1 0.1\n"
     items = {i["filename"]: i for i in images_of(admin, pid)}
@@ -172,7 +169,7 @@ def test_merge_strategy_yolo(admin, create_project, root):
                              "merge_into_name": c["name"], "rewritten_files": 3}
 
 
-def test_merge_strategy_voc(admin, create_project, root):
+def test_merge_strategy_voc(admin, app, create_project, root):
     folder = root / "voc"
     make_image(folder / "a.jpg")
     (folder / "a.xml").write_text("<annotation><object><name>van</name><bndbox><xmin>1</xmin><ymin>1</ymin>"
@@ -181,20 +178,19 @@ def test_merge_strategy_voc(admin, create_project, root):
                                   "</object></annotation>")
     project = create_project(folder, label_format="voc", classes=["car", "van"])
     car, van = project["classes"]
-    response = admin.delete(f"/api/projects/{project['id']}/classes/{van['id']}",
-                            params={"strategy": "merge", "merge_into": car["id"]})
-    assert response.json() == {"rewritten_files": 1}
+    result = delete_class(admin, app, project["id"], van["id"], strategy="merge", merge_into=car["id"])
+    assert result["type"] == "class_deleted" and result["rewritten_files"] == 1
     names = [o.findtext("name") for o in ET.parse(folder / "a.xml").getroot().findall("object")]
     assert names == ["car", "car"]
     assert (folder / "classes.txt").read_text() == "car\n"
 
 
-def test_invalid_strategy(admin, create_project, dataset):
+def test_invalid_strategy(admin, app, create_project, dataset):
     project = create_project(dataset, classes=["a"])
     cid = project["classes"][0]["id"]
     assert admin.delete(f"/api/projects/{project['id']}/classes/{cid}",
                         params={"strategy": "nuke"}).status_code == 422
-    assert admin.delete(f"/api/projects/{project['id']}/classes/{cid}").json() == {"rewritten_files": 0}
+    assert delete_class(admin, app, project["id"], cid)["rewritten_files"] == 0
     assert admin.get(f"/api/projects/{project['id']}/classes").json() == []
 
 
@@ -220,20 +216,19 @@ def test_failed_delete_rolls_everything_back_and_a_retry_works(admin, app, creat
         real(src, dst)
 
     monkeypatch.setattr(fsutil, "_replace", flaky)
-    response = admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
-                            params={"strategy": "merge", "merge_into": b["id"]})
-    assert response.status_code == 400 and "Nothing was changed" in response.json()["detail"]
+    failed = delete_class(admin, app, pid, a["id"], strategy="merge", merge_into=b["id"])
+    assert failed["type"] == "class_delete_failed" and "Nothing was changed" in failed["error"]
+    assert failed["code"] == "bad_request" and failed["merge_into_name"] == "b"
     assert {n: (folder / n).read_text() for n in before} == before
     assert _hidden(folder) == []
     assert [c_["name"] for c_ in admin.get(f"/api/projects/{pid}").json()["classes"]] == ["a", "b", "c"]
     monkeypatch.setattr(fsutil, "_replace", real)
-    retry = admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
-                         params={"strategy": "merge", "merge_into": b["id"]})
-    assert retry.status_code == 200
+    retry = delete_class(admin, app, pid, a["id"], strategy="merge", merge_into=b["id"])
+    assert retry["type"] == "class_deleted" and retry["rewritten_files"] == 3
     assert (folder / "i1.txt").read_text() == "0 0.5 0.5 0.1 0.1\n1 0.2 0.2 0.1 0.1\n"
 
 
-def test_failed_rollback_is_reported_honestly(admin, create_project, root, monkeypatch):
+def test_failed_rollback_is_reported_honestly(admin, app, create_project, root, monkeypatch):
     from annotamate.core import fsutil
 
     folder, project = _yolo_project(create_project, root)
@@ -249,11 +244,10 @@ def test_failed_rollback_is_reported_honestly(admin, create_project, root, monke
         real(src, dst)
 
     monkeypatch.setattr(fsutil, "_replace", flaky)
-    response = admin.delete(f"/api/projects/{pid}/classes/{a['id']}",
-                            params={"strategy": "merge", "merge_into": b["id"]})
-    assert response.status_code == 500
-    body = response.json()
-    assert body["code"] == "migration_incomplete" and [f.endswith("i1.txt") for f in body["files"]] == [True]
+    body = delete_class(admin, app, pid, a["id"], strategy="merge", merge_into=b["id"])
+    assert body["type"] == "class_delete_failed"
+    assert body["code"] == "migration_incomplete" and body["files"] == ["i1.txt"]  # names only, never server paths
+    assert [c_["name"] for c_ in admin.get(f"/api/projects/{pid}").json()["classes"]] == ["a", "b", "c"]
     assert any(n.endswith(".bak") for n in _hidden(folder))
 
 

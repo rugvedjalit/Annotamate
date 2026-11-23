@@ -6,7 +6,7 @@ from fastapi import APIRouter
 
 from annotamate.server.deps import DB, Access, Ctx
 from annotamate.server.errors import forbidden
-from annotamate.server.schemas import ClassCreate, ClassDeleteResult, ClassPatch, ProjectClass
+from annotamate.server.schemas import ClassCreate, ClassDeleteStarted, ClassPatch, ProjectClass
 from annotamate.server.services import classes as svc
 from annotamate.server.services import serialize
 from annotamate.server.services.labels import load_class_table
@@ -36,11 +36,13 @@ def update_class(cid: int, body: ClassPatch, access: Access, ctx: Ctx, db: DB) -
     return serialize.class_out(svc.update_class(ctx, db, access, cls, name=body.name, color=body.color))
 
 
-@router.delete("/projects/{pid}/classes/{cid}", response_model=ClassDeleteResult)
+@router.delete("/projects/{pid}/classes/{cid}", status_code=202, response_model=ClassDeleteStarted)
 def delete_class(cid: int, access: Access, ctx: Ctx, db: DB,
                  strategy: Literal["forbid", "delete_boxes", "merge"] = "forbid",
                  merge_into: int | None = None) -> dict:
+    """Check the request and start the background job that rewrites the label files and removes the class."""
     access.require_manage()
     access.require_writable()
     cls = svc.get_class(db, access.project.id, cid)
-    return {"rewritten_files": svc.delete_class(ctx, db, access, cls, strategy=strategy, merge_into=merge_into)}
+    svc.start_delete(ctx, db, access, cls, strategy=strategy, merge_into=merge_into)
+    return {"started": True}
