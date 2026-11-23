@@ -496,7 +496,8 @@ export interface ServerMessageMap {
   }
   'lock.granted': { type: 'lock.granted'; image_id: number }
   'lock.denied': { type: 'lock.denied'; image_id: number; holder: UserBrief }
-  'lock.revoked': { type: 'lock.revoked'; image_id: number; by: UserBrief }
+  /** `by` is null when the server took the lock back because the holder lost the right to edit (`reason`). */
+  'lock.revoked': { type: 'lock.revoked'; image_id: number; by: UserBrief | null; reason?: string }
   'lock.expired': { type: 'lock.expired'; image_id: number }
   'lock.state': { type: 'lock.state'; project_id: number; image_id: number; holder: UserBrief | null }
   'image.updated': {

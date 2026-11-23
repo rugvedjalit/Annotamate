@@ -24,6 +24,17 @@ log = logging.getLogger("annotamate.realtime")
 LOCK_TTL = 60.0
 SWEEP_INTERVAL = 5.0
 QUEUE_SIZE = 2000
+#: Open sockets allowed per user (tabs, devices) and in total; more are refused with close code 4429.
+MAX_CONNECTIONS_PER_USER = 10
+MAX_CONNECTIONS = 5000
+#: Edit locks one user may hold at once over all their connections (each connection holds at most one).
+MAX_LOCKS_PER_USER = 3
+#: A connection's typing notices to one target are passed on at most this often (seconds).
+TYPING_INTERVAL = 2.0
+#: Incoming frames: sustained rate per connection and burst; a client that keeps exceeding it is closed.
+FRAME_RATE = 20.0
+FRAME_BURST = 40.0
+MAX_DROPPED_FRAMES = 200
 
 Message = dict[str, Any]
 Target = tuple[str, Any]
@@ -42,6 +53,22 @@ class Connection:
     image_filename: str | None = None
     presence_at: float = 0.0
     closing: bool = False
+    typing_at: dict[tuple[str, int | None], float] = field(default_factory=dict)
+    tokens: float = FRAME_BURST
+    tokens_at: float = field(default_factory=time.monotonic)
+    dropped: int = 0
+
+    def take_frame(self) -> bool:
+        """Token bucket for incoming frames: False when the client is sending faster than ``FRAME_RATE``."""
+        now = time.monotonic()
+        self.tokens = min(FRAME_BURST, self.tokens + (now - self.tokens_at) * FRAME_RATE)
+        self.tokens_at = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            self.dropped = max(0, self.dropped - 1)
+            return True
+        self.dropped += 1
+        return False
 
 
 @dataclass
@@ -50,6 +77,7 @@ class EditLock:
     project_id: int
     conn: Connection
     expires_at: float
+    acquired_at: float = field(default_factory=time.monotonic)
 
 
 class _Close:
@@ -185,8 +213,12 @@ class Hub:
                 self._leave_room(conn)
                 self._enqueue(conn, {"type": "error", "code": "not_found", "detail": "Project not available."})
 
-    def _enqueue(self, conn: Connection, message: Message | _Close) -> None:
+    def _enqueue(self, conn: Connection, message: Message | _Close, *, droppable: bool = False) -> None:
+        """Queue for one connection. ``droppable`` messages (typing, presence) are skipped while its queue is
+        half full, so chatter from other users can never push a slow reader into being disconnected."""
         if conn.closing:
+            return
+        if droppable and conn.queue.qsize() > QUEUE_SIZE // 2:
             return
         if isinstance(message, _Close):
             conn.closing = True
@@ -215,10 +247,11 @@ class Hub:
         """Queue a message for one connection (event-loop thread only)."""
         self._enqueue(conn, message)
 
-    def _room_send(self, project_id: int, message: Message, exclude: Connection | None = None) -> None:
+    def _room_send(self, project_id: int, message: Message, exclude: Connection | None = None, *,
+                   droppable: bool = False) -> None:
         for conn in list(self._rooms.get(project_id, ())):
             if conn is not exclude:
-                self._enqueue(conn, message)
+                self._enqueue(conn, message, droppable=droppable)
 
     async def writer(self, conn: Connection) -> None:
         """Single writer per socket: drains the queue in order."""
@@ -236,6 +269,12 @@ class Hub:
             conn.closing = True
 
     # connection registry
+
+    def admits(self, user_id: int) -> bool:
+        """Whether another socket of ``user_id`` may connect (per-user and global caps)."""
+        with self._mutex:
+            return (len(self._connections) < MAX_CONNECTIONS
+                    and len(self._by_user.get(user_id, ())) < MAX_CONNECTIONS_PER_USER)
 
     def register(self, conn: Connection) -> None:
         with self._mutex:
@@ -279,7 +318,7 @@ class Hub:
                             "image_filename": best.image_filename if best else None}
         if best is None:
             message["left"] = True
-        self._room_send(project_id, message, exclude=exclude)
+        self._room_send(project_id, message, exclude=exclude, droppable=best is not None)  # "left" always arrives
 
     def join_room(self, conn: Connection, project_id: int) -> None:
         if conn.project_id is not None:
@@ -329,11 +368,20 @@ class Hub:
         self._broadcast_presence(conn.project_id, conn, exclude=conn)
 
     def typing(self, conn: Connection, scope: str, user_id: int | None) -> None:
+        target = (scope, conn.project_id if scope == "chat" else user_id)
+        now = time.monotonic()
+        if now - conn.typing_at.get(target, -TYPING_INTERVAL) < TYPING_INTERVAL:
+            return  # clients re-send while the user types; one notice per interval is enough
+        if len(conn.typing_at) > 64:
+            conn.typing_at.clear()
+        conn.typing_at[target] = now
         if scope == "chat" and conn.project_id is not None:
             self._room_send(conn.project_id, {"type": "typing", "scope": "chat", "project_id": conn.project_id,
-                                              "user": dict(conn.brief)}, exclude=conn)
+                                              "user": dict(conn.brief)}, exclude=conn, droppable=True)
         elif scope == "dm" and isinstance(user_id, int) and user_id != conn.user_id:
-            self._deliver(("user", user_id), {"type": "typing", "scope": "dm", "user": dict(conn.brief)})
+            message = {"type": "typing", "scope": "dm", "user": dict(conn.brief)}
+            for other in list(self._by_user.get(user_id, ())):
+                self._enqueue(other, message, droppable=True)
 
     # edit locks
 
@@ -368,11 +416,21 @@ class Hub:
                 self._enqueue(conn, {"type": "lock.denied", "image_id": image_id, "holder": holder})
                 return
             # One edit lock per connection: taking a new one lets go of any other, so a script cannot
-            # lock a whole project.
+            # lock a whole project. Over all of the user's connections at most MAX_LOCKS_PER_USER stay:
+            # the oldest others are let go too (their tabs get lock.revoked).
             dropped = [lk for lk in self._locks.values() if lk.conn is conn and lk.image_id != image_id]
             for other in dropped:
                 del self._locks[other.image_id]
+            others = sorted((lk for lk in self._locks.values()
+                             if lk.conn.user_id == conn.user_id and lk.image_id != image_id),
+                            key=lambda lk: lk.acquired_at)
+            excess = others[:max(0, len(others) - (MAX_LOCKS_PER_USER - 1))]
+            for other in excess:
+                del self._locks[other.image_id]
         for other in dropped:
+            self._lock_state(other.project_id, other.image_id, None)
+        for other in excess:
+            self._enqueue(other.conn, {"type": "lock.revoked", "image_id": other.image_id, "by": dict(conn.brief)})
             self._lock_state(other.project_id, other.image_id, None)
         if revoked is not None:
             self._enqueue(revoked, {"type": "lock.revoked", "image_id": image_id, "by": dict(conn.brief)})
@@ -402,6 +460,20 @@ class Hub:
             for lock in self._locks.values():
                 if lock.conn is conn:
                     lock.expires_at = deadline
+
+    def locked_images(self, conn: Connection) -> list[int]:
+        with self._mutex:
+            return [lk.image_id for lk in self._locks.values() if lk.conn is conn]
+
+    def revoke(self, conn: Connection, image_id: int, reason: str) -> None:
+        """Take a lock away from its holder because they lost the right to edit the image."""
+        with self._mutex:
+            lock = self._locks.get(image_id)
+            if lock is None or lock.conn is not conn:
+                return
+            del self._locks[image_id]
+        self._enqueue(conn, {"type": "lock.revoked", "image_id": image_id, "by": None, "reason": reason})
+        self._lock_state(lock.project_id, image_id, None)
 
     def sweep(self) -> None:
         now = time.monotonic()

@@ -67,7 +67,11 @@ export function useImageLock(imageId: number, wanted: boolean): ImageLock {
         // Do not take it back on the next reconnect; it is requested again when the new holder leaves.
         realtime.forgetLock(imageId)
         set('revoked', m.by)
-        if (m.by.id === me()) {
+        if (!m.by) {
+          toast.warning(m.reason ?? 'You can no longer edit this image', {
+            description: 'You are now in read-only mode. Unsaved changes are kept in this tab; copy them if needed.',
+          })
+        } else if (m.by.id === me()) {
           toast.info('This image is now open for editing in another tab', {
             description: 'This tab is read-only until you choose to edit here again.',
           })

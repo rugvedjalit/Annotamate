@@ -15,7 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from annotamate.server.context import AppContext
 from annotamate.server.errors import ApiError
 from annotamate.server.models import Image, User, UserSession, utcnow
-from annotamate.server.realtime import Connection
+from annotamate.server.realtime import MAX_DROPPED_FRAMES, Connection
 from annotamate.server.security import SESSION_COOKIE
 from annotamate.server.services import serialize
 from annotamate.server.services.access import ProjectAccess, load_access
@@ -27,15 +27,20 @@ router = APIRouter()
 MAX_FRAME = 64 * 1024
 
 
-def origin_allowed(ws: WebSocket) -> bool:
-    """Browsers always send ``Origin``; it must name the host the request was sent to."""
+def origin_allowed(ws: WebSocket, secure: bool = False) -> bool:
+    """Browsers always send ``Origin``; it must name the host the request was sent to.
+
+    Only the ``Host`` header counts (proxies are configured to pass it on unchanged): ``X-Forwarded-Host`` could
+    be supplied by the client itself. With ``secure`` (HTTPS deployment) the page must be an https page too.
+    """
     origin = ws.headers.get("origin")
     if origin is None:
         return True  # non-browser client: the session cookie still authenticates it
-    netloc = urlsplit(origin).netloc.lower()
-    hosts = {h.strip().lower() for h in (ws.headers.get("host", ""), ws.headers.get("x-forwarded-host", "")) if h}
-    hosts |= {h.split(",")[0].strip() for h in hosts}
-    return bool(netloc) and netloc in hosts
+    parts = urlsplit(origin)
+    if parts.scheme not in ("http", "https") or (secure and parts.scheme != "https"):
+        return False
+    host = ws.headers.get("host", "").strip().lower()
+    return bool(parts.netloc) and parts.netloc.lower() == host
 
 
 def _authenticate(ctx: AppContext, token: str | None) -> tuple[int, int, dict[str, Any], bool] | None:
@@ -44,19 +49,19 @@ def _authenticate(ctx: AppContext, token: str | None) -> tuple[int, int, dict[st
         if found is None:
             return None
         user_session, user = found
-        if touch_session(user_session, user, ctx.settings.session_days):
+        if touch_session(user_session, user, ctx.settings.session_days, ctx.settings.session_max_days):
             session.commit()
         return user.id, user_session.id, serialize.brief(user), user.is_admin
 
 
-def _session_alive(ctx: AppContext, session_id: int, days: int) -> bool:
+def _session_alive(ctx: AppContext, session_id: int, days: int, max_days: int | None = None) -> bool:
     """The connection's session still exists, has not expired and belongs to an active user (and slides on)."""
     with ctx.db.session() as session:
         user_session = session.get(UserSession, session_id)
         user = session.get(User, user_session.user_id) if user_session is not None else None
         if user_session is None or user is None or not user.is_active or user_session.expires_at <= utcnow():
             return False
-        if touch_session(user_session, user, days):
+        if touch_session(user_session, user, days, max_days):
             session.commit()
         return True
 
@@ -106,21 +111,41 @@ def _image_filename(ctx: AppContext, project_id: int, image_id: int) -> str | No
 
 
 def _int(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+    """A database id: a positive integer that fits a 64-bit column (anything else is ignored)."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2**63:
+        return value
+    return None
+
+
+def _lock_still_allowed(ctx: AppContext, user_id: int, image_id: int) -> str | None:
+    """``None`` while the user may still edit the image, otherwise why the lock must go."""
+    rights = _lock_rights(ctx, user_id, image_id)
+    if rights is None or not rights.can_edit:
+        return "You can no longer edit this image."
+    if rights.assigned_elsewhere:
+        return "This image has been assigned to someone else."
+    return None
 
 
 async def _handle(ctx: AppContext, conn: Connection, message: dict[str, Any]) -> None:
     hub = ctx.hub
     kind = message.get("type")
     if kind == "ping":
-        if not await run_in_threadpool(_session_alive, ctx, conn.session_id, ctx.settings.session_days):
+        if not await run_in_threadpool(_session_alive, ctx, conn.session_id, ctx.settings.session_days,
+                                     ctx.settings.session_max_days):
             hub.send(conn, {"type": "error", "code": "unauthenticated", "detail": "Your session has expired."})
             hub.close_sessions({conn.session_id})
             return
+        for image_id in hub.locked_images(conn):  # rights can change while a lock is held (reassignment)
+            reason = await run_in_threadpool(_lock_still_allowed, ctx, conn.user_id, image_id)
+            if reason:
+                hub.revoke(conn, image_id, reason)
         hub.renew(conn)
         hub.send(conn, {"type": "pong"})
     elif kind == "subscribe":
         project_id = _int(message.get("project_id"))
+        if project_id is not None and project_id == conn.project_id:
+            return  # already in that room
         if project_id is None or not await run_in_threadpool(_can_view, ctx, conn.user_id, project_id):
             hub.send(conn, {"type": "error", "code": "not_found", "detail": "Project not found."})
             return
@@ -166,7 +191,7 @@ async def _handle(ctx: AppContext, conn: Connection, message: dict[str, Any]) ->
 @router.websocket("/ws")
 async def websocket(ws: WebSocket) -> None:
     ctx: AppContext = ws.app.state.ctx
-    if not origin_allowed(ws):
+    if not origin_allowed(ws, ctx.settings.secure_cookies):
         await ws.close(code=1008)
         return
     auth = await run_in_threadpool(_authenticate, ctx, ws.cookies.get(SESSION_COOKIE))
@@ -177,6 +202,10 @@ async def websocket(ws: WebSocket) -> None:
         return
     user_id, session_id, brief, is_admin = auth
     hub = ctx.hub
+    if not hub.admits(user_id):
+        await ws.send_json({"type": "error", "code": "rate_limited", "detail": "Too many open connections."})
+        await ws.close(code=4429)
+        return
     if hub.loop is None:
         hub.loop = asyncio.get_running_loop()
     conn = Connection(ws=ws, user_id=user_id, session_id=session_id, brief=brief, is_admin=is_admin)
@@ -192,12 +221,21 @@ async def websocket(ws: WebSocket) -> None:
                 raw = frame["bytes"].decode("utf-8", "replace")
             if not raw:
                 continue
+            if not conn.take_frame():  # flooding: drop the frame, and close a client that keeps at it
+                if conn.dropped == 1:
+                    hub.send(conn, {"type": "error", "code": "rate_limited", "detail": "Too many messages."})
+                if conn.dropped > MAX_DROPPED_FRAMES:
+                    hub.send(conn, {"type": "error", "code": "rate_limited", "detail": "Closing: too many messages."})
+                    with contextlib.suppress(Exception):
+                        await ws.close(code=1008)
+                    break
+                continue
             if len(raw) > MAX_FRAME:
                 hub.send(conn, {"type": "error", "code": "bad_request", "detail": "Frame too large."})
                 continue
             try:
                 message = json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):
                 hub.send(conn, {"type": "error", "code": "bad_request", "detail": "Frames must be JSON."})
                 continue
             if isinstance(message, dict):
@@ -206,6 +244,7 @@ async def websocket(ws: WebSocket) -> None:
                 except Exception:
                     log.exception("WebSocket handler failed")
                     hub.send(conn, {"type": "error", "code": "internal_error", "detail": "Internal error."})
+            await asyncio.sleep(0)  # let the writers (this and other sockets) run between frames
     except Exception as exc:  # disconnects surface as various exceptions depending on the server
         log.debug("WebSocket closed: %r", exc)
     finally:
