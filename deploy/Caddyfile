@@ -25,16 +25,32 @@
 {$ANNOTAMATE_DOMAIN:annotate.example.com} {
 	encode zstd gzip
 
-	# Uploads: Annotamate enforces ANNOTAMATE_MAX_UPLOAD_MB per file. This is
-	# only an upper bound for one whole request, which may carry several files.
-	request_body {
-		max_size 2GB
+	# Uploads are the only place that accepts large request bodies.
+	# Annotamate enforces ANNOTAMATE_MAX_UPLOAD_MB per file and
+	# ANNOTAMATE_MAX_UPLOAD_REQUEST_MB (default 1024) for one whole request;
+	# this value must not be smaller than the latter.
+	@upload path_regexp ^/api/projects/[0-9]+/upload$
+	handle @upload {
+		request_body {
+			max_size 1GB
+		}
+		reverse_proxy {$ANNOTAMATE_UPSTREAM:127.0.0.1:8765} {
+			transport http {
+				response_header_timeout 10m
+			}
+		}
 	}
 
-	reverse_proxy {$ANNOTAMATE_UPSTREAM:127.0.0.1:8765} {
-		# Large exports and uploads can take a while.
-		transport http {
-			response_header_timeout 10m
+	# Everything else: small request bodies only (Annotamate's default is 2 MB too).
+	handle {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy {$ANNOTAMATE_UPSTREAM:127.0.0.1:8765} {
+			# Large exports can take a while.
+			transport http {
+				response_header_timeout 10m
+			}
 		}
 	}
 
@@ -62,9 +78,17 @@
 # 	# /annotamate -> /annotamate/
 # 	redir /annotamate /annotamate/ 308
 #
+# 	@upload path_regexp ^/annotamate/api/projects/[0-9]+/upload$
+# 	handle @upload {
+# 		request_body {
+# 			max_size 1GB
+# 		}
+# 		reverse_proxy 127.0.0.1:8765
+# 	}
+#
 # 	handle /annotamate/* {
 # 		request_body {
-# 			max_size 2GB
+# 			max_size 2MB
 # 		}
 # 		reverse_proxy 127.0.0.1:8765
 # 	}

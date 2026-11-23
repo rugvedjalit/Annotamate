@@ -2,6 +2,7 @@
 #
 #   mkdir -p datasets
 #   docker compose up -d
+#   docker compose logs annotamate     (shows the one-time setup token)
 #   open http://localhost:8765 and create the administrator account
 #
 # Full guide: docs/guides/deployment.md
@@ -27,10 +28,14 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
 
     ports:
-      # Reachable from the network on port 8765 over plain HTTP.
-      # Behind a reverse proxy on the same host use "127.0.0.1:8765:8765",
-      # or remove `ports` entirely when using the Caddy service below.
-      - "8765:8765"
+      # Published on this machine only: open http://localhost:8765. Behind a reverse
+      # proxy on the same host this is what you want; remove `ports` entirely when
+      # using the Caddy service below.
+      - "127.0.0.1:8765:8765"
+      # To reach the app from other machines on your network (plain HTTP, trusted LAN
+      # only) use this line instead of the one above. Create the administrator right
+      # away: the first-run setup needs the token printed in `docker compose logs annotamate`.
+      # - "8765:8765"
 
     environment:
       # Inside the container the server must listen on all interfaces.
@@ -46,6 +51,10 @@ services:
       # ANNOTAMATE_BASE_URL: /annotamate/
       # ANNOTAMATE_SESSION_DAYS: "14"
       # ANNOTAMATE_MAX_UPLOAD_MB: "50"
+      # ANNOTAMATE_MAX_UPLOAD_REQUEST_MB: "1024"
+      # ANNOTAMATE_MAX_BODY_MB: "2"
+      # ANNOTAMATE_MAX_IMAGE_MEGAPIXELS: "150"
+      # ANNOTAMATE_LOGIN_IP_LIMIT: "30"
       # ANNOTAMATE_LOG_LEVEL: info
       # Behind the Caddy service below, trust its X-Forwarded-For header so that the
       # sign-in rate limit counts real client addresses instead of the proxy's.
