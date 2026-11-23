@@ -1,0 +1,128 @@
+"""Reading label files and mapping their labels onto project classes."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import uuid
+from dataclasses import dataclass, field
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from annotamate.core.classes import write_classes
+from annotamate.core.formats import ParseResult, parse_label, uses_class_index
+from annotamate.core.fsutil import OutsideRootError
+from annotamate.server.models import ProjectClass
+from annotamate.server.services.paths import ProjectPaths
+
+
+def label_version(data: bytes) -> str:
+    """First 16 hex characters of the SHA-256 of the label file bytes."""
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def stable_box_id(image_id: int, version: str | None, index: int) -> str:
+    """Deterministic UUID (version 4 layout) for a box read from disk, stable across reloads."""
+    digest = hashlib.sha256(f"annotamate:{image_id}:{version}:{index}".encode()).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
+
+
+@dataclass
+class ClassTable:
+    """A project's classes in index order, with lookups in both directions."""
+
+    fmt: str
+    classes: list[ProjectClass]
+    by_id: dict[int, ProjectClass] = field(init=False)
+    by_name: dict[str, ProjectClass] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.classes = sorted(self.classes, key=lambda c: (c.position, c.id))
+        self.by_id = {c.id: c for c in self.classes}
+        self.by_name = {c.name: c for c in self.classes}
+        self._index = {c.id: i for i, c in enumerate(self.classes)}
+
+    @property
+    def names(self) -> list[str]:
+        return [c.name for c in self.classes]
+
+    def index_of(self, cls: ProjectClass) -> int:
+        """YOLO index: the position in this ordered list (what ``resolve`` reads back)."""
+        return self._index[cls.id]
+
+    def label_for(self, cls: ProjectClass) -> str:
+        return str(self.index_of(cls)) if uses_class_index(self.fmt) else cls.name
+
+    def resolve(self, label: str) -> ProjectClass | None:
+        if uses_class_index(self.fmt):
+            try:
+                index = int(label)
+            except ValueError:
+                return None
+            return self.classes[index] if 0 <= index < len(self.classes) else None
+        return self.by_name.get(label)
+
+    def counts(self, result: ParseResult) -> tuple[dict[int, int], int]:
+        """Boxes per class id, plus the number of boxes with unknown labels."""
+        per_class: dict[int, int] = {}
+        unknown = 0
+        for box in result.boxes:
+            cls = self.resolve(box.label)
+            if cls is None:
+                unknown += 1
+            else:
+                per_class[cls.id] = per_class.get(cls.id, 0) + 1
+        return per_class, unknown
+
+
+def load_class_table(session: Session, project_id: int, fmt: str) -> ClassTable:
+    rows = list(session.scalars(select(ProjectClass).where(ProjectClass.project_id == project_id)))
+    return ClassTable(fmt, rows)
+
+
+@dataclass
+class LabelFile:
+    path: str | None           # None when the label path is unsafe
+    data: bytes | None         # None when the file does not exist
+    mtime: float | None
+    parse: ParseResult
+    readonly_reason: str | None
+
+    @property
+    def exists(self) -> bool:
+        return self.data is not None
+
+    @property
+    def version(self) -> str | None:
+        return label_version(self.data) if self.data is not None else None
+
+
+def read_label_file(paths: ProjectPaths, rel_path: str, width: float | None = None,
+                    height: float | None = None) -> LabelFile:
+    """Read and parse an image's label file. Problems become ``readonly_reason`` rather than errors."""
+    fmt = paths.project.label_format
+    try:
+        path = paths.label_file(rel_path)
+    except OutsideRootError:
+        return LabelFile(None, None, None, ParseResult(), "The label file resolves outside the label folder.")
+    try:
+        with open(path, "rb") as fh:
+            mtime = os.fstat(fh.fileno()).st_mtime
+            data = fh.read()
+    except FileNotFoundError:
+        return LabelFile(path, None, None, ParseResult(), None)
+    except IsADirectoryError:
+        return LabelFile(path, None, None, ParseResult(), "The label path is a folder.")
+    except OSError as exc:
+        return LabelFile(path, None, None, ParseResult(), f"The label file cannot be read ({exc.strerror}).")
+    result = parse_label(fmt, data, width, height)
+    return LabelFile(path, data, mtime, result, result.readonly_reason)
+
+
+def sync_classes_file(paths: ProjectPaths, table: ClassTable, *, only_if_missing: bool = False) -> None:
+    """Write ``classes.txt`` in the label folder so it matches the class list."""
+    target = paths.classes_file()
+    if only_if_missing and os.path.exists(target):
+        return
+    write_classes(target, table.names)
