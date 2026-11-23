@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import posixpath
+import unicodedata
 import zipfile
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, nullcontext
@@ -15,15 +16,42 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from annotamate.core.boxes import Box, sanitize
-from annotamate.core.formats import ImageContext, parse_label, serialize_label, uses_class_index
+from annotamate.core.formats import (
+    TOO_MANY_BOXES_REASON,
+    ImageContext,
+    parse_label,
+    serialize_label,
+    uses_class_index,
+)
 from annotamate.core.fsutil import OutsideRootError
 from annotamate.core.images import ImageError, probe
 from annotamate.server.errors import ApiError
 from annotamate.server.models import Image, Project
-from annotamate.server.services.labels import ClassTable
+from annotamate.server.services.labels import ClassTable, read_limited
 from annotamate.server.services.paths import ProjectPaths
 
 log = logging.getLogger("annotamate.export")
+
+
+#: Size of the pieces image files are copied in (the archive is never built in memory).
+CHUNK = 1024 * 1024
+
+
+class _SkipError(Exception):
+    """An item's label cannot be exported; the item is left out and the export goes on."""
+
+
+def safe_entry_name(rel_path: str) -> bool:
+    """True when ``rel_path`` can be used as a zip entry name without surprising extraction tools.
+
+    Refused: backslashes, control characters, drive colons, ``.``/``..``/empty segments and absolute names
+    (on Linux a dataset file can be named with backslashes, e.g. a fake parent-folder path).
+    """
+    if not rel_path or rel_path.startswith("/") or "\\" in rel_path or ":" in rel_path:
+        return False
+    if any(unicodedata.category(c) == "Cc" for c in rel_path):
+        return False
+    return all(part not in ("", ".", "..") for part in rel_path.split("/"))
 
 
 @dataclass
@@ -90,9 +118,12 @@ class Exporter:
     def _read(self, item: ExportItem) -> tuple[bytes | None, ImageContext | None]:
         try:
             with self.label_lock, open(self.paths.label_file(item.rel_path), "rb") as fh:  # not mid-save/migration
-                data: bytes | None = fh.read()
+                data: bytes | None = read_limited(fh)
         except (OSError, OutsideRootError):
             data = None
+        else:
+            if data is None:
+                raise _SkipError("the label file is too large")
         context = None
         if self.fmt != self.source_fmt or self.fmt == "coco" or data is None:
             try:
@@ -110,6 +141,8 @@ class Exporter:
         if data is None:
             return []
         result = parse_label(self.source_fmt, data, context.width, context.height)
+        if result.readonly_reason == TOO_MANY_BOXES_REASON:
+            raise _SkipError("the label file has too many boxes")
         out: list[Box] = []
         for box in sanitize(result.boxes, context.width, context.height):
             cls = self.table.resolve(box.label)
@@ -122,31 +155,57 @@ class Exporter:
             out.append(Box(box.x1, box.y1, box.x2, box.y2, label, box.difficult, box.truncated))
         return out
 
+    def _add_label(self, zf: zipfile.ZipFile, coco: dict[str, Any], coco_ids: dict[str, int],
+                   item: ExportItem) -> None:
+        data, context = self._read(item)
+        stem = posixpath.splitext(item.rel_path)[0]
+        if self.fmt == "coco":
+            if context is not None:
+                self._add_coco(coco, coco_ids, item, data, context)
+        elif self.fmt == self.source_fmt and data is not None:
+            folder = "labels" if self.fmt == "yolo" else "Annotations"
+            zf.writestr(f"{folder}/{stem}{'.txt' if self.fmt == 'yolo' else '.xml'}", data)
+        elif context is not None:
+            boxes = self._boxes(data, context)
+            payload = serialize_label(self.fmt, boxes, context, self.table.names)
+            folder = "labels" if self.fmt == "yolo" else "Annotations"
+            zf.writestr(f"{folder}/{stem}{'.txt' if self.fmt == 'yolo' else '.xml'}", payload)
+
+    def _copy_image(self, zf: zipfile.ZipFile, sink: _Sink, item: ExportItem) -> Iterator[bytes]:
+        """Copy an image into the archive in chunks, yielding what the archive produced after each one."""
+        source = self.paths.image_file(item.rel_path)
+        info = zipfile.ZipInfo.from_file(source, f"images/{item.rel_path}", strict_timestamps=False)
+        info.compress_type = zipfile.ZIP_STORED
+        with open(source, "rb") as src, zf.open(info, "w") as dest:
+            while block := src.read(CHUNK):
+                dest.write(block)
+                piece = sink.drain()
+                if piece:
+                    yield piece
+
     def stream(self) -> Iterator[bytes]:
+        """The archive in chunks. A problem with one item skips that item (with a warning), never the archive."""
         sink = _Sink()
         with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED) as zf:  # type: ignore[arg-type]
             coco: dict[str, Any] = {"images": [], "annotations": [], "categories": []}
             coco_ids: dict[str, int] = {name: i + 1 for i, name in enumerate(self.table.names)}
             for item in self.items:
-                data, context = self._read(item)
-                stem = posixpath.splitext(item.rel_path)[0]
-                if self.fmt == "coco":
-                    if context is not None:
-                        self._add_coco(coco, coco_ids, item, data, context)
-                elif self.fmt == self.source_fmt and data is not None:
-                    folder = "labels" if self.fmt == "yolo" else "Annotations"
-                    zf.writestr(f"{folder}/{stem}{'.txt' if self.fmt == 'yolo' else '.xml'}", data)
-                elif context is not None:
-                    boxes = self._boxes(data, context)
-                    payload = serialize_label(self.fmt, boxes, context, self.table.names)
-                    folder = "labels" if self.fmt == "yolo" else "Annotations"
-                    zf.writestr(f"{folder}/{stem}{'.txt' if self.fmt == 'yolo' else '.xml'}", payload)
+                if not safe_entry_name(item.rel_path):
+                    log.warning("Export skipped %r: its name is not safe to store in an archive", item.rel_path)
+                    continue
+                try:
+                    self._add_label(zf, coco, coco_ids, item)
+                except _SkipError as exc:
+                    log.warning("Export skipped the labels of %s: %s", item.rel_path, exc)
+                except Exception:
+                    log.warning("Export skipped the labels of %s", item.rel_path, exc_info=True)
                 if self.include_images:
                     try:
-                        zf.write(self.paths.image_file(item.rel_path), f"images/{item.rel_path}",
-                                 compress_type=zipfile.ZIP_STORED)
+                        yield from self._copy_image(zf, sink, item)
                     except (OSError, ApiError) as exc:
                         log.warning("Export skipped image %s: %s", item.rel_path, exc)
+                    except Exception:
+                        log.warning("Export skipped image %s", item.rel_path, exc_info=True)
                 chunk = sink.drain()
                 if chunk:
                     yield chunk
@@ -163,10 +222,11 @@ class Exporter:
 
     def _add_coco(self, coco: dict[str, Any], ids: dict[str, int], item: ExportItem, data: bytes | None,
                   context: ImageContext) -> None:
+        boxes = self._boxes(data, context)  # first: nothing is added for an item that fails here
         image_id = len(coco["images"]) + 1
         coco["images"].append({"id": image_id, "file_name": item.rel_path, "width": context.width,
                                "height": context.height})
-        for box in self._boxes(data, context):
+        for box in boxes:
             category = ids.setdefault(box.label, len(ids) + 1)
             w, h = box.x2 - box.x1, box.y2 - box.y1
             coco["annotations"].append({

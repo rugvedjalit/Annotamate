@@ -24,6 +24,9 @@ from annotamate.server.services import serialize
 from annotamate.server.services.annotations import probe_image
 from annotamate.server.services.paths import ProjectPaths
 
+#: Thumbnail sizes (px); a requested size is rounded up to the next one.
+THUMB_SIZES = (128, 256, 512)
+
 router = APIRouter(tags=["images"])
 
 IMMUTABLE = "private, max-age=31536000, immutable"
@@ -103,6 +106,7 @@ def image_file(iid: int, access: Access, ctx: Ctx, db: DB, v: str | None = None)
 @router.get("/projects/{pid}/images/{iid}/thumb")
 def thumbnail(iid: int, access: Access, ctx: Ctx, db: DB, size: Annotated[int, Query(ge=64, le=512)] = 256,
               v: str | None = None) -> FileResponse:
+    size = next(allowed for allowed in THUMB_SIZES if allowed >= size)  # few sizes: bounded decodes and cache files
     image = svc.get_image(db, access.project.id, iid)
     paths = ProjectPaths(ctx.settings, access.project)
     paths.check()

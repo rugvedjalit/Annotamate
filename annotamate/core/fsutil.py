@@ -11,15 +11,22 @@ import os
 import re
 import secrets
 import time
+import unicodedata
 
 _WINDOWS = os.name == "nt"
 log = logging.getLogger("annotamate.fsutil")
 _RESERVED_WINDOWS_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
+    *(f"{device}{digit}" for device in ("COM", "LPT") for digit in map(chr, (0xB9, 0xB2, 0xB3))),  # superscript 1-3
 }
-_UNSAFE_CHARS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]')
+_UNSAFE_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f<>:"/\\|?*]')
+
+
+def _is_invisible(char: str) -> bool:
+    """Format characters (bidi overrides, zero-width marks...) except the joiners emoji and scripts need."""
+    return unicodedata.category(char) == "Cf" and ord(char) not in (0x200C, 0x200D)  # ZWNJ, ZWJ
 
 
 class OutsideRootError(ValueError):
@@ -323,13 +330,14 @@ def _recover_entry(entry: dict[str, str | None]) -> bool:
 def sanitize_filename(name: str, max_length: int = 200) -> str | None:
     """Make an uploaded file name safe to create on any OS. Returns ``None`` when nothing usable is left."""
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(c for c in name if not _is_invisible(c))
     name = _UNSAFE_CHARS.sub("_", name).strip().strip(".").strip()
     if not name:
         return None
     stem, dot, ext = name.rpartition(".")
     if not dot:
         stem, ext = name, ""
-    if stem.split(".")[0].upper() in _RESERVED_WINDOWS_NAMES:
+    if stem.split(".")[0].rstrip(" .").upper() in _RESERVED_WINDOWS_NAMES:
         stem = f"_{stem}"
     if len(stem) + len(ext) + 1 > max_length:
         stem = stem[: max(1, max_length - len(ext) - 1)]

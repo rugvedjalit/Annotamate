@@ -15,10 +15,23 @@ READONLY_EXTRA_COLUMNS = (
 )
 
 
+#: Longest piece of file content (a token, a label) echoed into a message shown to users.
+ECHO_LIMIT = 100
+
+
+def _clip(value: object, limit: int = ECHO_LIMIT) -> str:
+    """``str(value)`` cut to ``limit`` characters, so a hostile file cannot produce a huge message."""
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
 def _class_index(token: str) -> int:
-    value = float(token)
+    try:
+        value = float(token)
+    except (ValueError, OverflowError):
+        raise ValueError(f"invalid class id {_clip(repr(token))}") from None
     if not math.isfinite(value) or not value.is_integer() or value < 0:
-        raise ValueError(f"invalid class id {token!r}")
+        raise ValueError(f"invalid class id {_clip(repr(token))}")
     return int(value)
 
 
@@ -29,14 +42,26 @@ def _finite(tokens: list[str]) -> list[float]:
     return values
 
 
-def parse(text: str, width: float = 1.0, height: float = 1.0) -> ParseResult:
+def parse(text: str, width: float = 1.0, height: float = 1.0, *, max_boxes: int | None = None) -> ParseResult:
     """Parse YOLO text. Coordinates are scaled to ``width`` x ``height`` pixels.
 
     With the default size of 1 the boxes stay normalised, which is enough to count labels.
     Lines with more than 5 values are reduced to their bounding rectangle and make the file read-only.
+    Malformed input never raises: it makes the file read-only. With ``max_boxes`` parsing stops as
+    soon as more boxes than that were found (the caller reports it).
     """
     result = ParseResult()
+    try:
+        _parse_lines(text, width, height, max_boxes, result)
+    except Exception as exc:  # a label file is untrusted input: nothing in it may escape as an error
+        result.readonly_reason = result.readonly_reason or f"The label file cannot be parsed ({_clip(exc)})."
+    return result
+
+
+def _parse_lines(text: str, width: float, height: float, max_boxes: int | None, result: ParseResult) -> None:
     for lineno, line in enumerate(text.splitlines(), start=1):
+        if max_boxes is not None and len(result.boxes) > max_boxes:
+            return
         tokens = line.split()
         if not tokens:
             continue
@@ -45,9 +70,9 @@ def parse(text: str, width: float = 1.0, height: float = 1.0) -> ParseResult:
             if len(tokens) < 5:
                 raise ValueError(f"expected 5 values, found {len(tokens)}")
             coords = _finite(tokens[1:])
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             result.readonly_reason = (result.readonly_reason
-                                      or f"Line {lineno} of the label file cannot be parsed ({exc}).")
+                                      or f"Line {lineno} of the label file cannot be parsed ({_clip(exc)}).")
             continue
         if len(coords) == 4:
             cx, cy, w, h = coords
@@ -62,7 +87,6 @@ def parse(text: str, width: float = 1.0, height: float = 1.0) -> ParseResult:
                 cx, cy, w, h = coords[:4]
                 x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
         result.boxes.append(Box(x1 * width, y1 * height, x2 * width, y2 * height, label))
-    return result
 
 
 def dump(boxes: list[Box], image: ImageContext) -> str:
@@ -74,7 +98,7 @@ def dump(boxes: list[Box], image: ImageContext) -> str:
         try:
             index = _class_index(box.label)
         except ValueError:
-            raise LabelFormatError(f"YOLO labels must be class indexes, got {box.label!r}") from None
+            raise LabelFormatError(f"YOLO labels must be class indexes, got {_clip(repr(box.label))}") from None
         b = clamp(box, image.width, image.height)
         if b.width <= 0 or b.height <= 0:
             continue

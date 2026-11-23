@@ -15,6 +15,7 @@ from io import BytesIO
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from annotamate.core.fsutil import atomic_write
+from annotamate.core.scanning import IMAGE_FORMATS
 
 ORIENTATION_TAG = 0x0112
 EXIF_MODES = ("apply", "ignore")
@@ -86,7 +87,7 @@ def _open(path: str) -> Image.Image:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-            img = Image.open(path)
+            img = Image.open(path, formats=list(IMAGE_FORMATS))
     except FileNotFoundError:
         raise ImageError("File not found") from None
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError, SyntaxError):

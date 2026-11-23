@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from annotamate.core.fsutil import OutsideRootError, create_unique, resolve_inside, sanitize_filename
 from annotamate.core.images import budget_error
-from annotamate.core.scanning import IMAGE_EXTENSIONS, natural_key
+from annotamate.core.scanning import IMAGE_EXTENSIONS, IMAGE_FORMATS, natural_key
 from annotamate.server.context import AppContext
 from annotamate.server.db import emit
 from annotamate.server.errors import ApiError, bad_request
@@ -59,7 +59,7 @@ def _check_image(stream: BinaryIO) -> str | None:
     """``None`` for a valid image within the pixel budget, otherwise the reason it is refused."""
     try:
         stream.seek(0)
-        with PILImage.open(stream) as img:
+        with PILImage.open(stream, formats=list(IMAGE_FORMATS)) as img:
             too_big = budget_error(img.size)
             if too_big:
                 return too_big

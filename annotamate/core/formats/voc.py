@@ -5,11 +5,23 @@ from __future__ import annotations
 import copy
 import math
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 
 from annotamate.core.boxes import Box, clamp
-from annotamate.core.formats.base import ImageContext, ParseResult
+from annotamate.core.formats.base import ImageContext, LabelFormatError, ParseResult
 
 EXTENSION = ".xml"
+
+#: Longest piece of file content echoed into a message shown to users.
+ECHO_LIMIT = 100
+#: Deepest element nesting accepted. Real VOC files need 3 levels; deeper documents would exhaust the stack on save.
+MAX_DEPTH = 64
+
+
+def _clip(value: object, limit: int = ECHO_LIMIT) -> str:
+    """``str(value)`` cut to ``limit`` characters, so a hostile file cannot produce a huge message."""
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit]}..."
 
 
 def _text(element: ET.Element | None, tag: str, default: str = "") -> str:
@@ -37,24 +49,73 @@ def _coord(bndbox: ET.Element, tag: str) -> float:
 
 
 def _fromstring(data: bytes) -> ET.Element:
-    """Parse XML without DTDs: entity declarations are the vector of XML expansion attacks."""
-    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+    """Parse XML safely: no DTD or entity declaration (in any encoding) and bounded nesting.
+
+    The checks run inside expat, so they also hold for UTF-16 and other encodings where a byte search for
+    ``<!DOCTYPE`` finds nothing. Raises ``ET.ParseError`` for anything unacceptable.
+    """
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:  # fast path for the common ASCII-compatible case
         raise ET.ParseError("DTDs and entity declarations are not supported")
-    return ET.fromstring(data)  # noqa: S314 - DTDs rejected above; expat never fetches external entities
+    builder = ET.TreeBuilder()
+    depth = 0
+
+    def start(tag: str, attrs: dict[str, str]) -> None:
+        nonlocal depth
+        depth += 1
+        if depth > MAX_DEPTH:
+            raise ET.ParseError("elements are nested too deeply")
+        builder.start(tag, attrs)
+
+    def end(tag: str) -> None:
+        nonlocal depth
+        depth -= 1
+        builder.end(tag)
+
+    def refuse(*_args: object) -> None:
+        raise ET.ParseError("DTDs and entity declarations are not supported")
+
+    parser = expat.ParserCreate()
+    parser.buffer_text = True
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.CharacterDataHandler = builder.data
+    parser.StartDoctypeDeclHandler = refuse
+    parser.EntityDeclHandler = refuse
+    try:
+        parser.Parse(data, True)
+        return builder.close()
+    except expat.ExpatError as exc:
+        raise ET.ParseError(expat.ErrorString(exc.code)) from None
+    except (RecursionError, ValueError, TypeError, OverflowError, AssertionError) as exc:
+        raise ET.ParseError(_clip(exc)) from None
 
 
-def parse(data: bytes) -> ParseResult:
-    """Parse a VOC XML file. Objects without a usable ``bndbox`` make the file read-only."""
+def parse(data: bytes, *, max_boxes: int | None = None) -> ParseResult:
+    """Parse a VOC XML file. Objects without a usable ``bndbox`` make the file read-only.
+
+    Malformed input never raises: it makes the file read-only. With ``max_boxes`` parsing stops as
+    soon as more boxes than that were found (the caller reports it).
+    """
     result = ParseResult()
     try:
         root = _fromstring(data)
     except ET.ParseError as exc:
-        result.readonly_reason = f"The label file is not valid XML ({exc})."
+        result.readonly_reason = f"The label file is not valid XML ({_clip(exc)})."
         return result
+    try:
+        _parse_objects(root, max_boxes, result)
+    except Exception as exc:  # a label file is untrusted input: nothing in it may escape as an error
+        result.readonly_reason = result.readonly_reason or f"The label file cannot be parsed ({_clip(exc)})."
+    return result
+
+
+def _parse_objects(root: ET.Element, max_boxes: int | None, result: ParseResult) -> None:
     if root.tag != "annotation":
         result.readonly_reason = "The label file is not a Pascal VOC annotation."
-        return result
+        return
     for n, obj in enumerate(root.findall("object"), start=1):
+        if max_boxes is not None and len(result.boxes) > max_boxes:
+            return
         name = _text(obj, "name")
         bndbox = obj.find("bndbox")
         try:
@@ -64,15 +125,15 @@ def parse(data: bytes) -> ParseResult:
                 _coord(bndbox, "xmin"), _coord(bndbox, "ymin"), _coord(bndbox, "xmax"), _coord(bndbox, "ymax"),
                 name, difficult=_flag(obj, "difficult"), truncated=_flag(obj, "truncated"),
             )
-        except ValueError as exc:
-            result.readonly_reason = result.readonly_reason or f"Object {n} of the label file cannot be parsed ({exc})."
+        except (ValueError, OverflowError) as exc:
+            result.readonly_reason = (result.readonly_reason
+                                      or f"Object {n} of the label file cannot be parsed ({_clip(exc)}).")
             continue
         if obj.find("polygon") is not None or obj.find("segmentation") is not None:
             result.readonly_reason = result.readonly_reason or (
                 "This label file contains polygons. Editing is disabled so they are not lost."
             )
         result.boxes.append(box)
-    return result
 
 
 def to_pixel(value: float) -> int:
@@ -196,8 +257,11 @@ def dump(boxes: list[Box], image: ImageContext, *, original: bytes | None = None
         objects.append(obj)
     for offset, obj in enumerate(objects):
         root.insert(insert_at + offset, obj)
-    ET.indent(root, space="   ")
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
+    try:
+        ET.indent(root, space="   ")
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
+    except RecursionError:  # cannot happen for documents read by ``_fromstring`` (nesting is bounded)
+        raise LabelFormatError("The label document is nested too deeply to be written.") from None
 
 
 def relabel(data: bytes, mapping: dict[str, str | None]) -> tuple[bytes, int]:
@@ -205,6 +269,13 @@ def relabel(data: bytes, mapping: dict[str, str | None]) -> tuple[bytes, int]:
 
     Returns the new bytes and the number of objects changed. Unparsable files are returned unchanged.
     """
+    try:
+        return _relabel(data, mapping)
+    except Exception:  # malformed documents are left alone
+        return data, 0
+
+
+def _relabel(data: bytes, mapping: dict[str, str | None]) -> tuple[bytes, int]:
     try:
         root = _fromstring(data)
     except ET.ParseError:

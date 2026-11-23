@@ -16,26 +16,61 @@ from annotamate.core.formats.base import ImageContext, ParseResult
 
 EXTENSION = ".json"
 
+#: Longest piece of file content echoed into a message shown to users.
+ECHO_LIMIT = 100
+#: Deepest nesting accepted. Real COCO files need 4 levels; deeper documents would exhaust the stack on save.
+MAX_DEPTH = 64
+#: Everything a hostile or damaged document can raise while it is read (huge integers, deep nesting, wrong types).
+_MALFORMED = (ValueError, UnicodeDecodeError, OverflowError, RecursionError, TypeError, AttributeError, KeyError,
+              IndexError, MemoryError)
+
+
+def _clip(value: object, limit: int = ECHO_LIMIT) -> str:
+    """``str(value)`` cut to ``limit`` characters, so a hostile file cannot produce a huge message."""
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
 
 def _round(value: float) -> float:
     rounded = round(value, 3)
     return int(rounded) if float(rounded).is_integer() else rounded
 
 
+def _too_deep(doc: Any, limit: int = MAX_DEPTH) -> bool:
+    """True when containers are nested more than ``limit`` levels (checked without recursion)."""
+    stack: list[tuple[Any, int]] = [(doc, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            return True
+        children = node.values() if isinstance(node, dict) else node
+        stack.extend((child, depth + 1) for child in children if isinstance(child, dict | list))
+    return False
+
+
 def _load(data: bytes) -> dict[str, Any]:
     doc = json.loads(data.decode("utf-8-sig"))
     if not isinstance(doc, dict):
         raise ValueError("top level is not an object")
+    if _too_deep(doc):
+        raise RecursionError("nested too deeply")
     return doc
 
 
-def parse(data: bytes) -> ParseResult:
-    """Parse a per-image COCO file. Segmentations or several images make it read-only."""
+def parse(data: bytes, *, max_boxes: int | None = None) -> ParseResult:
+    """Parse a per-image COCO file. Segmentations or several images make it read-only.
+
+    Malformed input never raises: it makes the file read-only. With ``max_boxes`` parsing stops as
+    soon as more boxes than that were found (the caller reports it).
+    """
     result = ParseResult()
     try:
         doc = _load(data)
-    except (ValueError, UnicodeDecodeError) as exc:
-        result.readonly_reason = f"The label file is not valid JSON ({exc})."
+    except RecursionError:
+        result.readonly_reason = "The label file is not valid JSON (it is nested too deeply)."
+        return result
+    except _MALFORMED as exc:
+        result.readonly_reason = f"The label file is not valid JSON ({_clip(exc)})."
         return result
     try:
         categories = sorted(
@@ -48,22 +83,26 @@ def parse(data: bytes) -> ParseResult:
         if len(images) > 1:
             result.readonly_reason = "This COCO file describes several images. Editing is disabled."
         for n, ann in enumerate(doc.get("annotations") or [], start=1):
+            if max_boxes is not None and len(result.boxes) > max_boxes:
+                break
             try:
+                if not isinstance(ann, dict):
+                    raise ValueError("not an object")
                 x, y, w, h = (float(v) for v in ann["bbox"])
                 if not all(math.isfinite(v) for v in (x, y, w, h)):
                     raise ValueError("non-finite bbox")
                 cat = ann.get("category_id")
                 label = names.get(cat, str(cat))
-            except (KeyError, TypeError, ValueError) as exc:
-                result.readonly_reason = result.readonly_reason or f"Annotation {n} cannot be parsed ({exc})."
+            except _MALFORMED as exc:
+                result.readonly_reason = result.readonly_reason or f"Annotation {n} cannot be parsed ({_clip(exc)})."
                 continue
             if ann.get("segmentation"):
                 result.readonly_reason = result.readonly_reason or (
                     "This label file contains segmentation masks. Editing is disabled so they are not lost."
                 )
             result.boxes.append(Box(x, y, x + w, y + h, label))
-    except (TypeError, AttributeError, KeyError) as exc:
-        result.readonly_reason = f"The label file is not a COCO document ({exc})."
+    except Exception as exc:  # a label file is untrusted input: nothing in it may escape as an error
+        result.readonly_reason = f"The label file is not a COCO document ({_clip(exc)})."
     return result
 
 
@@ -81,12 +120,13 @@ def _original_document(original: bytes | None) -> dict[str, Any] | None:
         return None
     try:
         doc = _load(original)
-    except (ValueError, UnicodeDecodeError):
+    except _MALFORMED:
         return None
     parsed = parse(original)
     annotations = doc.get("annotations") or []
+    categories = doc.get("categories") or []
     if (parsed.readonly_reason or not isinstance(annotations, list) or len(annotations) != len(parsed.boxes)
-            or not all(isinstance(a, dict) for a in annotations)):
+            or not all(isinstance(a, dict) for a in annotations) or not isinstance(categories, list)):
         return None
     return doc
 
@@ -185,15 +225,23 @@ def relabel(data: bytes, mapping: dict[str, str | None], class_names: list[str])
     and the number of annotations changed; unparsable files are returned unchanged.
     """
     try:
-        doc = _load(data)
-        old_names = {c["id"]: str(c.get("name", c["id"])) for c in doc.get("categories") or []}
-        anns = list(doc.get("annotations") or [])
-    except (ValueError, UnicodeDecodeError, TypeError, KeyError, AttributeError):
+        return _relabel(data, mapping, class_names)
+    except Exception:  # malformed documents (wrong types, huge numbers, deep nesting) are left alone
         return data, 0
+
+
+def _relabel(data: bytes, mapping: dict[str, str | None], class_names: list[str]) -> tuple[bytes, int]:
+    doc = _load(data)
+    annotations = doc.get("annotations") or []
+    if not isinstance(annotations, list) or not all(isinstance(a, dict) for a in annotations):
+        return data, 0  # not a document this tool understands: renumbering its categories would corrupt it
+    old_names = {c["id"]: str(c.get("name", c["id"])) for c in doc.get("categories") or []
+                 if isinstance(c, dict) and "id" in c}
     changed = 0
     kept: list[tuple[dict[str, Any], str]] = []
-    for ann in anns:
-        name = old_names.get(ann.get("category_id"), str(ann.get("category_id")))
+    for ann in annotations:
+        cat = ann.get("category_id")
+        name = old_names.get(cat, str(cat))
         if name in mapping:
             changed += 1
             target = mapping[name]

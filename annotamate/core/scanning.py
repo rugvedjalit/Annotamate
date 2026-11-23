@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 IMAGE_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"})
+
+#: Pillow format names accepted for files with the extensions above. Pillow identifies content, not names:
+#: without this list a ``.png`` that is really EPS, ICO, TGA, DDS... would be opened too.
+IMAGE_FORMATS: tuple[str, ...] = ("JPEG", "PNG", "BMP", "WEBP", "TIFF")
 
 _DIGITS = re.compile(r"(\d+)")
 
@@ -31,6 +36,20 @@ def natural_key(text: str) -> tuple:
 
 def natural_sorted(items: list[str]) -> list[str]:
     return sorted(items, key=natural_key)
+
+
+def _is_junction(path: str) -> bool:
+    """True for a Windows junction (``os.path.isjunction`` exists from Python 3.12)."""
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return bool(isjunction(path))
+    if os.name != "nt":
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400) and not stat.S_ISLNK(st.st_mode)  # REPARSE_POINT
 
 
 def _inside(root_real: str, path: str) -> bool:
@@ -69,6 +88,8 @@ def _walk(directory: str, prefix: str, recursive: bool, root_real: str, unreadab
                     continue
                 yield prefix + name
             elif recursive and entry.is_dir(follow_symlinks=False):
+                if _is_junction(entry.path) or not _inside(root_real, entry.path):
+                    continue  # a junction (or anything else) leading outside the root is never followed
                 yield from _walk(entry.path, f"{prefix}{name}/", recursive, root_real, unreadable)
         except OSError:
             continue
@@ -77,7 +98,7 @@ def _walk(directory: str, prefix: str, recursive: bool, root_real: str, unreadab
 def scan(directory: str, recursive: bool = False) -> ScanResult:
     """Image paths below ``directory``, relative to it with ``/`` separators, in natural order.
 
-    Hidden files and folders (leading dot) are skipped. Symlinked folders are not followed and
+    Hidden files and folders (leading dot) are skipped. Symlinked folders and junctions are not followed and
     symlinked files that resolve outside ``directory`` are ignored. Raises ``OSError`` when
     ``directory`` itself cannot be listed; unreadable sub-folders are reported in ``unreadable``.
     """

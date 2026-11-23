@@ -6,15 +6,27 @@ import hashlib
 import os
 import uuid
 from dataclasses import dataclass, field
+from typing import BinaryIO
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from annotamate.core.classes import write_classes
-from annotamate.core.formats import ParseResult, parse_label, uses_class_index
+from annotamate.core.formats import MAX_LABEL_BYTES, TOO_LARGE_REASON, ParseResult, parse_label, uses_class_index
 from annotamate.core.fsutil import OutsideRootError
 from annotamate.server.models import Image, PendingRename, Project, ProjectClass
 from annotamate.server.services.paths import RESERVED_YOLO_KEY, ProjectPaths, label_key
+
+
+def read_limited(fh: BinaryIO) -> bytes | None:
+    """The rest of ``fh``, or ``None`` when it is larger than ``MAX_LABEL_BYTES`` (nothing big is loaded)."""
+    try:
+        if os.fstat(fh.fileno()).st_size > MAX_LABEL_BYTES:
+            return None
+    except (OSError, AttributeError, ValueError):
+        pass
+    data = fh.read(MAX_LABEL_BYTES + 1)
+    return None if len(data) > MAX_LABEL_BYTES else data
 
 
 def label_version(data: bytes) -> str:
@@ -152,13 +164,15 @@ def read_label_file(paths: ProjectPaths, rel_path: str, width: float | None = No
     try:
         with open(path, "rb") as fh:
             mtime = os.fstat(fh.fileno()).st_mtime
-            data = fh.read()
+            data = read_limited(fh)
     except FileNotFoundError:
         return LabelFile(path, None, None, ParseResult(), None)
     except IsADirectoryError:
         return LabelFile(path, None, None, ParseResult(), "The label path is a folder.")
     except OSError as exc:
         return LabelFile(path, None, None, ParseResult(), f"The label file cannot be read ({exc.strerror}).")
+    if data is None:  # too large to load: unreadable for the editor, but it does exist
+        return LabelFile(path, None, mtime, ParseResult(), TOO_LARGE_REASON)
     result = parse_label(fmt, data, width, height)
     return LabelFile(path, data, mtime, result, result.readonly_reason)
 

@@ -21,7 +21,7 @@ from annotamate.server.context import AppContext, IndexProgress
 from annotamate.server.errors import ApiError
 from annotamate.server.models import Image, ImageClassCount, Project, ProjectClass, utcnow
 from annotamate.server.services import notify
-from annotamate.server.services.labels import ClassTable, load_class_table, sync_classes_file
+from annotamate.server.services.labels import ClassTable, load_class_table, read_limited, sync_classes_file
 from annotamate.server.services.paths import RESERVED_YOLO_KEY, ProjectPaths, label_key
 
 log = logging.getLogger("annotamate.indexing")
@@ -85,15 +85,29 @@ class LabelLister:
 
 
 def parse_for_index(paths: ProjectPaths, rel_path: str, lister: LabelLister | None = None) -> ParsedLabel:
-    """Label names (with counts) found in an image's label file; YOLO values stay normalised."""
+    """Label names (with counts) found in an image's label file; YOLO values stay normalised.
+
+    One file never affects another: a file that is too large, damaged or otherwise raises is recorded as
+    an existing label file without boxes (the editor shows why it is read-only).
+    """
+    try:
+        return _parse_for_index(paths, rel_path, lister)
+    except Exception:
+        log.warning("Label file of %s could not be indexed", rel_path, exc_info=True)
+        return ParsedLabel(True, Counter(), [])
+
+
+def _parse_for_index(paths: ProjectPaths, rel_path: str, lister: LabelLister | None) -> ParsedLabel:
     try:
         path = lister.path(paths.label_rel(rel_path)) if lister is not None else paths.label_file(rel_path)
         if path is None:
             return ParsedLabel(False, Counter(), [])
         with open(path, "rb") as fh:
-            data = fh.read()
+            data = read_limited(fh)
     except (OSError, OutsideRootError):
         return ParsedLabel(False, Counter(), [])
+    if data is None:  # larger than the label size limit: counted as present, never loaded
+        return ParsedLabel(True, Counter(), [])
     result = parse_label(paths.project.label_format, data)
     return ParsedLabel(True, Counter(b.label for b in result.boxes), result.categories)
 
