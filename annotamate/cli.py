@@ -136,6 +136,26 @@ def _ask_password(confirm: bool = True) -> str:
         return password
 
 
+def _read_password_stdin() -> str | None:
+    """The first line of standard input (for scripts and automation); ``None`` with a message when unusable."""
+    from annotamate.server.security import MIN_PASSWORD_LENGTH
+
+    password = sys.stdin.readline().rstrip("\r\n")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        print(f"The password read from standard input needs at least {MIN_PASSWORD_LENGTH} characters.",
+              file=sys.stderr)
+        return None
+    return password
+
+
+def _password_from(args: argparse.Namespace, *, allow_argument: bool) -> str | None:
+    if getattr(args, "password_stdin", False):
+        return _read_password_stdin()
+    if allow_argument and args.password is not None:
+        return args.password
+    return _ask_password()
+
+
 def cmd_user_create(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
@@ -143,7 +163,12 @@ def cmd_user_create(args: argparse.Namespace) -> int:
     from annotamate.server.schemas import UserCreate
     from annotamate.server.services.users import create_user
 
-    password = args.password if args.password is not None else _ask_password()
+    if args.password is not None and args.password_stdin:
+        print("Use either --password or --password-stdin, not both.", file=sys.stderr)
+        return 2
+    password = _password_from(args, allow_argument=True)
+    if password is None:
+        return 2
     try:
         body = UserCreate(username=args.username, display_name=args.display_name or args.username,
                           password=password, is_admin=args.admin)
@@ -169,13 +194,16 @@ def cmd_user_passwd(args: argparse.Namespace) -> int:
     from annotamate.server.security import hash_password
     from annotamate.server.services.users import find_by_username, revoke_sessions
 
+    password = _password_from(args, allow_argument=False)
+    if password is None:
+        return 2
     db = _db(args)
     with db.session() as session:
         user = find_by_username(session, args.username)
         if user is None:
             print(f"No user named '{args.username}'.", file=sys.stderr)
             return 1
-        user.password_hash = hash_password(_ask_password())
+        user.password_hash = hash_password(password)
         revoke_sessions(session, user.id)
         session.commit()
         print(f"Password changed for '{user.username}'; their sessions were signed out.")
@@ -242,11 +270,15 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--admin", action="store_true", help="grant administrator rights")
     create.add_argument("--display-name")
     create.add_argument("--password", help="password (prompted when omitted; a value given here can be seen "
-                        "in the process list and the shell history, so prefer the prompt)")
+                        "in the process list and the shell history, so prefer the prompt or --password-stdin)")
+    create.add_argument("--password-stdin", action="store_true",
+                        help="read the password from the first line of standard input (for scripts)")
     data_dir_option(create)
     create.set_defaults(func=cmd_user_create)
-    passwd = user_sub.add_parser("passwd", help="set a new password (prompts)")
+    passwd = user_sub.add_parser("passwd", help="set a new password (prompts, or --password-stdin)")
     passwd.add_argument("username")
+    passwd.add_argument("--password-stdin", action="store_true",
+                        help="read the password from the first line of standard input (for scripts)")
     data_dir_option(passwd)
     passwd.set_defaults(func=cmd_user_passwd)
     listing = user_sub.add_parser("list", help="list accounts")

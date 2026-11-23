@@ -238,3 +238,24 @@ def test_environment_settings_are_used(tmp_path, data_dir, monkeypatch, capsys, 
 def test_serve_rejects_an_invalid_base_url(tmp_path, data_dir, capsys, fake_uvicorn):
     assert run("serve", "--data-dir", str(data_dir), "--root", str(tmp_path), "--base-url", '/a"><script>/') == 2
     assert "base_url" in capsys.readouterr().err and fake_uvicorn == []
+
+
+def test_passwords_can_come_from_standard_input(data_dir, monkeypatch, capsys):
+    import io
+
+    def fail_prompt(prompt: str = "") -> str:
+        raise AssertionError("must not prompt")
+
+    monkeypatch.setattr(cli.getpass, "getpass", fail_prompt)
+    monkeypatch.setattr("sys.stdin", io.StringIO("from-stdin-pw\r\nignored second line\n"))
+    assert run("user", "create", "carol", "--admin", "--password-stdin", "--data-dir", str(data_dir)) == 0
+    assert verify_password(load_user(data_dir, "carol").password_hash, "from-stdin-pw")[0]
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("rotated-password\n"))
+    assert run("user", "passwd", "carol", "--password-stdin", "--data-dir", str(data_dir)) == 0
+    assert verify_password(load_user(data_dir, "carol").password_hash, "rotated-password")[0]
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("short\n"))
+    assert run("user", "passwd", "carol", "--password-stdin", "--data-dir", str(data_dir)) == 2
+    assert "at least 8 characters" in capsys.readouterr().err
+    assert run("user", "create", "dave", "--password", "x" * 10, "--password-stdin", "--data-dir", str(data_dir)) == 2
