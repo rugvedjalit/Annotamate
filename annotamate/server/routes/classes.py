@@ -22,6 +22,7 @@ def list_classes(access: Access, db: DB) -> list[dict]:
 
 @router.post("/projects/{pid}/classes", response_model=ProjectClass)
 def add_class(body: ClassCreate, access: Access, ctx: Ctx, db: DB) -> dict:
+    access.require_writable()
     if not access.can_add_classes:
         raise forbidden("Your role cannot add classes in this project.")
     return serialize.class_out(svc.add_class(ctx, db, access, body.name, body.color))
@@ -30,6 +31,7 @@ def add_class(body: ClassCreate, access: Access, ctx: Ctx, db: DB) -> dict:
 @router.patch("/projects/{pid}/classes/{cid}", response_model=ProjectClass)
 def update_class(cid: int, body: ClassPatch, access: Access, ctx: Ctx, db: DB) -> dict:
     access.require_manage()
+    access.require_writable()
     cls = svc.get_class(db, access.project.id, cid)
     return serialize.class_out(svc.update_class(ctx, db, access, cls, name=body.name, color=body.color))
 
@@ -39,5 +41,6 @@ def delete_class(cid: int, access: Access, ctx: Ctx, db: DB,
                  strategy: Literal["forbid", "delete_boxes", "merge"] = "forbid",
                  merge_into: int | None = None) -> dict:
     access.require_manage()
+    access.require_writable()
     cls = svc.get_class(db, access.project.id, cid)
     return {"rewritten_files": svc.delete_class(ctx, db, access, cls, strategy=strategy, merge_into=merge_into)}

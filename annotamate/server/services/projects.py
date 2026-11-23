@@ -300,8 +300,11 @@ def _member(session: Session, project_id: int, user_id: int) -> ProjectMember:
 
 
 def _manager_count(session: Session, project_id: int) -> int:
-    return session.scalar(select(func.count()).select_from(ProjectMember).where(
-        ProjectMember.project_id == project_id, ProjectMember.role == "manager")) or 0
+    """Managers who can actually act (deactivated accounts do not count)."""
+    return session.scalar(select(func.count()).select_from(ProjectMember)
+                          .join(User, User.id == ProjectMember.user_id)
+                          .where(ProjectMember.project_id == project_id, ProjectMember.role == "manager",
+                                 User.is_active.is_(True))) or 0
 
 
 def add_member(session: Session, access: ProjectAccess, user_id: int, role: str) -> dict[str, Any]:

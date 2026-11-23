@@ -19,6 +19,7 @@ from annotamate.server.models import (
     Notification,
     Project,
     ProjectClass,
+    ProjectMember,
     User,
 )
 
@@ -175,13 +176,28 @@ def notifications(session: Session, rows: list[Notification]) -> list[Json]:
     project_ids = {n.project_id for n in rows if n.project_id is not None}
     projects = {p.id: {"id": p.id, "name": p.name} for p in
                 session.scalars(select(Project).where(Project.id.in_(project_ids)))} if project_ids else {}
+    # Links (and the project's current name) only for projects the recipient can still open; a user who left
+    # keeps the notification text written back then, nothing newer.
+    recipients = {n.user_id for n in rows}
+    admins: set[int] = set()
+    memberships: set[tuple[int, int]] = set()
+    if recipients:
+        admins = set(session.scalars(select(User.id).where(User.id.in_(recipients), User.is_admin.is_(True))))
+    if recipients and project_ids:
+        query = select(ProjectMember.user_id, ProjectMember.project_id).where(
+            ProjectMember.user_id.in_(recipients), ProjectMember.project_id.in_(project_ids))
+        memberships = {(uid, pid) for uid, pid in session.execute(query)}
+
+    def visible(n: Notification) -> bool:
+        return n.project_id is None or n.user_id in admins or (n.user_id, n.project_id) in memberships
+
     return [
         {
             "id": n.id,
             "type": n.type,
             "actor": users.get(n.actor_id) if n.actor_id else None,
-            "project": projects.get(n.project_id) if n.project_id else None,
-            "image": refs.get(n.image_id) if n.image_id else None,
+            "project": projects.get(n.project_id) if n.project_id and visible(n) else None,
+            "image": refs.get(n.image_id) if n.image_id and visible(n) else None,
             "text": n.text,
             "created_at": iso(n.created_at),
             "read_at": iso(n.read_at),

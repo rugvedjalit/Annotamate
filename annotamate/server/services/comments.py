@@ -105,6 +105,9 @@ def update_comment(session: Session, access: ProjectAccess, comment: Comment, *,
     if resolved is not None and resolved != comment.resolved:
         if not (access.can_edit or comment.user_id == user.id):
             raise forbidden("Your role cannot resolve comments.")
+        if (comment.user_id != user.id and access.restricted_annotator
+                and image.assignee_id not in (None, user.id)):
+            raise forbidden("This image is assigned to someone else.")
         comment.resolved = resolved
     refresh_comment_counts(session, image)
     return _emit_comment(session, comment, image, "comment.updated", user)

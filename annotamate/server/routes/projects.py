@@ -135,6 +135,7 @@ def remove_member(uid: int, access: Access, ctx: Ctx, db: DB) -> Response:
 @router.post("/projects/{pid}/upload", response_model=UploadResult)
 async def upload(request: Request, access: Access, ctx: Ctx, db: DB) -> dict:
     access.require_manage()
+    access.require_writable()
     form = await request.form(max_files=MAX_UPLOAD_FILES, max_fields=50)
     try:
         uploads = [f for f in [*form.getlist("files[]"), *form.getlist("files")] if isinstance(f, UploadFile)]

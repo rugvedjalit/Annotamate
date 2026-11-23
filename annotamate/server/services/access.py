@@ -26,12 +26,17 @@ class ProjectAccess:
         return "manager" if self.user.is_admin else (self.role or "viewer")
 
     @property
+    def writable(self) -> bool:
+        """Archived projects are read-only: no annotation, review, class, assignment or upload changes."""
+        return not self.project.archived
+
+    @property
     def can_edit(self) -> bool:
-        return self.effective_role in EDIT_ROLES
+        return self.writable and self.effective_role in EDIT_ROLES
 
     @property
     def can_review(self) -> bool:
-        return self.effective_role in REVIEW_ROLES
+        return self.writable and self.effective_role in REVIEW_ROLES
 
     @property
     def can_manage(self) -> bool:
@@ -40,7 +45,8 @@ class ProjectAccess:
     @property
     def can_add_classes(self) -> bool:
         role = self.effective_role
-        return role in REVIEW_ROLES or (role == "annotator" and self.project.annotators_can_add_classes)
+        return self.writable and (role in REVIEW_ROLES
+                                  or (role == "annotator" and self.project.annotators_can_add_classes))
 
     @property
     def can_delete(self) -> bool:
@@ -60,11 +66,17 @@ class ProjectAccess:
             "can_delete": self.can_delete,
         }
 
+    def require_writable(self) -> None:
+        if not self.writable:
+            raise forbidden("This project is archived and read-only. A manager can restore it in the project settings.")
+
     def require_edit(self) -> None:
+        self.require_writable()
         if not self.can_edit:
             raise forbidden("Your role in this project cannot edit annotations.")
 
     def require_review(self) -> None:
+        self.require_writable()
         if not self.can_review:
             raise forbidden("Only reviewers and managers can review images.")
 

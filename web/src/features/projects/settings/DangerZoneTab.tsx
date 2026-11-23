@@ -74,8 +74,8 @@ export function DangerZoneTab({ project }: { project: Project }) {
         title={project.archived ? 'Restore project' : 'Archive project'}
         description={
           project.archived
-            ? 'Bring the project back to the projects page. Nothing was changed while it was archived.'
-            : 'Hide the project from the projects page. Members keep access through “Show archived”; nothing is deleted.'
+            ? 'Bring the project back to the projects page and make it editable again. Nothing was changed while it was archived.'
+            : 'Hide the project from the projects page and make it read-only. Members keep access through “Show archived”; chat and comments still work, nothing is deleted.'
         }
         footer={
           project.archived ? (
@@ -132,7 +132,7 @@ export function DangerZoneTab({ project }: { project: Project }) {
         open={confirmArchive}
         onOpenChange={setConfirmArchive}
         title="Archive this project?"
-        description="It disappears from the projects page for everyone. You can restore it from this page."
+        description="It disappears from the projects page for everyone and becomes read-only: no annotation, review, class or assignment changes until it is restored from this page."
         confirmLabel="Archive"
         onConfirm={() =>
           update.mutateAsync({ archived: true }).then(() => toast.success('Project archived'))

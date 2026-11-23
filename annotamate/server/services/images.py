@@ -166,6 +166,7 @@ def patch_image(session: Session, access: ProjectAccess, image: Image, fields: d
         notify.record(session, project.id, "flagged", user=user, image_id=image.id, data={"flagged": image.flagged})
     if "assignee_id" in fields and fields["assignee_id"] != image.assignee_id:
         target_id = fields["assignee_id"]
+        access.require_writable()
         if not access.can_manage:
             access.require_edit()
             claim = target_id == user.id and image.assignee_id is None
@@ -183,8 +184,17 @@ def patch_image(session: Session, access: ProjectAccess, image: Image, fields: d
     return _broadcast_image(session, image, user)
 
 
-def _owner_ids(image: Image) -> list[int]:
-    return [uid for uid in (image.done_by_id or image.assignee_id,) if uid is not None]
+def _owner_ids(session: Session, image: Image) -> list[int]:
+    """Who gets review results: the annotator who submitted (or the assignee), if they still have access."""
+    uid = image.done_by_id or image.assignee_id
+    if uid is None:
+        return []
+    user = session.get(User, uid)
+    if user is None or not user.is_active:
+        return []
+    member = session.scalar(select(ProjectMember.user_id).where(ProjectMember.project_id == image.project_id,
+                                                                ProjectMember.user_id == uid))
+    return [uid] if member is not None or user.is_admin else []
 
 
 def change_status(ctx: AppContext, session: Session, access: ProjectAccess, image: Image, action: str,
@@ -208,7 +218,7 @@ def change_status(ctx: AppContext, session: Session, access: ProjectAccess, imag
         if action == "reject" and not (comment or "").strip():
             raise bad_request("A comment explaining the rejection is required.")
         new = "done" if action == "approve" else "rejected"
-        subject = (_owner_ids(image) or [None])[0]
+        subject = (_owner_ids(session, image) or [None])[0]
     elif action == "reopen":
         owns = user.id in (image.assignee_id, image.done_by_id)
         if not (access.can_review or (access.can_edit and owns)):
@@ -233,12 +243,13 @@ def change_status(ctx: AppContext, session: Session, access: ProjectAccess, imag
                       f"{user.display_name} submitted {image.filename} for review", actor=user, project=project,
                       image_id=image.id)
     elif action == "approve":
-        notify.notify(session, _owner_ids(image), "review_approved", f"{user.display_name} approved {image.filename}",
-                      actor=user, project=project, image_id=image.id)
+        notify.notify(session, _owner_ids(session, image), "review_approved",
+                      f"{user.display_name} approved {image.filename}", actor=user, project=project,
+                      image_id=image.id)
     elif action == "reject":
         reason = (comment or "").strip()
         create_comment(ctx, session, access, image, reason, None, notify_watchers=False)
-        notify.notify(session, _owner_ids(image), "review_rejected",
+        notify.notify(session, _owner_ids(session, image), "review_rejected",
                       f"{user.display_name} rejected {image.filename}: {notify.preview(reason)}", actor=user,
                       project=project, image_id=image.id)
     return _broadcast_image(session, image, user)
@@ -274,6 +285,7 @@ def bulk(session: Session, access: ProjectAccess, *, image_ids: list[int] | None
          action: str, assignee_id: int | None, status: str | None, user_ids: list[int] | None,
          limit: int | None) -> int:
     access.require_manage()
+    access.require_writable()
     user, project = access.user, access.project
     if image_ids is None and flt is None:
         raise bad_request("Provide image_ids or a filter.")

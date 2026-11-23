@@ -67,7 +67,7 @@ export function ProjectPage() {
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="truncate text-lg font-semibold tracking-tight text-fg">{project.name}</h1>
             <FormatBadge format={project.label_format} />
-            {project.archived && <Badge variant="outline">Archived</Badge>}
+            {project.archived && <Badge variant="outline" title="Archived projects are read-only">Archived · read-only</Badge>}
             <Badge variant="neutral">{project.my_role ? ROLE_LABELS[project.my_role] : 'Administrator'}</Badge>
           </div>
           {project.description && <p className="mt-1 max-w-3xl text-base text-muted">{project.description}</p>}
