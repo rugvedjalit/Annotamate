@@ -13,7 +13,10 @@ export type MessageToken =
   | { type: 'mention'; username: string; value: string }
   | { type: 'link'; href: string; value: string }
 
-const TOKEN_RE = /(https?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]])|(^|[^\w@])@([a-z0-9_.-]{3,32})/gi
+// Links stop at bidirectional controls and zero-width characters, so a link cannot display reversed or
+// hide part of its address.
+const TOKEN_RE =
+  /(https?:\/\/[^\s<>"'\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]+[^\s<>"'.,;:!?)\]\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff])|(^|[^\w@])@([a-z0-9_.-]{3,32})/gi
 
 /** Split a message body into text, @mention and link tokens (no HTML is ever produced). */
 export function tokenizeMessage(text: string): MessageToken[] {

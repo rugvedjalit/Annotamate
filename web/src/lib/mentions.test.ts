@@ -73,3 +73,19 @@ describe('tokenizeMessage', () => {
     expect(tokenizeMessage('')).toEqual([])
   })
 })
+
+describe('tokenizeMessage with invisible characters', () => {
+  it('ends a link at a bidirectional override, so it cannot display reversed', () => {
+    const tokens = tokenizeMessage('see https://good.example/‮moc.live now')
+    expect(tokens.find((t) => t.type === 'link')).toEqual({
+      type: 'link',
+      href: 'https://good.example/',
+      value: 'https://good.example/',
+    })
+  })
+
+  it('ends a link at a zero-width space', () => {
+    const link = tokenizeMessage('https://a.example/x​https://b.example').find((t) => t.type === 'link')
+    expect(link?.href).toBe('https://a.example/x')
+  })
+})

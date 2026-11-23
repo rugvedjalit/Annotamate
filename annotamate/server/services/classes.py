@@ -21,6 +21,7 @@ from annotamate.server.context import AppContext
 from annotamate.server.db import emit
 from annotamate.server.errors import ApiError, bad_request, conflict, not_found
 from annotamate.server.models import Image, PendingRename, Project, ProjectClass
+from annotamate.server.schemas import INVISIBLE_CHARS
 from annotamate.server.services import notify, serialize
 from annotamate.server.services.access import ProjectAccess
 from annotamate.server.services.indexing import (
@@ -44,8 +45,9 @@ def clean_name(name: str) -> str:
         raise bad_request("Class name is required.")
     if len(name) > 100:
         raise bad_request("Class names are at most 100 characters.")
-    if any(ord(ch) < 32 or ch == "\x7f" for ch in name):
-        raise bad_request("Class names cannot contain line breaks or control characters.")
+    if any(ord(ch) < 32 or ch == "\x7f" or ch in INVISIBLE_CHARS for ch in name):
+        raise bad_request("Class names cannot contain line breaks, control characters or invisible formatting "
+                          "characters.")
     return name
 
 
@@ -259,7 +261,11 @@ def rename_in_files(ctx: AppContext, project_id: int) -> None:
                         log.warning("Could not read %s; the class rename will be retried", path)
                         failed += 1
                     continue
-                new, changed = relabel(project.label_format, data, name_map=name_map, class_names=table.names)
+                try:
+                    new, changed = relabel(project.label_format, data, name_map=name_map, class_names=table.names)
+                except Exception:  # a malformed file is read-only anyway; it must not stop the job
+                    log.warning("Skipping %s: it could not be parsed for the class rename", path, exc_info=True)
+                    continue
                 if changed:
                     try:
                         atomic_write(path, new)
@@ -349,7 +355,12 @@ def delete_class(ctx: AppContext, session: Session, access: ProjectAccess, cls: 
             in_use_missing += uses and image_id in missing_ids
             if strategy == "forbid" and in_use:
                 continue  # keep counting, nothing will be written
-            new, changed = relabel(fmt, data, index_map=index_map, name_map=name_map, class_names=new_names)
+            try:
+                new, changed = relabel(fmt, data, index_map=index_map, name_map=name_map, class_names=new_names)
+            except Exception:
+                log.warning("Could not rewrite %s for a class change", path, exc_info=True)
+                raise bad_request(f"The label file {os.path.basename(path)} could not be rewritten. "
+                                  "Nothing was changed.") from None
             if changed:
                 staged.append((path, new))
             if uses:

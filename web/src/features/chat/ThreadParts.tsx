@@ -62,6 +62,8 @@ export function MessageHeader({ user, createdAt, edited }: { user: UserBrief; cr
   return (
     <div className="flex items-baseline gap-2">
       <span className="truncate text-base font-semibold text-fg">{user.display_name}</span>
+      {/* The username is unique; display names are not, so it is shown to tell look-alikes apart. */}
+      <span className="shrink-0 font-mono text-2xs text-dim">@{user.username}</span>
       <time dateTime={createdAt} title={formatDateTime(createdAt)} className="shrink-0 text-2xs text-dim">
         {formatTime(createdAt)}
       </time>

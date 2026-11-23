@@ -38,10 +38,32 @@ def _password(value: str) -> str:
     return value
 
 
+#: Characters that change how text around them is shown without being visible: bidirectional overrides,
+#: embeddings, isolates and marks, zero-width spaces, word joiner, BOM, soft hyphen. In names they enable
+#: spoofing (``Ada\u200b`` looks like ``Ada``; U+202E reverses what follows). Zero-width (non-)joiners are kept:
+#: emoji sequences and several scripts need them.
+INVISIBLE_CHARS = frozenset("\u061c\u200b\u200e\u200f\u202a\u202b\u202c\u202d\u202e"
+                            "\u2060\u2066\u2067\u2068\u2069\ufeff\u00ad")
+
+
+def strip_invisible(value: str) -> str:
+    """``value`` without control characters and the invisible formatting characters above."""
+    return "".join(ch for ch in value if ch not in INVISIBLE_CHARS and (ch >= " " or ch in "\t\n") and ch != "\x7f")
+
+
 def _display_name(value: str) -> str:
-    value = " ".join(value.split())
+    value = " ".join(strip_invisible(value).split())
     if not 1 <= len(value) <= 64:
         raise ValueError("must be 1-64 characters")
+    return value
+
+
+def _project_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = " ".join(strip_invisible(value).split())
+    if not value:
+        raise ValueError("is required")
     return value
 
 
@@ -531,6 +553,7 @@ class MemberPatch(Model):
 
 
 class ProjectCreate(Model):
+    _n = field_validator("name")(_project_name)
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
     description: Annotated[str, StringConstraints(max_length=4000)] = ""
     image_dir: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
@@ -542,6 +565,7 @@ class ProjectCreate(Model):
 
 
 class ProjectPatch(Model):
+    _n = field_validator("name")(_project_name)
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)] | None = None
     description: Annotated[str, StringConstraints(max_length=4000)] | None = None
     label_dir: Annotated[str, StringConstraints(max_length=4096)] | None = None
