@@ -81,9 +81,13 @@ Run these before opening a pull request. CI runs the same commands.
 **Backend**
 
 ```bash
-ruff check annotamate tests
+ruff check annotamate tests scripts
 pytest -q
 ```
+
+**Benchmark** (optional locally; CI runs it with 10,000 images): `python scripts/benchmark.py --images 10000 --check`
+generates a dataset, starts a server and fails when indexing, rescanning, paging, saving or exporting got slower
+than the thresholds at the top of the script.
 
 **Frontend** (in `web/`)
 

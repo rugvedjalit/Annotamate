@@ -61,6 +61,7 @@ cd web
 npm run lint && npm run typecheck && npm test && npm run build
 npx playwright install chromium                    # once
 PYTHON=../.venv/bin/python E2E_PORT=8799 npx playwright test   # end-to-end, ~2 min, needs the build
+cd .. && .venv/bin/python scripts/benchmark.py --images 10000 --check   # performance regressions, ~1 min on Linux
 ```
 
 On Windows use `..\.venv\Scripts\python.exe` for `PYTHON`. All of these must pass before a commit is
