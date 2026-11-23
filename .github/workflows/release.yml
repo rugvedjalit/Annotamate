@@ -1,0 +1,206 @@
+name: Release
+
+# Push a tag such as v2.0.0 (or v2.1.0-rc.1 for a pre-release) to publish:
+#   - a GitHub release with the sdist and the wheel (the wheel contains the SPA)
+#   - a multi-arch container image on ghcr.io/rugvedjalit/annotamate
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: rugvedjalit/annotamate
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build the SPA
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Check the distributions
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          python - <<'PY'
+          import glob
+          import os
+          import sys
+          import tarfile
+          import zipfile
+
+          tag = os.environ["TAG"]
+          wheels = glob.glob("dist/*-py3-none-any.whl")
+          sdists = glob.glob("dist/*.tar.gz")
+          if len(wheels) != 1 or len(sdists) != 1:
+              sys.exit(f"expected one pure-Python wheel and one sdist, found {sorted(glob.glob('dist/*'))}")
+          wheel = wheels[0]
+          if "annotamate/server/static/index.html" not in zipfile.ZipFile(wheel).namelist():
+              sys.exit("the wheel does not contain the built SPA")
+          if not any(n.endswith("/annotamate/server/static/index.html") for n in tarfile.open(sdists[0]).getnames()):
+              sys.exit("the sdist does not contain the built SPA")
+
+          # For final releases the tag must match the package version exactly.
+          # Pre-release tags (v2.1.0-rc.1) are normalised by Python packaging (2.1.0rc1),
+          # so they are not compared.
+          version = os.path.basename(wheel).split("-")[1]
+          if "-" not in tag and tag != f"v{version}":
+              sys.exit(f"tag {tag} does not match the package version {version}")
+          print(f"OK: {wheel} (version {version}) for tag {tag}")
+          PY
+
+      - name: Upload the distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - name: Download the distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" dist/* \
+            --title "Annotamate ${TAG#v}" \
+            --generate-notes \
+            --verify-tag \
+            "${flags[@]}"
+
+  image:
+    name: Container image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # v2.3.4      -> 2.3.4, 2.3, 2, latest
+      # v2.4.0-rc.1 -> 2.4.0-rc.1 only
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+          labels: |
+            org.opencontainers.image.title=Annotamate
+            org.opencontainers.image.description=Self-hosted, multi-user image annotation server (YOLO, Pascal VOC, COCO)
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.authors=Rugved Jalit
+            org.opencontainers.image.vendor=Rugved Jalit
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=annotamate
+          cache-to: type=gha,scope=annotamate,mode=max
+
+  # Optional: publish to PyPI with trusted publishing (no API token).
+  # Enable by (1) registering this workflow as a trusted publisher for the
+  # `annotamate` project on pypi.org with the environment name `pypi`, and
+  # (2) setting the repository variable PUBLISH_TO_PYPI to `true`.
+  pypi:
+    name: Publish to PyPI
+    if: ${{ vars.PUBLISH_TO_PYPI == 'true' }}
+    needs: [build, github-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/annotamate/
+    permissions:
+      id-token: write # OpenID Connect token for trusted publishing
+    steps:
+      - name: Download the distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

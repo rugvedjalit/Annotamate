@@ -1,0 +1,98 @@
+name: Bug report
+description: Something does not work as documented or as you expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a problem.
+
+        **Security issues:** please do not open a public issue. Follow the
+        [security policy](https://github.com/rugvedjalit/Annotamate/security/policy) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the problem. Screenshots help for anything visual.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The shortest sequence of actions that shows the problem.
+      placeholder: |
+        1. Open project "..." (format: YOLO)
+        2. Draw a box and ...
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Annotamate version
+      description: Output of `annotamate version`, or the container image tag.
+      placeholder: "2.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is it installed?
+      options:
+        - pip (wheel)
+        - Docker / Docker Compose
+        - From source (development)
+        - Desktop app (legacy)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Annotator (canvas, tools, shortcuts)
+        - Projects, classes, members
+        - Review workflow and assignments
+        - Chat, comments, messages, notifications
+        - Label files (YOLO / VOC / COCO), export, upload
+        - Accounts and sign-in
+        - Installation, deployment, reverse proxy
+        - Other
+
+  - type: input
+    id: server
+    attributes:
+      label: Server environment
+      description: Operating system, Python version, database (SQLite or PostgreSQL), reverse proxy if any.
+      placeholder: "Ubuntu 24.04, Python 3.12, SQLite, Caddy 2"
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser
+      description: Name, version and operating system of the browser.
+      placeholder: "Firefox 145 on Windows 11"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Relevant server output (`journalctl -u annotamate`, `docker compose logs annotamate`) and
+        browser console errors. Remove anything private first.
+      render: text
