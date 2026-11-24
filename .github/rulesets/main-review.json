@@ -1,0 +1,55 @@
+{
+  "name": "main: pull requests, review and checks",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [
+    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "require_code_owner_review": true,
+        "dismiss_stale_reviews_on_push": true,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": true,
+        "allowed_merge_methods": ["squash", "rebase"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "Backend (Python 3.11)", "integration_id": 15368 },
+          { "context": "Backend (Python 3.13)", "integration_id": 15368 },
+          { "context": "Benchmark (10,000 images)", "integration_id": 15368 },
+          { "context": "Frontend", "integration_id": 15368 },
+          { "context": "Package (wheel + smoke test)", "integration_id": 15368 },
+          { "context": "End-to-end (Playwright)", "integration_id": 15368 },
+          { "context": "Docker image (build and smoke test)", "integration_id": 15368 },
+          { "context": "Dependency review", "integration_id": 15368 },
+          { "context": "CodeQL (python)", "integration_id": 15368 },
+          { "context": "CodeQL (javascript-typescript)", "integration_id": 15368 },
+          { "context": "CodeQL (actions)", "integration_id": 15368 }
+        ]
+      }
+    },
+    {
+      "type": "code_scanning",
+      "parameters": {
+        "code_scanning_tools": [
+          { "tool": "CodeQL", "security_alerts_threshold": "high_or_higher", "alerts_threshold": "errors" }
+        ]
+      }
+    }
+  ]
+}

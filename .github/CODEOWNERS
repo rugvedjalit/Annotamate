@@ -1,2 +1,28 @@
+# Code owners are asked for review automatically, and the ruleset on `main` requires their approval.
+# Later patterns take precedence over earlier ones.
+# Details: docs/guides/maintainers.md
+
 # Default owner for everything in the repository.
-* @rugvedjalit
+*                                   @rugvedjalit
+
+# Areas where a mistake affects security, releases or users' data. Listed explicitly so that
+# adding a co-maintainer for general code never grants approval over these.
+/.github/                           @rugvedjalit
+/Dockerfile                         @rugvedjalit
+/docker-compose.yml                 @rugvedjalit
+/deploy/                            @rugvedjalit
+/pyproject.toml                     @rugvedjalit
+/web/package.json                   @rugvedjalit
+/web/package-lock.json              @rugvedjalit
+/scripts/bootstrap.py               @rugvedjalit
+/annotamate/core/fsutil.py          @rugvedjalit
+/annotamate/server/security.py      @rugvedjalit
+/annotamate/server/deps.py          @rugvedjalit
+/annotamate/server/routes/auth.py   @rugvedjalit
+/annotamate/server/routes/fs.py     @rugvedjalit
+/annotamate/server/services/access.py  @rugvedjalit
+/annotamate/server/services/paths.py   @rugvedjalit
+/annotamate/server/services/uploads.py @rugvedjalit
+/annotamate/server/migrations/      @rugvedjalit
+/SECURITY.md                        @rugvedjalit
+/LICENSE                            @rugvedjalit
