@@ -187,6 +187,7 @@ A typical workflow:
 | [Deployment](docs/guides/deployment.md) | Installing, HTTPS, reverse proxies, permissions, backups, upgrades, troubleshooting |
 | [Administrator](docs/guides/administrator.md) | Accounts, roles, projects, classes, assignments, review, uploads, exports |
 | [Annotator](docs/guides/annotator.md) | The workspace, tools, keyboard shortcuts, comments, chat, reviews |
+| [Maintainer](docs/guides/maintainers.md) | Branch protection, reviewing and merging pull requests, releasing, repository settings |
 | [Architecture](docs/architecture.md) | How the server is built, the security model, the on-disk formats |
 | [API](docs/api.md) | The REST and WebSocket contract |
 
@@ -223,7 +224,9 @@ cd web && npx playwright test                                             # end-
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and the pull-request checklist, and
-[SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+[SECURITY.md](SECURITY.md) for reporting vulnerabilities. Everyone taking part follows the
+[Code of Conduct](CODE_OF_CONDUCT.md). How `main` and releases are protected is described in the
+[maintainer guide](docs/guides/maintainers.md).
 
 ## Desktop app (legacy)
 

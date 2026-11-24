@@ -23,3 +23,4 @@
 - [ ] API changes are reflected in `docs/api.md` and `web/src/lib/types.ts`
 - [ ] User-visible changes are described in `CHANGELOG.md` and, where relevant, in `docs/guides/`
 - [ ] No secrets, datasets or generated files (`annotamate/server/static/`, `node_modules/`) are committed
+- [ ] Changes to workflows, dependencies, the container or security-sensitive code are explained above (new actions are pinned to a full commit SHA)

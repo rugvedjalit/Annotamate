@@ -7,6 +7,8 @@ Bug reports and feature ideas are welcome through the
 [issue tracker](https://github.com/rugvedjalit/Annotamate/issues). Please report security problems
 privately, as described in [SECURITY.md](SECURITY.md).
 
+Everyone taking part is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Project layout
 
 ```text
@@ -196,18 +198,37 @@ Before asking for review, check that:
       colours are involved;
 - [ ] the description says what changed, why, and how you tested it.
 
-A maintainer reviews every pull request. CI must be green before a merge.
+### How a pull request gets merged
+
+`main` is protected (details in the [maintainer guide](docs/guides/maintainers.md)):
+
+1. **Fork** the repository, push your branch to your fork and open a pull request against `main`.
+   Nobody pushes to `main` directly, and its history is never rewritten.
+2. For a first contribution, the checks start once a maintainer has looked at the change and
+   approved the workflow run. They run with read-only access and no secrets.
+3. These checks must pass: backend (Python 3.11 and 3.13), benchmark, frontend, package, end-to-end,
+   Docker image, dependency review and CodeQL. A pull request that adds a dependency with a known
+   high or critical vulnerability, or a GPL-licensed one, fails *Dependency review*.
+4. A code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)) reviews and approves. Every review
+   conversation must be resolved, and a new push after an approval needs a new approval.
+5. The branch must be up to date with `main` (use **Update branch** or rebase). The maintainer then
+   squashes or rebases it onto `main`; merge commits are not used.
+
+Changes to workflows (`.github/`), dependencies, the container files, authentication, path checks
+or migrations get an especially careful review: please explain why they are needed.
 
 ## Releases
 
-Maintainers release by:
+Only maintainers can release (step by step in the [maintainer guide](docs/guides/maintainers.md#releasing)):
 
-1. updating the version in `annotamate/__init__.py` and in `web/package.json`, and moving the *Unreleased*
-   entries in `CHANGELOG.md` under the new version with the date;
-2. tagging the commit on `main`: `git tag v2.1.0 && git push origin v2.1.0`.
+1. a pull request updates the version in `annotamate/__init__.py` and in `web/package.json`, and moves
+   the *Unreleased* entries in `CHANGELOG.md` under the new version with the date;
+2. after it is merged, a maintainer tags the commit on `main`: `git tag -a v2.1.0 -m "Annotamate 2.1.0" && git push origin v2.1.0`
+   (only maintainers can create `v*` tags);
+3. the maintainer approves the `release` deployment of the workflow run.
 
-The release workflow builds the web interface, the sdist and the wheel, checks that the tag matches
-the version, creates the GitHub release with generated notes and publishes the container image
+The release workflow builds the web interface, the sdist and the wheel, checks that the tag is on
+`main` and matches the version, creates the GitHub release with generated notes and publishes the container image
 (`linux/amd64` and `linux/arm64`) to `ghcr.io/rugvedjalit/annotamate`. Publishing to PyPI is
 optional: set the repository variable `PUBLISH_TO_PYPI` to `true` once trusted publishing is
 configured.

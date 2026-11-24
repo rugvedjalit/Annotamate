@@ -90,6 +90,8 @@ it, `web/src/lib/types.ts` (mirror of the API) and [CHANGELOG.md](CHANGELOG.md) 
 
 - Conventional Commits: `feat(server): ...`, `fix(web): ...`, `docs: ...` (types: feat, fix, docs,
   refactor, perf, test, build, ci, chore). Work on a branch and open a pull request; never push to `main`.
+  `main` is protected (no force pushes; reviews and green checks required) and only maintainers
+  create `v*` release tags: see [docs/guides/maintainers.md](docs/guides/maintainers.md).
 - UTF-8 with LF line endings (`.gitattributes` enforces it), 4-space Python, 2-space everything else,
   Python line length 120 (`ruff`).
 - Database changes need an Alembic migration in `annotamate/server/migrations/versions/`.

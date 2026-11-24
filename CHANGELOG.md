@@ -7,6 +7,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+Protection of the repository and of releases (details in `docs/guides/maintainers.md`):
+
+- `main` cannot be force-pushed or deleted, by anyone. Changes arrive through pull requests with a
+  code owner's approval, resolved conversations and green checks, merged by squash or rebase.
+- Only maintainers can create `v*` tags. The release workflow refuses tags that are not on `main`,
+  never runs in forks, and publishes only after a maintainer approves the `release` (or `pypi`)
+  environment. Container images now carry build provenance and an SBOM.
+- All GitHub Actions are pinned to full commit SHAs, checkouts no longer keep the token, and only
+  actions from GitHub, Docker and PyPA may run. Workflow runs from external contributors wait for
+  approval.
+- New checks on every pull request: CodeQL (Python, TypeScript, workflows) and *Dependency review*.
+- Code of Conduct (Contributor Covenant 2.1), `CODEOWNERS` for security-sensitive paths, and
+  `scripts/apply_repo_settings.py`, which applies the rulesets in `.github/rulesets/` and the other
+  settings from reviewable files.
+
 ### Performance
 
 Staying responsive with many users and projects of a lakh of images (first part of

@@ -66,6 +66,20 @@ Please allow time for a fix to be released before disclosing details publicly.
 
 Details: [docs/architecture.md](docs/architecture.md), section 10.
 
+## Supply chain
+
+- `main` accepts changes only through reviewed pull requests with green checks, and its history
+  cannot be rewritten. Releases are built by GitHub Actions from `v*` tags that only maintainers can
+  create, on commits that are on `main`, and each release waits for a maintainer's approval.
+- Every GitHub Action is pinned to a full commit SHA; only actions from GitHub, Docker and PyPA are
+  allowed. Pull requests are scanned by CodeQL and *Dependency review*.
+- The container image on `ghcr.io/rugvedjalit/annotamate` carries build provenance and an SBOM
+  (`docker buildx imagetools inspect ghcr.io/rugvedjalit/annotamate:latest --format '{{json .Provenance}}'`).
+- Only images from `ghcr.io/rugvedjalit/annotamate` and releases on
+  <https://github.com/rugvedjalit/Annotamate/releases> are official.
+
+Details: [docs/guides/maintainers.md](docs/guides/maintainers.md).
+
 ## Hardening checklist
 
 For anyone operating a server. The [deployment guide](docs/guides/deployment.md) shows how to do
